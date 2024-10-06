@@ -4,7 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const libuv = b.dependency("zig_libuv", .{
+    const libuv_dep = b.dependency("zig_libuv", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const zg_dep = b.dependency("zg", .{
         .target = target,
         .optimize = optimize,
     });
@@ -15,8 +20,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    lib.linkLibrary(libuv.artifact("libuv"));
-    lib.root_module.addImport("uv", libuv.module("uv"));
+    lib.linkLibrary(libuv_dep.artifact("libuv"));
+    lib.root_module.addImport("uv", libuv_dep.module("uv"));
+    lib.root_module.addImport("grapheme", zg_dep.module("grapheme"));
+    lib.root_module.addImport("DisplayWidth", zg_dep.module("DisplayWidth"));
     b.installArtifact(lib);
 
     const exe = b.addExecutable(.{

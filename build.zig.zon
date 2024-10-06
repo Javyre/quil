@@ -14,5 +14,9 @@
             .url = "https://github.com/Javyre/zig-libuv/archive/64d783f4b5c6cf507a7693f93e7d5b6a12f4be49.tar.gz",
             .hash = "12204af572513b1a3d3838064108617e3631fef95234eadeebba2b56eb5215c9764a",
         },
+        .zg = .{
+            .url = "https://codeberg.org/dude_the_builder/zg/archive/7ddce488e074c3f052949ba513a340446cea86e9.tar.gz",
+            .hash = "12205e2e7108385a1ec280b6365166e902a690d6a0e8fcc015fdea62d63cf79be8ec",
+        },
     },
 }
