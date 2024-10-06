@@ -3,9 +3,10 @@ const uv = @import("uv");
 
 const uv_utils = @import("./uv_utils.zig");
 const Render = @import("./Render.zig");
+const WindowManager = @import("./WindowManager.zig");
 
-const upgradeBaton = uv_utils.upgradeBaton;
-const downgradeBaton = uv_utils.downgradeBaton;
+const upgrade_baton = uv_utils.upgrade_baton;
+const downgrade_baton = uv_utils.downgrade_baton;
 
 const Error = @import("root").QuilError;
 
@@ -22,19 +23,19 @@ pub const Quil = struct {
     loop: uv.Loop,
     cmds: Commands = .{},
     render: Render,
+    window_manager: WindowManager,
     is_alive: bool = false,
 
-    pub fn init(alloc: std.mem.Allocator) !Quil {
+    pub fn init(q: *Quil, alloc: std.mem.Allocator) !void {
         const loop = try uv.Loop.init(alloc);
 
-        var q = Quil{
+        q.* = Quil{
             .alloc = alloc,
             .loop = loop,
             .render = try Render.init(alloc, loop),
+            .window_manager = try WindowManager.init(alloc, &q.render),
         };
         try q.cmds.setCapacity(alloc, 32);
-
-        return q;
     }
 
     pub fn deinit(q: *Quil) void {
@@ -51,6 +52,7 @@ pub const Quil = struct {
         q.loop.deinit(q.alloc);
 
         q.render.deinit();
+        q.window_manager.deinit();
         q.cmds.deinit(q.alloc);
         q.* = undefined;
     }
@@ -65,15 +67,16 @@ pub fn run(q: *Quil) !void {
     q.is_alive = true;
     defer q.is_alive = false;
 
-    // Setup Renderer
+    // drive teardown requests.
+    defer _ = q.loop.run(.default) catch unreachable;
 
+    // Setup Renderer
     try q.render.setup();
-    defer {
-        std.debug.assert(q.render.is_alive);
-        q.render.teardown() catch unreachable;
-        _ = q.loop.run(.default) catch unreachable;
-        std.debug.assert(!q.render.is_alive);
-    }
+    defer q.render.teardown() catch unreachable;
+
+    // Setup Window Manager
+    try q.window_manager.setup();
+    defer q.window_manager.teardown() catch unreachable;
 
     // Handle Signals for graceful shutdown
 
@@ -83,12 +86,12 @@ pub fn run(q: *Quil) !void {
     };
     var sigint_handle: SigHandle = .{ .q = q };
     var sighup_handle: SigHandle = .{ .q = q };
-    const sigint_raw_handle = downgradeBaton(&sigint_handle, uv.c.uv_signal_t);
-    const sighup_raw_handle = downgradeBaton(&sighup_handle, uv.c.uv_signal_t);
+    const sigint_raw_handle = downgrade_baton(&sigint_handle, uv.c.uv_signal_t);
+    const sighup_raw_handle = downgrade_baton(&sighup_handle, uv.c.uv_signal_t);
 
     const handle_signal = struct {
         fn handler(raw_handle: ?*uv.c.uv_signal_t, signum: c_int) callconv(.C) void {
-            const handle = upgradeBaton(raw_handle.?, SigHandle);
+            const handle = upgrade_baton(raw_handle.?, SigHandle);
 
             switch (signum) {
                 uv.c.SIGINT, uv.c.SIGHUP => handle.q.loop.stop(),

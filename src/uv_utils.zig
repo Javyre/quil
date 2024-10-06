@@ -1,4 +1,4 @@
-fn assertBaton(
+fn assert_baton(
     comptime Downgraded: type,
     comptime UpgradedStruct: type,
 ) void {
@@ -20,7 +20,7 @@ fn assertBaton(
     }
 }
 
-pub fn upgradeBaton(ptr: anytype, comptime UpgradedStruct: type) R: {
+pub fn upgrade_baton(ptr: anytype, comptime UpgradedStruct: type) R: {
     var info = @typeInfo(@TypeOf(ptr));
     info.pointer.child = UpgradedStruct;
     break :R @Type(info);
@@ -31,11 +31,11 @@ pub fn upgradeBaton(ptr: anytype, comptime UpgradedStruct: type) R: {
             @compileError("ptr must be a pointer");
         },
     };
-    assertBaton(Downgraded, UpgradedStruct);
+    assert_baton(Downgraded, UpgradedStruct);
     return @ptrCast(ptr);
 }
 
-pub fn downgradeBaton(ptr: anytype, comptime Downgraded: type) R: {
+pub fn downgrade_baton(ptr: anytype, comptime Downgraded: type) R: {
     var info = @typeInfo(@TypeOf(ptr));
     info.pointer.child = Downgraded;
     break :R @Type(info);
@@ -46,6 +46,6 @@ pub fn downgradeBaton(ptr: anytype, comptime Downgraded: type) R: {
             @compileError("ptr must be a pointer");
         },
     };
-    assertBaton(Downgraded, UpgradedStruct);
+    assert_baton(Downgraded, UpgradedStruct);
     return @ptrCast(ptr);
 }
