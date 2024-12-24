@@ -2,13 +2,22 @@ const std = @import("std");
 const uv = @import("uv");
 
 const uv_utils = @import("./uv_utils.zig");
+const MultiArrayPool = @import("./multi_array_pool.zig").MultiArrayPool;
 const Render = @import("./Render.zig");
 const WindowManager = @import("./WindowManager.zig");
+const BufferManager = @import("./BufferManager.zig");
+
+test {
+    std.testing.refAllDecls(@This());
+}
 
 const upgrade_baton = uv_utils.upgrade_baton;
 const downgrade_baton = uv_utils.downgrade_baton;
 
-const Error = @import("root").QuilError;
+const Error = if (std.meta.fieldIndex(@import("root"), "QuilError")) |_|
+    @import("root").QuilError
+else
+    error{};
 
 const Command = struct {
     name: []const u8,
@@ -16,14 +25,15 @@ const Command = struct {
     func: *fn (data: *anyopaque, q: *Quil) Error!void,
     data: *anyopaque,
 };
-const Commands = std.MultiArrayList(Command);
+const Commands = MultiArrayPool(Command);
 
 pub const Quil = struct {
     alloc: std.mem.Allocator,
     loop: uv.Loop,
-    cmds: Commands = .{},
+    cmds: Commands = .empty,
     render: Render,
     window_manager: WindowManager,
+    buffer_manager: BufferManager,
     is_alive: bool = false,
 
     pub fn init(q: *Quil, alloc: std.mem.Allocator) !void {
@@ -32,10 +42,10 @@ pub const Quil = struct {
         q.* = Quil{
             .alloc = alloc,
             .loop = loop,
-            .render = try Render.init(alloc, loop),
-            .window_manager = try WindowManager.init(alloc, &q.render),
+            .render = try .init(alloc, loop),
+            .buffer_manager = try .init(alloc, loop),
+            .window_manager = try .init(alloc, &q.render, &q.buffer_manager),
         };
-        try q.cmds.setCapacity(alloc, 32);
     }
 
     pub fn deinit(q: *Quil) void {
@@ -52,6 +62,7 @@ pub const Quil = struct {
         q.loop.deinit(q.alloc);
 
         q.render.deinit();
+        q.buffer_manager.deinit();
         q.window_manager.deinit();
         q.cmds.deinit(q.alloc);
         q.* = undefined;
@@ -73,6 +84,10 @@ pub fn run(q: *Quil) !void {
     // Setup Renderer
     try q.render.setup();
     defer q.render.teardown() catch unreachable;
+
+    // Setup Buffer Manager
+    try q.buffer_manager.setup();
+    defer q.buffer_manager.teardown() catch unreachable;
 
     // Setup Window Manager
     try q.window_manager.setup();

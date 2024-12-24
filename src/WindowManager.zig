@@ -1,16 +1,20 @@
 const std = @import("std");
 const uv = @import("uv");
 const Render = @import("./Render.zig");
+const BufferManager = @import("./BufferManager.zig");
 
 const WindowManager = @This();
 
 alloc: std.mem.Allocator,
 render: *Render,
+buffer_manager: *BufferManager,
 
 node_pool: std.heap.MemoryPool(Node),
 main_tree: ?Tree = null,
 
 const Tree = struct {
+    // Since tiled surfaces can't overlap, they can share a common backing
+    // grid.
     backing_grid: Render.GridNum,
     root: *Node,
 };
@@ -32,15 +36,20 @@ const Node = struct {
     };
 
     const Window = struct {
-        // buf: *Buffer,
+        buf: BufferManager.BufferNum,
         surface: Render.SurfaceNum,
     };
 };
 
-pub fn init(alloc: std.mem.Allocator, r: *Render) !WindowManager {
+pub fn init(
+    alloc: std.mem.Allocator,
+    r: *Render,
+    bm: *BufferManager,
+) !WindowManager {
     return .{
         .alloc = alloc,
         .render = r,
+        .buffer_manager = bm,
         .node_pool = .init(alloc),
     };
 }
@@ -68,12 +77,14 @@ pub fn setup(wm: *WindowManager) !void {
             .kind = .{
                 .window = .{
                     .surface = surface,
+                    .buf = try wm.buffer_manager.buffer_create_scratch(),
                 },
             },
         };
 
         const dims = try r.tty_get_dimensions();
         try wm.tree_layout(&wm.main_tree.?, .zero, dims);
+        try wm.render.flush();
     }
 
     // TODO: floating trees
@@ -215,13 +226,35 @@ fn layout_tiled_window(
     screen_pos_ofs: Render.Position,
 ) !void {
     _ = node;
-
-    wm.render.surface_set_dimensions(window.surface, new_dims);
+    try wm.render.surface_set_dimensions(window.surface, new_dims);
     wm.render.surface_set_grid_position(window.surface, new_grid_pos);
     wm.render.surface_set_screen_position(window.surface, .{
         .x = new_grid_pos.x + screen_pos_ofs.x,
         .y = new_grid_pos.y + screen_pos_ofs.y,
     });
+
+    try wm.redraw_window(window, new_dims);
+}
+
+fn redraw_window(
+    wm: *WindowManager,
+    window: *Node.Window,
+    dims: Render.Dimensions,
+) !void {
+    // TODO: impl text wrapping
+
+    const buf_lines = wm.buffer_manager.buffer_get_lines(window.buf).items;
+    const buf_draw_height = @min(dims.h, buf_lines.len);
+
+    for (
+        0..,
+        buf_lines[0..buf_draw_height],
+    ) |y, line| {
+        try wm.render.surface_draw_utf8(window.surface, .{
+            .x = 0,
+            .y = @intCast(y),
+        }, line.items);
+    }
 }
 
 // pub fn setup_window(wm: *WindowManager, win: *Window) !void {
