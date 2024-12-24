@@ -14,25 +14,35 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const lib = b.addStaticLibrary(.{
-        .name = "quil",
+    const lib_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    lib.linkLibrary(libuv_dep.artifact("libuv"));
-    lib.root_module.addImport("uv", libuv_dep.module("uv"));
-    lib.root_module.addImport("grapheme", zg_dep.module("grapheme"));
-    lib.root_module.addImport("DisplayWidth", zg_dep.module("DisplayWidth"));
-    b.installArtifact(lib);
+    lib_mod.linkLibrary(libuv_dep.artifact("libuv"));
+    lib_mod.addImport("uv", libuv_dep.module("uv"));
+    lib_mod.addImport("zg_grapheme", zg_dep.module("grapheme"));
+    lib_mod.addImport("zg_DisplayWidth", zg_dep.module("DisplayWidth"));
+    lib_mod.addImport("zg_code_point", zg_dep.module("code_point"));
+    lib_mod.addImport("zg_ascii", zg_dep.module("ascii"));
 
-    const exe = b.addExecutable(.{
-        .name = "quil",
+    const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    exe.root_module.addImport("quil", &lib.root_module);
+    exe_mod.addImport("quil", lib_mod);
+
+    const lib = b.addStaticLibrary(.{
+        .name = "quil",
+        .root_module = lib_mod,
+    });
+    b.installArtifact(lib);
+
+    const exe = b.addExecutable(.{
+        .name = "quil",
+        .root_module = exe_mod,
+    });
     b.installArtifact(exe);
 
     // Run
@@ -48,18 +58,10 @@ pub fn build(b: *std.Build) void {
 
     // Test
 
-    const lib_unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const lib_unit_tests = b.addTest(.{ .root_module = lib_mod });
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
-    const exe_unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const exe_unit_tests = b.addTest(.{ .root_module = exe_mod });
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
     const test_step = b.step("test", "Run unit tests");

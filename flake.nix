@@ -34,7 +34,7 @@
           ...
         }:
         let
-          zig = inputs'.zig.packages.master-2024-10-06;
+          zig = inputs'.zig.packages.master-2024-12-22;
           zls = inputs'.zls.packages.zls;
         in
         {
