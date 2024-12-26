@@ -67,6 +67,7 @@ pub fn setup(wm: *WindowManager) !void {
         const root = try wm.node_pool.create();
         const grid = try wm.render.grid_create();
         const surface = try wm.render.surface_create();
+        wm.render.surface_set_label(surface, "default window");
         wm.render.surface_set_grid(surface, grid);
         wm.main_tree = .{
             .root = root,

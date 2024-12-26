@@ -140,6 +140,8 @@ pub const SurfaceNum = Surfaces.Idx;
 /// Think of a viewport in GL terms.
 /// This should be treated as surfaces to render on and composit together.
 const Surface = struct {
+    label: ?[]const u8 = null,
+
     parent_surface: SurfaceNum = .null,
     /// Whether we need to rerender this surface on the next flush.
     dirt: Dirt = .clean,
@@ -617,35 +619,61 @@ const BitMap = struct {
     }
 
     test first_set_bit {
-        const words = [_]Word{ 1 << 5, 0, 1 << 100 };
+        const words_true = [_]Word{ 1 << 5, 0, 1 << 100 };
+        const words_false = [_]Word{
+            ~words_true[0],
+            ~words_true[1],
+            ~words_true[2],
+        };
         const eq = std.testing.expectEqual;
-        try eq(5, first_set_bit(
-            &words,
-            0,
-            words.len * @bitSizeOf(Word),
-            true,
-            .little,
-        ));
-        try eq(
-            100,
-            first_set_bit(&words, 0, words.len * @bitSizeOf(Word), true, .big),
-        );
-        try eq(
-            null,
-            first_set_bit(&words, 6, (@bitSizeOf(Word) * 2) - 6, true, .little),
-        );
-        try eq(
-            0,
-            first_set_bit(&words, 100, (@bitSizeOf(Word) * 2) - 100, true, .big),
-        );
-        try eq(
-            2,
-            first_set_bit(&words, 3, @bitSizeOf(Word) * 2, true, .little),
-        );
-        try eq(
-            97,
-            first_set_bit(&words, 3, @bitSizeOf(Word) * 2, true, .big),
-        );
+
+        inline for (
+            .{ words_true, words_false },
+            .{ true, false },
+        ) |words, val| {
+            try eq(5, first_set_bit(
+                &words,
+                0,
+                words.len * @bitSizeOf(Word),
+                val,
+                .little,
+            ));
+            try eq(100, first_set_bit(
+                &words,
+                0,
+                words.len * @bitSizeOf(Word),
+                val,
+                .big,
+            ));
+            try eq(null, first_set_bit(
+                &words,
+                6,
+                (@bitSizeOf(Word) * 2) - 6,
+                val,
+                .little,
+            ));
+            try eq(0, first_set_bit(
+                &words,
+                100,
+                (@bitSizeOf(Word) * 2) - 100,
+                val,
+                .big,
+            ));
+            try eq(2, first_set_bit(
+                &words,
+                3,
+                @bitSizeOf(Word) * 2,
+                val,
+                .little,
+            ));
+            try eq(97, first_set_bit(
+                &words,
+                3,
+                @bitSizeOf(Word) * 2,
+                val,
+                .big,
+            ));
+        }
     }
 };
 
@@ -1146,6 +1174,7 @@ fn grid_direct_draw(r: *Render, grid: Grid, mask: BitMap.View) !void {
     } = null;
     for (0..grid.dims.h) |y_| {
         const y: u32 = @intCast(y_);
+
         var start_x: u32 = 0;
         while (mask.find_next_set_in_row(start_x, y)) |found| {
             assert(found.count > 0);
@@ -1161,9 +1190,9 @@ fn grid_direct_draw(r: *Render, grid: Grid, mask: BitMap.View) !void {
 
                 const need_pos, const need_cell_bg, const need_cell_fg =
                     if (current_cursor) |c| .{
-                    std.meta.eql(c.cell_fg, cell_fg),
-                    std.meta.eql(c.cell_bg, cell_bg),
-                    std.meta.eql(c.pos, .{ .x = x, .y = y }),
+                    !std.meta.eql(c.cell_fg, cell_fg),
+                    !std.meta.eql(c.cell_bg, cell_bg),
+                    !std.meta.eql(c.pos, .{ .x = x, .y = y }),
                 } else .{ true, true, true };
 
                 // HVP - set cursor position
@@ -1306,9 +1335,21 @@ pub fn grid_set_dimensions(
     const cell_bg = &slice.items(.cell_bg)[num.to_idx().?];
     const cell_fg = &slice.items(.cell_fg)[num.to_idx().?];
 
-    try cell_char.ensureTotalCapacity(r.alloc, new_cell_count);
-    try cell_bg.ensureTotalCapacity(r.alloc, new_cell_count);
-    try cell_fg.ensureTotalCapacity(r.alloc, new_cell_count);
+    cell_char.clearRetainingCapacity();
+    cell_bg.clearRetainingCapacity();
+    cell_fg.clearRetainingCapacity();
+    @memset(try cell_char.addManyAsSlice(r.alloc, new_cell_count), 0);
+    @memset(try cell_bg.addManyAsSlice(r.alloc, new_cell_count), .default);
+    @memset(try cell_fg.addManyAsSlice(r.alloc, new_cell_count), .default);
+}
+
+pub fn surface_set_label(
+    r: *Render,
+    num: SurfaceNum,
+    label: ?[]const u8,
+) void {
+    const slice = r.surfaces.slice();
+    slice.items(.label)[num.to_idx().?] = label;
 }
 
 pub fn surface_set_grid(
@@ -1413,7 +1454,9 @@ pub fn surface_draw_utf8(
         for (text) |char| {
             // is ASCII
             std.debug.assert(char < 128);
-            if (!ascii_char_is_visible(char)) continue;
+            if (ascii_char_is_invisible(char)) {
+                continue;
+            }
 
             const g_pos = grid_pos_from_surface_pos(info, pos);
             g_grid.items[g_dims.w * g_pos.y + g_pos.x] = char;
@@ -1438,7 +1481,7 @@ pub fn surface_draw_utf8(
             const char = gc_bytes[0];
             // is ASCII
             std.debug.assert(char < 128);
-            if (!ascii_char_is_visible(char)) continue;
+            if (ascii_char_is_invisible(char)) continue;
 
             const g_pos = grid_pos_from_surface_pos(info, pos);
             g_grid.items[g_dims.w * g_pos.y + g_pos.x] = char;
@@ -1497,7 +1540,7 @@ fn grid_pos_from_surface_pos(info: SurfaceGridInfo, s_pos: Position) Position {
     return .{ .x = g_pos[0], .y = g_pos[1] };
 }
 
-fn ascii_char_is_visible(char: u8) bool {
+fn ascii_char_is_invisible(char: u8) bool {
     std.debug.assert(char < 128);
     // C0 control char or DEL
     return char < 32 or char == 127;
