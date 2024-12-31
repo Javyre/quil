@@ -7,6 +7,10 @@ const Render = @import("./Render.zig");
 const WindowManager = @import("./WindowManager.zig");
 const BufferManager = @import("./BufferManager.zig");
 
+const BufferNum = BufferManager.BufferNum;
+const Node = WindowManager.Node;
+const ICtnrChildIdx = WindowManager.ICtnrChildIdx;
+
 test {
     std.testing.refAllDecls(@This());
 }
@@ -32,8 +36,8 @@ pub const Quil = struct {
     loop: uv.Loop,
     cmds: Commands = .empty,
     render: Render,
-    window_manager: WindowManager,
-    buffer_manager: BufferManager,
+    win_manager: WindowManager,
+    buf_manager: BufferManager,
     is_alive: bool = false,
 
     pub fn init(q: *Quil, alloc: std.mem.Allocator) !void {
@@ -43,8 +47,8 @@ pub const Quil = struct {
             .alloc = alloc,
             .loop = loop,
             .render = try .init(alloc, loop),
-            .buffer_manager = try .init(alloc, loop),
-            .window_manager = try .init(alloc, &q.render, &q.buffer_manager),
+            .buf_manager = try .init(alloc, loop),
+            .win_manager = try .init(alloc, &q.render, &q.buf_manager),
         };
     }
 
@@ -62,8 +66,8 @@ pub const Quil = struct {
         q.loop.deinit(q.alloc);
 
         q.render.deinit();
-        q.buffer_manager.deinit();
-        q.window_manager.deinit();
+        q.buf_manager.deinit();
+        q.win_manager.deinit();
         q.cmds.deinit(q.alloc);
         q.* = undefined;
     }
@@ -71,10 +75,55 @@ pub const Quil = struct {
     fn tick(q: *Quil) !void {
         _ = q;
     }
+
+    //
+    // ==== Public API ====
+    //
+    // NOTE: Functions here should validate input and return errors,
+    //       the functions they call can assert valid input.
+    //
+
+    // == Buffers ==
+
+    pub fn buf_create(q: *Quil, name: []const u8) !BufferNum {
+        return try q.buf_manager.buffer_create(name);
+    }
+    pub fn buf_set_region(q: *Quil, buf: BufferNum, start: usize, end: usize, text: []const u8) !void {
+        try q.buf_manager.buffer_set_region(buf, start, end, text);
+    }
+
+    // == Windows ==
+
+    pub fn get_root_node(q: *Quil) *Node {
+        return q.win_manager.main_root.?;
+    }
+    pub fn node_get_ctnr(q: *Quil, node: *Node) ?*Node {
+        return q.win_manager.node_get_ctnr(node);
+    }
+    pub fn node_wrap(q: *Quil, node: *Node) !*Node {
+        return q.win_manager.node_wrap(node);
+    }
+    pub fn ctnr_insert(
+        q: *Quil,
+        ctnr: *Node,
+        child: *Node,
+        index: ICtnrChildIdx,
+    ) !void {
+        try q.win_manager.ctnr_insert(ctnr, child, index);
+    }
+    pub fn win_create(q: *Quil) !*Node {
+        return try q.win_manager.win_create();
+    }
+    pub fn win_get_buf(q: *Quil, win: *Node) BufferNum {
+        return q.win_manager.win_get_buf(win);
+    }
+    pub fn win_set_buf(q: *Quil, win: *Node, buf: BufferNum) !void {
+        try q.win_manager.win_set_buf(win, buf);
+    }
 };
 
 /// Start the event loop and launch Quil
-pub fn run(q: *Quil) !void {
+pub fn run(q: *Quil, setup_cb: ?fn (*Quil) Error!void) !void {
     q.is_alive = true;
     defer q.is_alive = false;
 
@@ -86,12 +135,12 @@ pub fn run(q: *Quil) !void {
     defer q.render.teardown() catch unreachable;
 
     // Setup Buffer Manager
-    try q.buffer_manager.setup();
-    defer q.buffer_manager.teardown() catch unreachable;
+    try q.buf_manager.setup();
+    defer q.buf_manager.teardown() catch unreachable;
 
     // Setup Window Manager
-    try q.window_manager.setup();
-    defer q.window_manager.teardown() catch unreachable;
+    try q.win_manager.setup();
+    defer q.win_manager.teardown() catch unreachable;
 
     // Handle Signals for graceful shutdown
 
@@ -132,8 +181,36 @@ pub fn run(q: *Quil) !void {
         }
     }
 
+    setup(q);
+    if (setup_cb) |cb| {
+        try cb(q);
+    }
+
+    {
+        const wm = &q.win_manager;
+        const dims = try q.render.tty_get_dimensions();
+        try wm.tree_layout(&wm.main_root.?, .zero, dims);
+    }
+    try q.render.flush();
+
     // Run Main Loop
 
     _ = try q.loop.run(.default);
     // Teardown defers run here after loop.stop()
+}
+
+fn setup(q: *Quil) !void {
+    const buf = try q.buf_create("*Scratch*");
+    const win = try q.win_create();
+    const root = q.get_root_node();
+
+    std.debug.assert(root.kind == .ctnr);
+
+    q.ctnr_insert(root, win, 0);
+    q.win_set_buf(win, buf);
+    q.buf_set_region(buf, 0, q.buf_get_len(buf),
+        \\
+        \\// Scratch zig buffer
+        \\
+    );
 }

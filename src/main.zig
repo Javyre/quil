@@ -2,6 +2,7 @@ const std = @import("std");
 const quil = @import("quil");
 
 pub const QuilError = error{};
+const Error = QuilError;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -9,25 +10,32 @@ pub fn main() !void {
     try q.init(gpa.allocator());
     defer q.deinit();
 
-    // setup(&q);
-
-    try quil.run(&q);
+    try quil.run(&q, setup);
 }
 
-// This code runs before the starting the event loop.
-fn setup(q: *quil.Quil) !void {
-    const win = q.win_at_point(null);
-    const buf = q.win_buf(win);
-    const nwin = q.win_split(win, .hori);
-    q.win_set_buf(nwin, buf);
-    q.win_set_width(nwin, 10);
+// This code runs right before the starting the event loop.
+fn setup(q: *quil.Quil) Error!void {
+    try vsplit(q, q.get_focused_win());
 
-    q.def_cmd(struct {
+    q.cmd_map(struct {
         fn write_buf(self: *@This(), qq: *quil.Quil) !void {
             _ = self;
             _ = qq;
         }
     }{});
 
-    q.map("SPC f s", .write_buf);
+    q.key_map("SPC f s", .write_buf);
+}
+
+fn vsplit(q: *quil.Quil, win: quil.Window) Error!quil.Window {
+    const buf = q.win_get_buf(win);
+    const nwin = q.win_create();
+    q.win_set_buf(nwin, buf);
+
+    const ctnr =
+        try q.node_get_ctnr(win) orelse
+        try q.node_wrap(win, .hori);
+    q.ctnr_insert(ctnr, nwin, -1);
+    q.node_set_width(nwin, 10);
+    return nwin;
 }

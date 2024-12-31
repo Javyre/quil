@@ -43,22 +43,15 @@ pub fn teardown(bm: *BufferManager) !void {
     _ = bm;
 }
 
-pub fn buffer_create_scratch(bm: *BufferManager) !BufferNum {
-    var lines: Buffer.Lines = .empty;
-    try lines.appendSlice(bm.alloc, &.{
-        .empty,
-        line: {
-            var line = std.ArrayListUnmanaged(u8).empty;
-            try line.appendSlice(bm.alloc, "// Scratch zig buffer");
-            break :line line;
-        },
-        .empty,
-    });
-
+pub fn buffer_create(bm: *BufferManager, name: []const u8) !BufferNum {
     return try bm.buffers.create(bm.alloc, .{
-        .name = try bm.alloc.dupe(u8, "*Scratch*"),
-        .lines = lines,
+        .name = try bm.alloc.dupe(u8, name),
+        .lines = .empty,
     });
+}
+
+pub fn buffer_set_region(bm: *BufferManager, num: BufferNum, start: usize, end: usize, text: []const u8) !void {
+    @panic("unimplemented");
 }
 
 pub fn buffer_get_lines(bm: *BufferManager, num: BufferNum) *Buffer.Lines {

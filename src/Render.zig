@@ -849,7 +849,10 @@ pub fn flush(r: *Render) !void {
                 const s_wrapping_ofs = s_slice.items(.wrapping_ofs)[s_idx];
                 {
                     const cells = s_dims.w * s_dims.h;
-                    std.debug.assert(s_cell_dirt.items.len == (cells + word_bits - 1) / word_bits);
+                    std.debug.assert(
+                        s_cell_dirt.items.len ==
+                            (cells + word_bits - 1) / word_bits,
+                    );
                 }
 
                 const D = BitMap.View.entire(s_cell_dirt.items, s_dims);
@@ -1317,8 +1320,16 @@ pub fn grid_create(r: *Render) !GridNum {
     return try r.grids.create(r.alloc, .empty);
 }
 
+pub fn grid_destroy(r: *Render, num: GridNum) void {
+    r.grids.destroy(num);
+}
+
 pub fn surface_create(r: *Render) !SurfaceNum {
     return try r.surfaces.create(r.alloc, .{});
+}
+
+pub fn surface_destroy(r: *Render, num: SurfaceNum) void {
+    r.surfaces.destroy(num);
 }
 
 pub fn grid_set_dimensions(
