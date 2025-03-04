@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const log = std.log.scoped(.rope);
 
 const Rope = @This();
 
@@ -217,6 +218,30 @@ const IndxBlock = extern struct {
         }
         return sum;
     }
+
+    pub fn format(
+        block: IndxBlock,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = fmt;
+        _ = options;
+        const f = std.fmt.format;
+        try f(writer, "IndxBlock {{ meta: {any}, ", .{block.meta});
+        try f(writer, "keys: {{ ", .{});
+        for (block.keys) |key| {
+            if (raw_key_is_null(key)) break;
+            try f(writer, "{d}, ", .{int_from_bytes(SubtreeByteSize, key)});
+        }
+        try f(writer, "}}, ", .{});
+        try f(writer, "children: {{ ", .{});
+        for (block.keys, block.children) |key, child| {
+            if (raw_key_is_null(key)) break;
+            try f(writer, "{d}, ", .{child});
+        }
+        try f(writer, "}} }}", .{});
+    }
 };
 
 const DataBlock = struct {
@@ -228,6 +253,26 @@ const DataBlock = struct {
         newlines: u128 = 0, // 128 = data_block_bytes_max
         next: ?Idx = null,
         prev: ?Idx = null,
+
+        pub fn format(
+            meta: Meta,
+            comptime fmt: []const u8,
+            options: std.fmt.FormatOptions,
+            writer: anytype,
+        ) !void {
+            _ = fmt;
+            _ = options;
+            try std.fmt.format(
+                writer,
+                "Meta {{ bytes: {d}, newlines: {b}, next: {?d}, prev: {?d} }}",
+                .{
+                    meta.bytes,
+                    meta.newlines,
+                    meta.next,
+                    meta.prev,
+                },
+            );
+        }
     };
 
     comptime {
@@ -236,6 +281,24 @@ const DataBlock = struct {
 
     meta: Meta align(dcache_line_bytes),
     bytes: [data_block_bytes_max]u8,
+
+    pub fn format(
+        block: DataBlock,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = fmt;
+        _ = options;
+        try std.fmt.format(
+            writer,
+            "DataBlock {{ meta: {any}, bytes: {s} }}",
+            .{
+                block.meta,
+                block.bytes[0..block.meta.bytes],
+            },
+        );
+    }
 
     pub const Slice = struct {
         block: *DataBlock,
@@ -248,58 +311,6 @@ const DataBlock = struct {
             .ofs = ofs,
             .len = len,
         };
-    }
-
-    // NOTE: If we can eventually get rid of all the long slice sutff,
-    //       that would be great.
-    //
-    //       This is usually much less efficient than manually copying chunks
-    //       of data_blocks around as we often have much more info at the
-    //       callsite about the copy and we can make assumptions.
-    pub const LongSlice = struct {
-        start_block: *DataBlock,
-        start_ofs: u7,
-        len: ByteIdx,
-    };
-    fn slice_long(db: *DataBlock, r: *Rope, ofs: ByteIdxDelta, len: ByteIdx) LongSlice {
-        if (ofs >= 0) {
-            var ofs_rest: ByteIdx = @intCast(ofs);
-            var start_block = db;
-            while (ofs_rest >= start_block.meta.bytes) {
-                start_block = r.data_blocks.at(
-                    db.meta.next orelse @panic("slice ofs out of bounds"),
-                );
-                ofs_rest -= start_block.meta.bytes;
-            }
-            assert(ofs_rest < start_block.meta.bytes);
-            return .{
-                .start_block = start_block,
-                .start_ofs = @intCast(ofs_rest),
-                .len = len,
-            };
-        } else {
-            var ofs_rest: ByteIdx = @intCast(-ofs);
-            assert(ofs_rest > 0);
-
-            var start_block = r.data_blocks.at(
-                db.meta.prev orelse @panic("slice ofs out of bounds"),
-            );
-            while (ofs_rest > start_block.meta.bytes) {
-                start_block = r.data_blocks.at(
-                    db.meta.prev orelse @panic("slice ofs out of bounds"),
-                );
-                ofs_rest -= start_block.meta.bytes;
-            }
-            assert(ofs_rest < start_block.meta.bytes);
-            return .{
-                .start_block = start_block,
-                .start_ofs = @intCast(
-                    start_block.meta.bytes -
-                        @as(u8, @intCast(ofs_rest)),
-                ),
-                .len = len,
-            };
-        }
     }
 };
 
@@ -540,6 +551,11 @@ fn alloc_at(r: *Rope, ofs: ByteIdx, alloc_len: ByteIdx) !struct {
     /// Bytes successfully allocated.
     alloc_len: ByteIdx,
 } {
+    log.debug(
+        "alloc_at(r: {*}, ofs: {d}, alloc_len: {d})",
+        .{ r, ofs, alloc_len },
+    );
+
     var path_store: [indx_blocks_height_max]BlockPathEntry = undefined;
     const target_query = x: {
         break :x r.find_data_block(r.indx_root, ofs, &path_store);
@@ -555,11 +571,7 @@ fn alloc_at(r: *Rope, ofs: ByteIdx, alloc_len: ByteIdx) !struct {
             entry.parent_block.child_subtree_bytes(entry.key_idx),
         );
         assert(len <= data_block_bytes_max);
-        if (len == 0) {
-            assert(target_query.block_ofs == ofs);
-        } else {
-            assert(target_query.block_ofs + len > ofs);
-        }
+        assert(ofs - target_query.block_ofs <= len);
         break :x .{
             .parent_block = entry.parent_block,
             .key_idx = entry.key_idx,
@@ -575,6 +587,8 @@ fn alloc_at(r: *Rope, ofs: ByteIdx, alloc_len: ByteIdx) !struct {
     // STEP 0: handle the data fitting without data block splitting.
 
     if (target.space >= alloc_len) {
+        log.debug("fits in target data block", .{});
+
         // we can fit the data in this single existing data block
         const start_ofs: u7 = @intCast(ofs - target.block_ofs);
         assert(start_ofs < data_block_bytes_max);
@@ -624,6 +638,7 @@ fn alloc_at(r: *Rope, ofs: ByteIdx, alloc_len: ByteIdx) !struct {
         target_r.?.space + target.space >= alloc_len)
     {
         // this + right is enough space
+        log.debug("fits in target + target_r data blocks", .{});
         const start_ofs: u7 = @intCast(ofs - target.block_ofs);
         assert(start_ofs < data_block_bytes_max);
 
@@ -675,8 +690,9 @@ fn alloc_at(r: *Rope, ofs: ByteIdx, alloc_len: ByteIdx) !struct {
         assert(new_target_len <= data_block_bytes_max);
         assert(new_target_r_len <= data_block_bytes_max);
         assert(
-            new_target_len + new_target_r_len ==
-                target.len + target_r.?.len + alloc_len,
+            @as(ByteIdx, new_target_len) + @as(ByteIdx, new_target_r_len) ==
+                @as(ByteIdx, target.len) + @as(ByteIdx, target_r.?.len) +
+                alloc_len,
         );
         assert(target.block.meta.bytes == target.len);
         assert(target_r.?.block.meta.bytes == target_r.?.len);
@@ -722,6 +738,7 @@ fn alloc_at(r: *Rope, ofs: ByteIdx, alloc_len: ByteIdx) !struct {
         @as(ByteIdx, if (target_r) |r_| r_.space else 0) >= alloc_len)
     {
         // this + left + right is enough space
+        log.debug("fits in target + target_l + target_r data blocks", .{});
 
         // PICTURE: before/after alloc:
         //
@@ -758,6 +775,11 @@ fn alloc_at(r: *Rope, ofs: ByteIdx, alloc_len: ByteIdx) !struct {
         // somethinghel | lo_worldlalal.. | goodbyelolololo
         //          ^^^underflow
         //          ^^^   ^^prefix
+        //
+        // something... | helloworldlalal | goodbyelolololo
+        // somethingh_e | lloworldlalal.. | goodbyelolololo
+        //          ^^^underflow
+        //          ^prefix
 
         // alloc left
         assert(alloc_len > target.space);
@@ -769,6 +791,21 @@ fn alloc_at(r: *Rope, ofs: ByteIdx, alloc_len: ByteIdx) !struct {
                 target_l.?.block.slice(@intCast(target_l.?.len), uf_pf_len),
                 target.block.slice(0, uf_pf_len),
             );
+            if (prefix_len < underflow_len and
+                prefix_len < target.len and
+                prefix_len + alloc_len < target_l.?.space)
+            {
+                const cpy_len: u8 = target_l.?.space -
+                    prefix_len -
+                    @as(u8, @intCast(alloc_len));
+                data_block_cpy(
+                    target_l.?.block.slice(
+                        @intCast(target_l.?.len + prefix_len + alloc_len),
+                        cpy_len,
+                    ),
+                    target.block.slice(prefix_len, cpy_len),
+                );
+            }
         }
 
         // alloc right
@@ -814,16 +851,17 @@ fn alloc_at(r: *Rope, ofs: ByteIdx, alloc_len: ByteIdx) !struct {
             }
         } else {
             // target shrinks
+            const first_shl = underflow_len - @as(u7, @intCast(alloc_len));
+            assert(first_shl > 0);
             data_block_shl(
                 target.block,
                 target.len,
-                underflow_len - @as(u7, @intCast(alloc_len)),
+                first_shl,
             );
-            if (prefix_len > 0) {
+            if (prefix_len > first_shl) {
                 data_block_shl(
                     target.block,
-                    prefix_len -
-                        (underflow_len - @as(u7, @intCast(alloc_len))),
+                    prefix_len - first_shl,
                     @truncate(alloc_len),
                 );
             }
@@ -843,8 +881,12 @@ fn alloc_at(r: *Rope, ofs: ByteIdx, alloc_len: ByteIdx) !struct {
             const new_right_len = target_r.?.len + overflow_len;
             assert(new_right_len <= data_block_bytes_max);
             assert(
-                new_left_len + new_this_len + new_right_len ==
-                    target_l.?.len + target.len + target_r.?.len + alloc_len,
+                @as(ByteIdx, new_left_len) +
+                    @as(ByteIdx, new_this_len) +
+                    @as(ByteIdx, new_right_len) ==
+                    @as(ByteIdx, target_l.?.len) +
+                    @as(ByteIdx, target.len) +
+                    @as(ByteIdx, target_r.?.len) + alloc_len,
             );
 
             assert(target_r.?.block.meta.bytes == target_r.?.len);
@@ -852,8 +894,9 @@ fn alloc_at(r: *Rope, ofs: ByteIdx, alloc_len: ByteIdx) !struct {
             parent.set_child_subtree_bytes(target.key_idx + 1, new_right_len);
         } else {
             assert(
-                new_left_len + new_this_len ==
-                    target_l.?.len + target.len + alloc_len,
+                @as(ByteIdx, new_left_len) + @as(ByteIdx, new_this_len) ==
+                    @as(ByteIdx, target_l.?.len) +
+                    @as(ByteIdx, target.len) + alloc_len,
             );
         }
         assert(target_l.?.block.meta.bytes == target_l.?.len);
@@ -928,17 +971,20 @@ fn alloc_at(r: *Rope, ofs: ByteIdx, alloc_len: ByteIdx) !struct {
         ++
         \\parent
     );
+    log.debug("splitting left = {}, right = {}", .{ split_l, split_r });
 
     // new data blocks and l/r will be 2/3 full. l will contain the spill.
-    const total_data_blocks =
-        (@as(ByteIdx, split_l.len) +
+    const total_bytes =
+        @as(ByteIdx, split_l.len) +
         @as(ByteIdx, split_r.len) +
-        alloc_len) / data_block_bytes_min;
+        alloc_len;
+    const total_data_blocks = total_bytes / data_block_bytes_min;
     assert(total_data_blocks >= 3);
     const new_data_blocks: DataBlock.Idx = @intCast(total_data_blocks - 2);
 
-    const prefix_len = ofs - split_l.block_ofs;
-    const postfix_len = (split_l.len - prefix_len) + split_r.len;
+    const prefix_len: ByteIdx = ofs - split_l.block_ofs;
+    const postfix_len: ByteIdx =
+        @as(ByteIdx, split_l.len) + @as(ByteIdx, split_r.len) - prefix_len;
     var buf_store: [data_block_bytes_max * 2]u8 = undefined;
     var buf = std.ArrayListUnmanaged(u8).initBuffer(&buf_store);
     buf.appendSliceAssumeCapacity(split_l.block.bytes[0..split_l.len]);
@@ -946,13 +992,15 @@ fn alloc_at(r: *Rope, ofs: ByteIdx, alloc_len: ByteIdx) !struct {
 
     // set split l/r lengths in advance so the insert_data_blocks call can
     // accurately recalculate the subtree sizes.
-    const spill_len: u6 = @intCast(
-        (split_l.len + split_r.len + alloc_len) -
-            (total_data_blocks * data_block_bytes_min),
+    const spill_len: u6 = @intCast(total_bytes % data_block_bytes_min);
+    assert(spill_len <= (data_block_bytes_max * 2) / 3);
+    const spill_len_l = @min(
+        data_block_bytes_max - data_block_bytes_min,
+        spill_len,
     );
-    assert(spill_len <= (data_block_bytes_max + 2) / 3);
-    const new_split_l_len: u8 = data_block_bytes_min + @as(u8, spill_len);
-    const new_split_r_len: u7 = data_block_bytes_min;
+    const spill_len_r = spill_len - spill_len_l;
+    const new_split_l_len: u8 = data_block_bytes_min + @as(u8, spill_len_l);
+    const new_split_r_len: u8 = data_block_bytes_min + @as(u8, spill_len_r);
     assert(new_split_l_len <= data_block_bytes_max);
     assert(new_split_r_len <= data_block_bytes_max);
     assert(
@@ -1013,25 +1061,35 @@ fn alloc_at(r: *Rope, ofs: ByteIdx, alloc_len: ByteIdx) !struct {
     assert(
         buf.items.len == @as(ByteIdx, prefix_len) + @as(ByteIdx, postfix_len),
     );
-    assert(r.data_block_set_bytes_long(
-        split_l.block.slice_long(r, 0, prefix_len),
-        buf.items[0..prefix_len],
-    ) == prefix_len);
-    assert(r.data_block_set_bytes_long(
-        split_r.block.slice_long(
+    {
+        var cursor = Cursor{
+            .block = split_l.block,
+            .ofs = 0,
+        };
+        cursor.writer(r).writeAll(buf.items[0..prefix_len]) catch
+            unreachable;
+    }
+    {
+        assert(buf.items[prefix_len..].len == postfix_len);
+        var cursor = Cursor{
+            .block = split_r.block,
+            .ofs = new_split_r_len,
+        };
+        cursor.seek_by(
             r,
             // NOTE: This will be negative on PURPOSE
-            @as(ByteIdxDelta, new_split_r_len) -
-                @as(ByteIdxDelta, postfix_len),
-            postfix_len,
-        ),
-        buf.items[prefix_len..],
-    ) == postfix_len);
+            // @as(ByteIdxDelta, new_split_r_len) -
+            -@as(ByteIdxDelta, postfix_len),
+        );
+        cursor.writer(r).writeAll(buf.items[prefix_len..]) catch
+            unreachable;
+    }
 
-    const alloc_slice = split_l.block.slice_long(r, prefix_len, alloc_len);
+    var cursor = Cursor{ .block = split_l.block, .ofs = 0 };
+    cursor.seek_by(r, prefix_len);
     return .{
-        .start_data_block = alloc_slice.start_block,
-        .start_ofs = alloc_slice.start_ofs,
+        .start_data_block = cursor.block,
+        .start_ofs = cursor.ofs,
         .alloc_len = (@as(ByteIdx, data_block_bytes_min) * 2) +
             @as(ByteIdx, spill_len) +
             @as(ByteIdx, allocated_data_blocks * data_block_bytes_min) -
@@ -1053,6 +1111,10 @@ fn insert_data_blocks(
     inserted_count: DataBlock.Idx,
     new_path: ?[]BlockPathEntry,
 } {
+    log.debug("insert_data_blocks(path: {any}, new_data_blocks: {d})", .{
+        path,
+        new_data_blocks,
+    });
     assert(new_data_blocks > 0);
     assert(path.len > 0);
 
@@ -1093,6 +1155,7 @@ fn insert_data_blocks(
 
     if (new_data_blocks <= target.space) {
         // fits in the single indx block
+        log.debug("fits in target indx block", .{});
         const start_ofs = path[path.len - 1].key_idx;
         assert(start_ofs < indx_block_keys_max);
 
@@ -1117,6 +1180,14 @@ fn insert_data_blocks(
             .inserted_count = new_data_blocks,
             .new_path = path,
         };
+    }
+
+    assert(path.len > 0);
+    if (path.len == 1) {
+        log.debug("root is full; creating new root", .{});
+        // COMBAK: impl this (without recursion plz)
+        //
+        @panic("unimplemented");
     }
 
     const target_r = right: {
@@ -1146,6 +1217,7 @@ fn insert_data_blocks(
         new_data_blocks <= target.space + target_r.?.space)
     {
         // fits in these two indx blocks.
+        log.debug("fits in target + target_r indx blocks", .{});
         const start_ofs = path[path.len - 1].key_idx;
         assert(start_ofs < indx_block_keys_max);
 
@@ -1245,6 +1317,7 @@ fn insert_data_blocks(
         (if (target_r) |r_| r_.space else 0) >= new_data_blocks)
     {
         // fits in these three/two indx blocks
+        log.debug("fits in target + target_l + target_r indx blocks", .{});
 
         const prefix_len: KeyIdx = path[path.len - 1].key_idx;
         const postfix_len: KeysLen = target.len - prefix_len;
@@ -1379,6 +1452,7 @@ fn insert_data_blocks(
             .block = r_.block,
         },
     } else unreachable;
+    log.debug("splitting left = {}, right = {}", .{ split_l, split_r });
 
     // we need to split target and r/l to create new data blocks for the
     // insertion.
@@ -2408,118 +2482,118 @@ fn data_block_set_bytes(db: *DataBlock, ofs: u7, bytes: []const u8) void {
     );
 }
 
-fn data_block_set_bytes_long(
-    r: *Rope,
-    dst: DataBlock.LongSlice,
-    _bytes: []const u8,
-) ByteIdx {
-    var bytes = _bytes;
-    assert(dst.len == bytes.len);
-    assert(dst.start_ofs <= dst.start_block.meta.bytes);
+// fn data_block_set_bytes_long(
+//     r: *Rope,
+//     dst: DataBlock.LongSlice,
+//     _bytes: []const u8,
+// ) ByteIdx {
+//     var bytes = _bytes;
+//     assert(dst.len == bytes.len);
+//     assert(dst.start_ofs <= dst.start_block.meta.bytes);
+//
+//     const Cursor = struct {
+//         block: ?*DataBlock,
+//         ofs: u7,
+//     };
+//     var cur_dst: Cursor = .{
+//         .block = dst.start_block,
+//         .ofs = dst.start_ofs,
+//     };
+//     while (bytes.len > 0) {
+//         if (cur_dst.block == null) break;
+//
+//         const cpy_len = @min(
+//             bytes.len,
+//             cur_dst.block.?.meta.bytes - cur_dst.ofs,
+//         );
+//         assert(cpy_len > 0);
+//
+//         data_block_set_bytes(
+//             cur_dst.block.?,
+//             cur_dst.ofs,
+//             bytes[0..cpy_len],
+//         );
+//
+//         // advance our cursor. null next blocks validated on next loop.
+//         assert(cur_dst.ofs + cpy_len <= cur_dst.block.?.meta.bytes);
+//         if (cur_dst.ofs + cpy_len == cur_dst.block.?.meta.bytes) {
+//             cur_dst.block = if (cur_dst.block.?.meta.next) |next|
+//                 r.data_blocks.at(next)
+//             else
+//                 null;
+//             cur_dst.ofs = 0;
+//         } else {
+//             cur_dst.ofs += @intCast(cpy_len);
+//         }
+//
+//         bytes = bytes[cpy_len..];
+//     }
+//     return @intCast(_bytes.len - bytes.len);
+// }
 
-    const Cursor = struct {
-        block: ?*DataBlock,
-        ofs: u7,
-    };
-    var cur_dst: Cursor = .{
-        .block = dst.start_block,
-        .ofs = dst.start_ofs,
-    };
-    while (bytes.len > 0) {
-        if (cur_dst.block == null) break;
-
-        const cpy_len = @min(
-            bytes.len,
-            cur_dst.block.?.meta.bytes - cur_dst.ofs,
-        );
-        assert(cpy_len > 0);
-
-        data_block_set_bytes(
-            cur_dst.block.?,
-            cur_dst.ofs,
-            bytes[0..cpy_len],
-        );
-
-        // advance our cursor. null next blocks validated on next loop.
-        assert(cur_dst.ofs + cpy_len <= cur_dst.block.?.meta.bytes);
-        if (cur_dst.ofs + cpy_len == cur_dst.block.?.meta.bytes) {
-            cur_dst.block = if (cur_dst.block.?.meta.next) |next|
-                r.data_blocks.at(next)
-            else
-                null;
-            cur_dst.ofs = 0;
-        } else {
-            cur_dst.ofs += @intCast(cpy_len);
-        }
-
-        bytes = bytes[cpy_len..];
-    }
-    return @intCast(_bytes.len - bytes.len);
-}
-
-/// Copy src to dst. Slices may span multiple blocks.
-/// Only overwrites in existing space. Does not modify block lens.
-///
-/// Individual chunk copy operations must not overlap.
-fn data_block_cpy_long(
-    dst: DataBlock.LongSlice,
-    src: DataBlock.LongSlice,
-) void {
-    assert(dst.len == src.len);
-    assert(src.start_ofs <= src.start_block.meta.bytes);
-    assert(dst.start_ofs <= dst.start_block.meta.bytes);
-    var rest = src.len;
-    const Cursor = struct {
-        block: ?*DataBlock,
-        ofs: u7,
-    };
-    var cur_src: Cursor = .{
-        .block = src.start_block,
-        .ofs = src.start_ofs,
-    };
-    var cur_dst: Cursor = .{
-        .block = dst.start_block,
-        .ofs = dst.start_ofs,
-    };
-    while (rest > 0) {
-        if (cur_src.block == null) @panic("src slice len out of bounds");
-        if (cur_dst.block == null) @panic("dst slice len out of bounds");
-
-        assert(cur_src.ofs < cur_src.block.meta.bytes);
-        assert(cur_dst.ofs < cur_dst.block.meta.bytes);
-
-        const cpy_len = @min(
-            rest,
-            cur_dst.block.meta.bytes - cur_dst.ofs,
-            cur_src.block.meta.bytes - cur_src.ofs,
-        );
-        assert(cpy_len > 0);
-
-        data_block_cpy(
-            cur_dst.block.slice(cur_dst.ofs, cpy_len),
-            cur_src.block.slice(cur_src.ofs, cpy_len),
-        );
-
-        // advance our cursors. null next blocks validated on next loop.
-        assert(cur_src.ofs + cpy_len <= cur_src.block.meta.bytes);
-        if (cur_src.ofs + cpy_len == cur_src.block.meta.bytes) {
-            cur_src.block = cur_src.block.meta.next;
-            cur_src.ofs = 0;
-        } else {
-            cur_src.ofs += cpy_len;
-        }
-
-        assert(cur_dst.ofs + cpy_len <= cur_dst.block.meta.bytes);
-        if (cur_dst.ofs + cpy_len == cur_dst.block.meta.bytes) {
-            cur_dst.block = cur_dst.block.meta.next;
-            cur_dst.ofs = 0;
-        } else {
-            cur_dst.ofs += cpy_len;
-        }
-
-        rest -= cpy_len;
-    }
-}
+// /// Copy src to dst. Slices may span multiple blocks.
+// /// Only overwrites in existing space. Does not modify block lens.
+// ///
+// /// Individual chunk copy operations must not overlap.
+// fn data_block_cpy_long(
+//     dst: DataBlock.LongSlice,
+//     src: DataBlock.LongSlice,
+// ) void {
+//     assert(dst.len == src.len);
+//     assert(src.start_ofs <= src.start_block.meta.bytes);
+//     assert(dst.start_ofs <= dst.start_block.meta.bytes);
+//     var rest = src.len;
+//     const Cursor = struct {
+//         block: ?*DataBlock,
+//         ofs: u7,
+//     };
+//     var cur_src: Cursor = .{
+//         .block = src.start_block,
+//         .ofs = src.start_ofs,
+//     };
+//     var cur_dst: Cursor = .{
+//         .block = dst.start_block,
+//         .ofs = dst.start_ofs,
+//     };
+//     while (rest > 0) {
+//         if (cur_src.block == null) @panic("src slice len out of bounds");
+//         if (cur_dst.block == null) @panic("dst slice len out of bounds");
+//
+//         assert(cur_src.ofs < cur_src.block.meta.bytes);
+//         assert(cur_dst.ofs < cur_dst.block.meta.bytes);
+//
+//         const cpy_len = @min(
+//             rest,
+//             cur_dst.block.meta.bytes - cur_dst.ofs,
+//             cur_src.block.meta.bytes - cur_src.ofs,
+//         );
+//         assert(cpy_len > 0);
+//
+//         data_block_cpy(
+//             cur_dst.block.slice(cur_dst.ofs, cpy_len),
+//             cur_src.block.slice(cur_src.ofs, cpy_len),
+//         );
+//
+//         // advance our cursors. null next blocks validated on next loop.
+//         assert(cur_src.ofs + cpy_len <= cur_src.block.meta.bytes);
+//         if (cur_src.ofs + cpy_len == cur_src.block.meta.bytes) {
+//             cur_src.block = cur_src.block.meta.next;
+//             cur_src.ofs = 0;
+//         } else {
+//             cur_src.ofs += cpy_len;
+//         }
+//
+//         assert(cur_dst.ofs + cpy_len <= cur_dst.block.meta.bytes);
+//         if (cur_dst.ofs + cpy_len == cur_dst.block.meta.bytes) {
+//             cur_dst.block = cur_dst.block.meta.next;
+//             cur_dst.ofs = 0;
+//         } else {
+//             cur_dst.ofs += cpy_len;
+//         }
+//
+//         rest -= cpy_len;
+//     }
+// }
 
 /// Shift the bytes in db by amt bytes to the left.
 inline fn data_block_shl(db: *DataBlock, ofs: u8, amt: u8) void {
@@ -2624,6 +2698,15 @@ inline fn indx_block_shr(ib: *IndxBlock, ofs: KeyIdx, amt: KeysLen) void {
         ib.keys[ofs..][0..@min(amt, indx_block_keys_max - ofs)],
         undefined,
     );
+    std.mem.copyBackwards(
+        IndxBlock.RawChild,
+        ib.children[ofs +| amt..][0..postfix_len],
+        ib.children[ofs..][0..postfix_len],
+    );
+    @memset(
+        ib.children[ofs..][0..@min(amt, indx_block_keys_max - ofs)],
+        undefined,
+    );
 }
 
 /// Update the parents of the given leaf block of the path to reflect the
@@ -2678,32 +2761,40 @@ fn indx_block_leaf_set_children_backwards(
     return next_idx_back;
 }
 
-// for reading/writing but no tree mutations. i.e. no (de)alloc of bytes.
-pub const Stream = struct {
-    r: *Rope,
-    cursor: Cursor = undefined,
-
-    const Cursor = struct {
-        block: *DataBlock,
-        ofs: u8,
-        pos: ByteIdx,
-    };
+// For reading/writing but no tree mutations. i.e. no (de)alloc of bytes.
+//
+// NOTE: For rope internal code, this is usually much less efficient than
+//       manually copying chunks of data_blocks around as we often have much
+//       more info at the callsite about the copy and we can make assumptions.
+pub const Cursor = struct {
+    block: *DataBlock,
+    ofs: u8,
 
     pub const ReadError = error{};
-    pub const WriteError = error{};
+    pub const WriteError = error{NoSpaceLeft};
 
-    pub const Writer = std.io.Writer(*@This(), WriteError, write);
-    pub const Reader = std.io.Reader(*@This(), ReadError, read);
+    const Ctx = struct {
+        r: *Rope,
+        cursor: *Cursor,
+        pub fn read(ctx: Ctx, dst: []u8) ReadError!usize {
+            return ctx.cursor.read(ctx.r, dst);
+        }
+        pub fn write(ctx: Ctx, src: []const u8) WriteError!usize {
+            return ctx.cursor.write(ctx.r, src);
+        }
+    };
+    pub const Writer = std.io.Writer(Ctx, WriteError, Ctx.write);
+    pub const Reader = std.io.Reader(Ctx, ReadError, Ctx.read);
 
-    pub fn reader(s: *@This()) Reader {
-        return .{ .context = s };
+    pub fn reader(c: *@This(), r: *Rope) Reader {
+        return .{ .context = .{ .r = r, .cursor = c } };
     }
-    pub fn writer(s: *@This()) Writer {
-        return .{ .context = s };
+    pub fn writer(c: *@This(), r: *Rope) Writer {
+        return .{ .context = .{ .r = r, .cursor = c } };
     }
 
-    pub fn read(s: *@This(), _dst: []u8) ReadError!usize {
-        assert(s.cursor.ofs <= s.cursor.block.meta.bytes);
+    pub fn read(c: *@This(), r: *Rope, _dst: []u8) ReadError!usize {
+        assert(c.ofs <= c.block.meta.bytes);
         var dst = _dst;
 
         var i: usize = 0;
@@ -2713,22 +2804,21 @@ pub const Stream = struct {
 
             const cpy_len = @min(
                 dst.len,
-                s.cursor.block.meta.bytes - s.cursor.ofs,
+                c.block.meta.bytes - c.ofs,
             );
             @memcpy(
                 dst[0..cpy_len],
-                s.cursor.block.bytes[s.cursor.ofs..][0..cpy_len],
+                c.block.bytes[c.ofs..][0..cpy_len],
             );
             dst = dst[cpy_len..];
-            s.cursor.ofs += cpy_len;
-            s.cursor.pos += cpy_len;
+            c.ofs += cpy_len;
 
-            assert(s.cursor.ofs <= s.cursor.block.meta.bytes);
-            if (s.cursor.ofs == s.cursor.block.meta.bytes) {
-                s.cursor.block = s.r.data_blocks.at(
-                    s.cursor.block.meta.next orelse break,
+            assert(c.ofs <= c.block.meta.bytes);
+            if (c.ofs == c.block.meta.bytes) {
+                c.block = r.data_blocks.at(
+                    c.block.meta.next orelse break,
                 );
-                s.cursor.ofs = 0;
+                c.ofs = 0;
             }
         }
 
@@ -2736,8 +2826,8 @@ pub const Stream = struct {
         return bytes_read;
     }
 
-    pub fn write(s: *@This(), _src: []const u8) WriteError!usize {
-        assert(s.cursor.ofs <= s.cursor.block.meta.bytes);
+    pub fn write(c: *@This(), r: *Rope, _src: []const u8) WriteError!usize {
+        assert(c.ofs <= c.block.meta.bytes);
         var src = _src;
 
         var i: usize = 0;
@@ -2747,68 +2837,167 @@ pub const Stream = struct {
 
             const cpy_len = @min(
                 src.len,
-                s.cursor.block.meta.bytes - s.cursor.ofs,
+                c.block.meta.bytes - c.ofs,
             );
             data_block_set_bytes(
-                s.cursor.block,
-                @intCast(s.cursor.ofs),
+                c.block,
+                @intCast(c.ofs),
                 src[0..cpy_len],
             );
             src = src[cpy_len..];
-            s.cursor.ofs += cpy_len;
-            s.cursor.pos += cpy_len;
+            c.ofs += cpy_len;
 
-            assert(s.cursor.ofs <= s.cursor.block.meta.bytes);
-            if (s.cursor.ofs == s.cursor.block.meta.bytes) {
-                s.cursor.block = s.r.data_blocks.at(
-                    s.cursor.block.meta.next orelse break,
+            assert(c.ofs <= c.block.meta.bytes);
+            if (c.ofs == c.block.meta.bytes) {
+                c.block = r.data_blocks.at(
+                    c.block.meta.next orelse break,
                 );
-                s.cursor.ofs = 0;
+                c.ofs = 0;
             }
         }
         const written = _src.len - src.len;
         assert(written > 0);
+        if (written != _src.len) return WriteError.NoSpaceLeft;
         return written;
     }
 
-    pub fn get_pos(s: *@This()) ByteIdx {
-        return s.cursor.pos;
+    fn seek_forward(c: *@This(), r: *Rope, _by: ByteIdx) void {
+        assert(c.ofs <= c.block.meta.bytes);
+        var by = _by;
+
+        var i: usize = 0;
+        while (by > 0) : (i += 1) {
+            if (i >= data_blocks_max)
+                @panic("reached max iterations. probably a bug.");
+
+            const cpy_len = @min(
+                by,
+                c.block.meta.bytes - c.ofs,
+            );
+            by -= cpy_len;
+            c.ofs += cpy_len;
+
+            assert(c.ofs <= c.block.meta.bytes);
+            if (c.ofs == c.block.meta.bytes) {
+                c.block = r.data_blocks.at(
+                    c.block.meta.next orelse break,
+                );
+                c.ofs = 0;
+            }
+        }
+        if (by != 0) @panic("seek_forward out of bounds");
     }
 
-    pub fn get_end_pos(s: *@This()) ByteIdx {
-        return s.r.indx_root.sum_subtree_sizes();
+    fn seek_back(c: *@This(), r: *Rope, _by: ByteIdx) void {
+        assert(c.ofs <= c.block.meta.bytes);
+        var by = _by;
+
+        var i: usize = 0;
+        while (by > 0) : (i += 1) {
+            if (i >= data_blocks_max)
+                @panic("reached max iterations. probably a bug.");
+
+            if (c.ofs == 0) {
+                c.block = r.data_blocks.at(
+                    c.block.meta.prev orelse break,
+                );
+                c.ofs = c.block.meta.bytes;
+            }
+
+            assert(c.ofs <= c.block.meta.bytes);
+            const cpy_len = @min(
+                by,
+                c.ofs,
+            );
+            by -= cpy_len;
+            c.ofs -= cpy_len;
+        }
+        if (by > 0) {
+            // we should be leaving the cursor within a block. not past the
+            // end.
+            assert(c.ofs < c.block.meta.bytes);
+        }
     }
 
-    pub fn seek_to(s: *@This(), pos: ByteIdx) void {
+    pub fn seek_by(c: *@This(), r: *Rope, delta: ByteIdxDelta) void {
+        assert(c.ofs <= c.block.meta.bytes);
+        if (delta == 0) return;
+        if (delta > 0) return c.seek_forward(r, @intCast(delta));
+        c.seek_back(r, @intCast(-delta));
+    }
+};
+
+pub const AbsCursor = struct {
+    cursor: Cursor,
+    pos: ByteIdx,
+
+    pub const ReadError = Cursor.ReadError;
+    pub const WriteError = Cursor.WriteError;
+
+    const Ctx = struct {
+        r: *Rope,
+        cursor: *AbsCursor,
+        pub fn read(ctx: Ctx, dst: []u8) ReadError!usize {
+            return ctx.cursor.read(ctx.r, dst);
+        }
+        pub fn write(ctx: Ctx, src: []const u8) WriteError!usize {
+            return ctx.cursor.write(ctx.r, src);
+        }
+    };
+    pub const Writer = std.io.Writer(Ctx, WriteError, Ctx.write);
+    pub const Reader = std.io.Reader(Ctx, ReadError, Ctx.read);
+
+    fn reader(c: *@This(), r: *Rope) Reader {
+        return .{ .context = .{ .r = r, .cursor = c } };
+    }
+    fn writer(c: *@This(), r: *Rope) Writer {
+        return .{ .context = .{ .r = r, .cursor = c } };
+    }
+
+    pub fn read(c: *@This(), r: *Rope, dst: []u8) ReadError!usize {
+        const res = try c.cursor.read(r, dst);
+        c.pos += @intCast(res);
+        return res;
+    }
+
+    pub fn write(c: *@This(), r: *Rope, src: []const u8) WriteError!usize {
+        const res = try c.cursor.write(r, src);
+        c.pos += @intCast(res);
+        return res;
+    }
+
+    pub fn get_pos(c: *@This()) ByteIdx {
+        return c.pos;
+    }
+
+    pub fn seek_to(c: *@This(), r: *Rope, pos: ByteIdx) void {
         // TODO: make path output optional
         var path_store: [indx_blocks_height_max]BlockPathEntry = undefined;
-        const res = s.r.find_data_block(s.r.indx_root, pos, &path_store);
-        const block = s.r.data_blocks.at(
+        const res = r.find_data_block(r.indx_root, pos, &path_store);
+        const block = r.data_blocks.at(
             res.path[res.path.len - 1].parent_block.child_data_block(
                 res.path[res.path.len - 1].key_idx,
             ),
         );
-        s.cursor = .{
-            .block = block,
-            .ofs = @intCast(pos - res.block_ofs),
+        c.* = .{
             .pos = pos,
+            .cursor = .{
+                .block = block,
+                .ofs = @intCast(pos - res.block_ofs),
+            },
         };
     }
 
-    pub fn seek_by(s: *@This(), delta: ByteIdxDelta) void {
-        const slice = s.cursor.block.slice_long(delta, 0);
-        s.cursor = .{
-            .block = slice.start_block,
-            .ofs = slice.start_ofs,
-            .pos = @intCast(@as(ByteIdxDelta, s.cursor.pos) + delta),
-        };
+    pub fn seek_by(c: *@This(), delta: ByteIdxDelta) void {
+        c.cursor.seek_by(delta);
+        c.pos = @intCast(@as(ByteIdxDelta, c.pos) + delta);
     }
 };
 
-pub fn stream(r: *Rope, initial_pos: ByteIdx) Stream {
-    var res: Stream = .{ .r = r };
-    res.seek_to(initial_pos);
-    return res;
+pub fn absolute_cursor_at(r: *Rope, initial_pos: ByteIdx) AbsCursor {
+    var cursor: AbsCursor = undefined;
+    cursor.seek_to(r, initial_pos);
+    return cursor;
 }
 
 // pub fn set_region(r: *Rope, start: ByteIdx, end: ByteIdx, text: []const u8) !void {}
@@ -2821,8 +3010,8 @@ pub fn insert(r: *Rope, ofs: ByteIdx, text: []const u8) !void {
         const res = try r.alloc_at(ofs, rest);
         rest -= res.alloc_len;
     }
-    var s = r.stream(ofs);
-    s.writer().writeAll(text) catch unreachable;
+    var s = r.absolute_cursor_at(ofs);
+    s.writer(r).writeAll(text) catch unreachable;
 }
 
 pub fn get_len(r: *Rope) ByteIdx {
@@ -2838,13 +3027,13 @@ pub fn format(
     _ = fmt;
     _ = options;
 
-    var s = r.stream(0);
+    var s = r.absolute_cursor_at(0);
     var i: usize = 0;
     while (true) : (i += 1) {
         if (i >= 100) @panic("reached max iterations. probably a bug.");
 
         var buf: [100]u8 = undefined;
-        const len = s.reader().readAll(&buf) catch unreachable;
+        const len = s.reader(r).readAll(&buf) catch unreachable;
         try std.fmt.format(writer, "{s}", .{buf[0..len]});
         if (len < buf.len) break;
     }
@@ -2854,7 +3043,7 @@ const ValidBlockResult = struct {
     subtree_bytes: SubtreeByteSize,
     last_db_idx: DataBlock.Idx,
 };
-fn assert_valid_indx_block(
+fn assert_valid__indx_block(
     r: *Rope,
     block: *IndxBlock,
     depth: u8,
@@ -2882,13 +3071,13 @@ fn assert_valid_indx_block(
             const db_idx = block.child_data_block(@intCast(i));
             break :x ValidBlockResult{
                 .last_db_idx = db_idx,
-                .subtree_bytes = r.assert_valid_data_block(
+                .subtree_bytes = r.assert_valid__data_block(
                     r.data_blocks.at(db_idx),
                     depth + 1,
                     last_db_idx,
                 ),
             };
-        } else r.assert_valid_indx_block(
+        } else r.assert_valid__indx_block(
             r.indx_blocks.at(block.child_indx_block(@intCast(i))),
             depth + 1,
             last_db_idx,
@@ -2903,7 +3092,7 @@ fn assert_valid_indx_block(
     };
 }
 
-fn assert_valid_data_block(
+fn assert_valid__data_block(
     r: *Rope,
     block: *DataBlock,
     depth: u8,
@@ -2916,14 +3105,13 @@ fn assert_valid_data_block(
         assert(block.meta.bytes >= data_block_bytes_min);
     }
     assert(block.meta.prev == prev_db_idx);
-    if (prev_db_idx) |p| assert(
-        r.data_blocks.at(r.data_blocks.at(p).meta.next.?) == block,
-    );
+    if (prev_db_idx) |p|
+        assert(r.data_blocks.at(r.data_blocks.at(p).meta.next.?) == block);
     return block.meta.bytes;
 }
 
 fn assert_valid(r: *Rope) void {
-    const res = r.assert_valid_indx_block(r.indx_root, 0, null);
+    const res = r.assert_valid__indx_block(r.indx_root, 0, null);
 
     var path_store: [indx_blocks_height_max]BlockPathEntry = undefined;
     const head = r.find_data_block(r.indx_root, 0, &path_store);
@@ -2955,6 +3143,7 @@ test insert {
 }
 
 test "insert-fuzz" {
+    std.testing.log_level = .debug;
     // makes for easier print debugging
     const gen_ascii = true;
 
@@ -2964,6 +3153,7 @@ test "insert-fuzz" {
     var str = std.ArrayList(u8).init(std.testing.allocator);
 
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    // var prng = std.Random.DefaultPrng.init(0x3bdac17f);
     const rand = prng.random();
 
     var buf: [1024 * 1024]u8 = undefined;
@@ -2973,7 +3163,8 @@ test "insert-fuzz" {
             const pos = rand.uintAtMost(ByteIdx, rope.get_len());
             const text = buf[0..rand.uintLessThan(usize, max_len)];
             if (gen_ascii) {
-                for (text) |*c| c.* = rand.uintLessThan(u8, 'z' - 'a') + 'a';
+                // for (text) |*c| c.* = rand.uintLessThan(u8, 'z' - 'a') + 'a';
+                @memset(text, rand.uintLessThan(u8, 'z' - 'a') + 'a' - (if (rand.boolean()) ('a' - 'A') else @as(u8, 0)));
             } else {
                 rand.bytes(text);
             }
