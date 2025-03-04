@@ -1321,7 +1321,7 @@ pub fn grid_create(r: *Render) !GridNum {
 }
 
 pub fn grid_destroy(r: *Render, num: GridNum) void {
-    r.grids.destroy(num);
+    r.grids.destroy(r.alloc, num);
 }
 
 pub fn surface_create(r: *Render) !SurfaceNum {
@@ -1329,7 +1329,7 @@ pub fn surface_create(r: *Render) !SurfaceNum {
 }
 
 pub fn surface_destroy(r: *Render, num: SurfaceNum) void {
-    r.surfaces.destroy(num);
+    r.surfaces.destroy(r.alloc, num);
 }
 
 pub fn grid_set_dimensions(

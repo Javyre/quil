@@ -3,7 +3,7 @@
   description = "Quil deps.";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
 
     flake-parts.url = "github:hercules-ci/flake-parts";
 
@@ -34,7 +34,7 @@
           ...
         }:
         let
-          zig = inputs'.zig.packages.master-2024-12-22;
+          zig = inputs'.zig.packages.master-2025-02-22;
           zls = inputs'.zls.packages.zls;
         in
         {
@@ -44,6 +44,8 @@
             buildInputs = [
               zig
               zls
+              pkgs.llvmPackages.lldb
+              # pkgs.vscode-extensions.vadimcn.vscode-lldb.adapter
             ];
           };
         };

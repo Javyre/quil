@@ -1,9 +1,17 @@
 const std = @import("std");
 const uv = @import("uv");
+const Rope = @import("./Rope.zig");
 
 const MultiArrayPool = @import("./multi_array_pool.zig").MultiArrayPool;
 
 const BufferManager = @This();
+
+test {
+    std.testing.refAllDecls(@This());
+    // TODO: figure out why we need this line if the above line already exists
+    _ = Rope;
+    // _ = @import("Rope.zig");
+}
 
 alloc: std.mem.Allocator,
 loop: uv.Loop,
@@ -50,7 +58,18 @@ pub fn buffer_create(bm: *BufferManager, name: []const u8) !BufferNum {
     });
 }
 
-pub fn buffer_set_region(bm: *BufferManager, num: BufferNum, start: usize, end: usize, text: []const u8) !void {
+pub fn buffer_set_region(
+    bm: *BufferManager,
+    num: BufferNum,
+    start: isize,
+    end: isize,
+    text: []const u8,
+) !void {
+    _ = bm;
+    _ = num;
+    _ = start;
+    _ = end;
+    _ = text;
     @panic("unimplemented");
 }
 

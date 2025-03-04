@@ -5,8 +5,8 @@ const BufferManager = @import("./BufferManager.zig");
 
 const WindowManager = @This();
 
-const UCtnrChildIdx = u10;
-const ICtnrChildIdx = i11;
+pub const UCtnrChildIdx = u10;
+pub const ICtnrChildIdx = i11;
 
 alloc: std.mem.Allocator,
 render: *Render,
@@ -50,7 +50,7 @@ pub const Node = struct {
         .dims = .zero,
         .parent = .{ .root_grid = .null },
         .kind = .{
-            .ctnr = .{ .dir = .hori },
+            .ctnr = .{ .dir = .horizontal },
         },
     };
 
@@ -117,7 +117,7 @@ pub fn tree_layout(
 ) !void {
     std.debug.assert(root.parent == .root_grid);
     try wm.render.grid_set_dimensions(
-        root.parent.root_grid.backing_grid,
+        root.parent.root_grid,
         new_dims,
     );
     // screen_pos = grid_pos + screen_pos_ofs
@@ -131,7 +131,7 @@ pub fn tree_layout(
         .new_grid_pos = new_pos,
     });
 
-    while (stack.popOrNull()) |s| {
+    while (stack.pop()) |s| {
         switch (s.node.kind) {
             .ctnr => |*ctnr| {
                 try wm.layout_tiled_ctnr(

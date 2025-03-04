@@ -34,10 +34,11 @@ pub fn MultiArrayPool(comptime T: type) type {
             return num;
         }
 
-        pub fn destroy(pool: *Pool, alloc: std.mem.Allocator) void {
+        pub fn destroy(pool: *Pool, alloc: std.mem.Allocator, idx: Idx) void {
             // TODO: destroy
             _ = pool;
             _ = alloc;
+            _ = idx;
         }
 
         /// WARN: iteration on this slice is currently undefined

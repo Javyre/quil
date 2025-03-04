@@ -8,7 +8,7 @@ const WindowManager = @import("./WindowManager.zig");
 const BufferManager = @import("./BufferManager.zig");
 
 const BufferNum = BufferManager.BufferNum;
-const Node = WindowManager.Node;
+pub const Node = WindowManager.Node;
 const ICtnrChildIdx = WindowManager.ICtnrChildIdx;
 
 test {
@@ -88,7 +88,13 @@ pub const Quil = struct {
     pub fn buf_create(q: *Quil, name: []const u8) !BufferNum {
         return try q.buf_manager.buffer_create(name);
     }
-    pub fn buf_set_region(q: *Quil, buf: BufferNum, start: usize, end: usize, text: []const u8) !void {
+    pub fn buf_set_region(
+        q: *Quil,
+        buf: BufferNum,
+        start: isize,
+        end: isize,
+        text: []const u8,
+    ) !void {
         try q.buf_manager.buffer_set_region(buf, start, end, text);
     }
 
@@ -181,7 +187,7 @@ pub fn run(q: *Quil, setup_cb: ?fn (*Quil) Error!void) !void {
         }
     }
 
-    setup(q);
+    try setup(q);
     if (setup_cb) |cb| {
         try cb(q);
     }
@@ -189,7 +195,7 @@ pub fn run(q: *Quil, setup_cb: ?fn (*Quil) Error!void) !void {
     {
         const wm = &q.win_manager;
         const dims = try q.render.tty_get_dimensions();
-        try wm.tree_layout(&wm.main_root.?, .zero, dims);
+        try wm.tree_layout(wm.main_root.?, .zero, dims);
     }
     try q.render.flush();
 
@@ -206,9 +212,9 @@ fn setup(q: *Quil) !void {
 
     std.debug.assert(root.kind == .ctnr);
 
-    q.ctnr_insert(root, win, 0);
-    q.win_set_buf(win, buf);
-    q.buf_set_region(buf, 0, q.buf_get_len(buf),
+    try q.ctnr_insert(root, win, 0);
+    try q.win_set_buf(win, buf);
+    try q.buf_set_region(buf, 0, -1,
         \\
         \\// Scratch zig buffer
         \\

@@ -15,19 +15,20 @@ pub fn main() !void {
 
 // This code runs right before the starting the event loop.
 fn setup(q: *quil.Quil) Error!void {
-    try vsplit(q, q.get_focused_win());
-
-    q.cmd_map(struct {
-        fn write_buf(self: *@This(), qq: *quil.Quil) !void {
-            _ = self;
-            _ = qq;
-        }
-    }{});
-
-    q.key_map("SPC f s", .write_buf);
+    _ = q;
+    // try vsplit(q, q.get_focused_win());
+    //
+    // q.cmd_map(struct {
+    //     fn write_buf(self: *@This(), qq: *quil.Quil) !void {
+    //         _ = self;
+    //         _ = qq;
+    //     }
+    // }{});
+    //
+    // q.key_map("SPC f s", .write_buf);
 }
 
-fn vsplit(q: *quil.Quil, win: quil.Window) Error!quil.Window {
+fn vsplit(q: *quil.Quil, win: *quil.Node) Error!*quil.Node {
     const buf = q.win_get_buf(win);
     const nwin = q.win_create();
     q.win_set_buf(nwin, buf);
