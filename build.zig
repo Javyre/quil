@@ -38,12 +38,26 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_mod,
     });
     b.installArtifact(lib);
+    const lib_check = b.addStaticLibrary(.{
+        .name = "quil",
+        .root_module = lib_mod,
+    });
 
     const exe = b.addExecutable(.{
         .name = "quil",
         .root_module = exe_mod,
     });
     b.installArtifact(exe);
+    const exe_check = b.addExecutable(.{
+        .name = "quil",
+        .root_module = exe_mod,
+    });
+
+    // Check
+
+    const check = b.step("check", "Check if it compiles");
+    check.dependOn(&lib_check.step);
+    check.dependOn(&exe_check.step);
 
     // Run
 

@@ -238,7 +238,8 @@ const IndxBlock = extern struct {
         try f(writer, "children: {{ ", .{});
         for (block.keys, block.children) |key, child| {
             if (raw_key_is_null(key)) break;
-            try f(writer, "{d}, ", .{child});
+            // In practice both idx types are u32 so this is fine.
+            try f(writer, "{d}, ", .{int_from_bytes(u32, child)});
         }
         try f(writer, "}} }}", .{});
     }
@@ -603,7 +604,7 @@ fn alloc_at(r: *Rope, ofs: ByteIdx, alloc_len: ByteIdx) !struct {
         target.block.meta.bytes = new_len;
         target.parent_block.set_child_subtree_bytes(target.key_idx, new_len);
 
-        indx_block_update_len(target_parent_path, @intCast(alloc_len));
+        block_update_parents_len(target_parent_path, @intCast(alloc_len));
 
         return .{
             .start_data_block = target.block,
@@ -613,7 +614,8 @@ fn alloc_at(r: *Rope, ofs: ByteIdx, alloc_len: ByteIdx) !struct {
     }
 
     const target_r = right: {
-        const has_right = target.key_idx + 1 < indx_block_keys_max and
+        const has_right =
+            @as(KeysLen, target.key_idx) + 1 < indx_block_keys_max and
             !IndxBlock.raw_key_is_null(
             target.parent_block.keys[target.key_idx + 1],
         );
@@ -703,7 +705,7 @@ fn alloc_at(r: *Rope, ofs: ByteIdx, alloc_len: ByteIdx) !struct {
         target.parent_block
             .set_child_subtree_bytes(target.key_idx + 1, new_target_r_len);
 
-        indx_block_update_len(target_parent_path, @intCast(alloc_len));
+        block_update_parents_len(target_parent_path, @intCast(alloc_len));
 
         return .{
             .start_data_block = target.block,
@@ -906,7 +908,7 @@ fn alloc_at(r: *Rope, ofs: ByteIdx, alloc_len: ByteIdx) !struct {
         parent.set_child_subtree_bytes(target.key_idx - 1, new_left_len);
         parent.set_child_subtree_bytes(target.key_idx, new_this_len);
 
-        indx_block_update_len(target_parent_path, @intCast(alloc_len));
+        block_update_parents_len(target_parent_path, @intCast(alloc_len));
 
         if (prefix_len < underflow_len) {
             return .{
@@ -1172,9 +1174,10 @@ fn insert_data_blocks(
         );
 
         // path to the target leaf block
-        indx_block_update_len(path[0 .. path.len - 1], @intCast(
-            new_data_blocks * data_block_bytes_min,
-        ));
+        block_update_parents_len2(
+            path[0 .. path.len - 1],
+            target.block.sum_subtree_sizes(),
+        );
 
         return .{
             .inserted_count = new_data_blocks,
@@ -1184,16 +1187,137 @@ fn insert_data_blocks(
 
     assert(path.len > 0);
     if (path.len == 1) {
-        log.debug("root is full; creating new root", .{});
-        // COMBAK: impl this (without recursion plz)
+        log.debug("root is full; creating new root and splitting", .{});
+
+        const new_indx_blocks: IndxBlock.Idx = x: {
+            const total_indx_blocks =
+                (@as(IndxBlock.Idx, target.len) +
+                new_data_blocks +
+                @as(IndxBlock.Idx, indx_block_keys_min) - 1) /
+                indx_block_keys_min;
+            assert(total_indx_blocks >= 2);
+            break :x @min(
+                total_indx_blocks - 1,
+                new_leaf_blocks_max,
+            );
+        };
+        assert(new_indx_blocks > 0);
+
+        const actual_new_data_blocks = @min(
+            new_data_blocks,
+            target.space + // try to fill target
+                (new_indx_blocks * indx_block_keys_min), // new indx blocks
+        );
+        assert(actual_new_data_blocks <= new_data_blocks);
+
+        // save the first data block as it is the head of a linked list
+        assert(target.len > 0);
+        assert(!IndxBlock.raw_key_is_null(target.block.keys[0]));
+        var next_data_block_idx: ?DataBlock.Idx = int_from_bytes(
+            DataBlock.Idx,
+            target.block.children[0],
+        );
+        try r.data_block_insert(
+            actual_new_data_blocks,
+            target.data_postfix_begin,
+            target.data_postfix_begin_idx,
+        );
+
+        const new_target_len: KeysLen = @intCast(
+            (@as(DataBlock.Idx, target.len) +
+                @as(DataBlock.Idx, actual_new_data_blocks)) -
+                (new_indx_blocks * @as(DataBlock.Idx, indx_block_keys_min)),
+        );
+        assert(new_target_len <= indx_block_keys_max);
+
+        const last_data_block_idx =
+            target.block.child_data_block(@intCast(target.len - 1));
+        const last_data_block = r.data_blocks.at(last_data_block_idx);
+
+        // new_target_len goes into target
+        // create new target block and repurpose the old one to be root still.
+        const new_target_block = try r.indx_blocks.addOne(r.alloc);
+        const new_target_block_idx: IndxBlock.Idx =
+            @intCast(r.indx_blocks.len - 1);
+        new_target_block.* = .empty_leaf;
+        next_data_block_idx = r.write_data_blocks(
+            &new_target_block.keys,
+            &new_target_block.children,
+            next_data_block_idx.?,
+            new_target_len,
+        );
+        assert(r.indx_root == target.block);
+        target.block.* = .{
+            .meta = .{ .is_leaf = false },
+            .keys = @splat(IndxBlock.null_key),
+            .children = undefined,
+        };
+        target.block.keys[0] = bytes_from_int(
+            @as(SubtreeByteSize, new_target_block.sum_subtree_sizes()),
+        );
+        target.block.children[0] = bytes_from_int(new_target_block_idx);
+
+        // rest goest into pending indx blocks insertion
         //
-        @panic("unimplemented");
+        // 256 + 128 bytes
+        // 2*indx_block_keys_max extra spots for the insert_indx_blocks() call
+        const pending_bs_store_len =
+            new_leaf_blocks_max + (2 * @as(comptime_int, indx_block_keys_max));
+        var pending_bs_store: [pending_bs_store_len]IndxBlock.RawChild =
+            undefined;
+        var pending_ks_store: [pending_bs_store_len]IndxBlock.RawKey =
+            @splat(IndxBlock.null_key);
+        var new_pending_bs: std.ArrayListUnmanaged(IndxBlock.RawChild) =
+            .initBuffer(pending_bs_store[0..]);
+        var new_pending_ks: std.ArrayListUnmanaged(IndxBlock.RawKey) =
+            .initBuffer(pending_ks_store[0..]);
+
+        for (0..new_indx_blocks) |_| {
+            const new_leaf = try r.indx_blocks.addOne(r.alloc);
+            new_leaf.* = .empty_leaf;
+            next_data_block_idx = r.write_data_blocks(
+                &new_leaf.keys,
+                &new_leaf.children,
+                next_data_block_idx.?,
+                indx_block_keys_min,
+            );
+            const subtree_bytes = x: {
+                var b: SubtreeByteSize = 0;
+                for (new_leaf.keys) |key| {
+                    if (IndxBlock.raw_key_is_null(key)) break;
+                    b += int_from_bytes(SubtreeByteSize, key);
+                }
+                break :x b;
+            };
+            new_pending_bs.appendAssumeCapacity(bytes_from_int(
+                @as(IndxBlock.Idx, @intCast(r.indx_blocks.len - 1)),
+            ));
+            new_pending_ks.appendAssumeCapacity(bytes_from_int(subtree_bytes));
+        }
+        assert(new_pending_bs.items.len == new_pending_ks.items.len);
+        assert(new_pending_bs.items.len <= new_leaf_blocks_max);
+        assert(next_data_block_idx == last_data_block.meta.next);
+
+        // set insert target
+        path[0].key_idx = 1;
+
+        // TODO: use corrected path from insert_indx_blocks() call?
+        _ = try r.insert_indx_blocks(
+            path,
+            new_pending_bs.items,
+            new_pending_ks.items,
+        );
+
+        return .{
+            .inserted_count = actual_new_data_blocks,
+            .new_path = null,
+        };
     }
 
     const target_r = right: {
         const entry = target.entry orelse break :right null;
         const has_right =
-            entry.key_idx + 1 < indx_block_keys_max and
+            @as(KeysLen, entry.key_idx) + 1 < indx_block_keys_max and
             !IndxBlock.raw_key_is_null(
             entry.parent_block.keys[entry.key_idx + 1],
         );
@@ -1281,7 +1405,7 @@ fn insert_data_blocks(
                 .set_child_subtree_bytes(parent.key_idx + 1, size_r);
         }
         // path to the parent of the target leaf block
-        indx_block_update_len(path[0 .. path.len - 2], @intCast(
+        block_update_parents_len(path[0 .. path.len - 2], @intCast(
             new_data_blocks * data_block_bytes_min,
         ));
 
@@ -1303,7 +1427,6 @@ fn insert_data_blocks(
         assert(block.meta.is_leaf);
         const len: KeysLen = block.keys_len();
         assert(len <= indx_block_keys_max);
-        assert(len >= indx_block_keys_min);
         break :left .{
             .len = @as(KeysLen, len),
             .space = @as(KeyIdx, @intCast(indx_block_keys_max - len)),
@@ -1405,7 +1528,7 @@ fn insert_data_blocks(
             }
         }
         // path to the parent of the target leaf block
-        indx_block_update_len(path[0 .. path.len - 2], @intCast(
+        block_update_parents_len(path[0 .. path.len - 2], @intCast(
             new_data_blocks * data_block_bytes_min,
         ));
 
@@ -1428,28 +1551,33 @@ fn insert_data_blocks(
         len: KeysLen,
         space: KeyIdx,
         block: *IndxBlock,
+        key_idx: KeyIdx,
     };
     const split_l, const split_r = if (target_l) |l| .{
         SplitInfo{
             .len = l.len,
             .space = l.space,
             .block = l.block,
+            .key_idx = target.entry.?.key_idx - 1,
         },
         SplitInfo{
             .len = target.len,
             .space = target.space,
             .block = target.block,
+            .key_idx = target.entry.?.key_idx,
         },
     } else if (target_r) |r_| .{
         SplitInfo{
             .len = target.len,
             .space = target.space,
             .block = target.block,
+            .key_idx = target.entry.?.key_idx,
         },
         SplitInfo{
             .len = r_.len,
             .space = r_.space,
             .block = r_.block,
+            .key_idx = target.entry.?.key_idx + 1,
         },
     } else unreachable;
     log.debug("splitting left = {}, right = {}", .{ split_l, split_r });
@@ -1457,18 +1585,16 @@ fn insert_data_blocks(
     // we need to split target and r/l to create new data blocks for the
     // insertion.
 
+    // FIXME: spill is actually <= 2/3 of full block. need to share spill to l
+    //        and r.
     // new indx blocks are 2/3 full. l will contain the spill.
     // const total_indx_blocks =
 
-    // CALC: max of 64 leaf blocks allocated:
-    //    => max of 64 * 16 * (2/3) data blocks allocated
-    //    => max of 64 * 16 * (2/3) * 128 * (2/3) bytes allocated
-    //            = 56.88KiB allocated
-    const new_leaf_blocks_max = 64;
-
     const new_indx_blocks: IndxBlock.Idx = x: {
         const total_indx_blocks =
-            (split_l.len + split_r.len + new_data_blocks) / indx_block_keys_min;
+            (@as(IndxBlock.Idx, split_l.len) +
+            @as(IndxBlock.Idx, split_r.len) +
+            new_data_blocks) / indx_block_keys_min;
         assert(total_indx_blocks >= 3);
         break :x @min(
             total_indx_blocks - 2,
@@ -1477,12 +1603,15 @@ fn insert_data_blocks(
     };
     assert(new_indx_blocks > 0);
 
-    const actual_new_data_blocks =
-        split_l.space + // assume spill fills split_l
-        (new_indx_blocks * indx_block_keys_min) + // new indx blocks
-        // leftover space from split_r after it's existing len
-        indx_block_keys_min -
-        split_r.len;
+    const actual_new_data_blocks = @min(
+        new_data_blocks,
+        split_l.space + // try to fill split_l
+            (new_indx_blocks * indx_block_keys_min) + // new indx blocks
+            // leftover space from split_r after it's existing len
+            indx_block_keys_min -
+            split_r.len,
+    );
+    assert(actual_new_data_blocks <= new_data_blocks);
 
     // save the first data block as it is the head of a linked list
     assert(split_l.len > 0);
@@ -1497,17 +1626,23 @@ fn insert_data_blocks(
         target.data_postfix_begin_idx,
     );
 
-    const spill_len: KeyIdx = @intCast(
-        (split_l.len + split_r.len + actual_new_data_blocks) %
-            indx_block_keys_min,
+    const new_split_l_len: KeysLen = @intCast(
+        (@as(DataBlock.Idx, split_l.len) +
+            @as(DataBlock.Idx, split_r.len) +
+            @as(DataBlock.Idx, actual_new_data_blocks)) -
+            ((new_indx_blocks + 1) * @as(DataBlock.Idx, indx_block_keys_min)),
     );
-    // indx_block_keys_min + spill_len goes into left
     split_l.block.* = .empty_leaf;
     next_data_block_idx = r.write_data_blocks(
         &split_l.block.keys,
         &split_l.block.children,
         next_data_block_idx.?,
-        indx_block_keys_min + spill_len,
+        new_split_l_len,
+    );
+    // insert_data_blocks() will update the tree up from the parent
+    target.entry.?.parent_block.set_child_subtree_bytes(
+        split_l.key_idx,
+        split_l.block.sum_subtree_sizes(),
     );
 
     // middle goes into pending indx block insertion
@@ -1533,30 +1668,29 @@ fn insert_data_blocks(
             next_data_block_idx.?,
             indx_block_keys_min,
         );
-        const subtree_bytes = x: {
-            var b: SubtreeByteSize = 0;
-            for (new_leaf.keys) |key| {
-                if (IndxBlock.raw_key_is_null(key)) break;
-                b += int_from_bytes(SubtreeByteSize, key);
-            }
-            break :x b;
-        };
         new_pending_bs.appendAssumeCapacity(bytes_from_int(
             @as(IndxBlock.Idx, @intCast(r.indx_blocks.len - 1)),
         ));
-        new_pending_ks.appendAssumeCapacity(bytes_from_int(subtree_bytes));
+        new_pending_ks.appendAssumeCapacity(bytes_from_int(
+            @as(SubtreeByteSize, new_leaf.sum_subtree_sizes()),
+        ));
     }
     assert(new_pending_bs.items.len == new_pending_ks.items.len);
     assert(new_pending_bs.items.len <= new_leaf_blocks_max);
 
     // last indx_block_keys_min goes into right
     split_r.block.* = .empty_leaf;
-    assert(r.write_data_blocks(
+    _ = r.write_data_blocks(
         &split_r.block.keys,
         &split_r.block.children,
         next_data_block_idx.?,
         indx_block_keys_min,
-    ).? == target.data_postfix_begin_idx);
+    );
+    // insert_data_blocks() will update the tree up from the parent
+    target.entry.?.parent_block.set_child_subtree_bytes(
+        split_r.key_idx,
+        split_r.block.sum_subtree_sizes(),
+    );
 
     // set insert target
     if (split_l.block == target.block) {
@@ -1581,6 +1715,12 @@ fn insert_data_blocks(
     };
 }
 
+// CALC: max of 64 leaf blocks allocated:
+//    => max of 64 * 16 * (2/3) data blocks allocated
+//    => max of 64 * 16 * (2/3) * 128 * (2/3) bytes allocated
+//            = 56.88KiB allocated
+const new_leaf_blocks_max = 64;
+
 /// insert indx blocks right before the indx block pointed to by the given
 /// path.
 ///
@@ -1602,10 +1742,14 @@ fn insert_indx_blocks(
     // TODO: see if there is a clever way to avoid having this buffer at all
     keys: []IndxBlock.RawKey,
 ) !?[]BlockPathEntry {
+    log.debug("insert_indx_blocks(path: {any}, idxs: {any}, keys: {any})", .{
+        path_,
+        idxs,
+        keys,
+    });
     assert(idxs.len > 0);
     assert(path_.len > 0);
 
-    const new_leaf_blocks_max = 64;
     assert(idxs.len <= new_leaf_blocks_max);
 
     var path = path_;
@@ -1615,10 +1759,6 @@ fn insert_indx_blocks(
     var path_cursor = path.len - 1;
     var pending_bs = idxs;
     var pending_ks = keys;
-    // // we can reuse the same buffers as the next iterations should be
-    // // progressively smaller.
-    // var next_pending_bs = idxs[0..0];
-    // var next_pending_ks = keys[0..0];
 
     // cap iterations because we are paranoid :)
     for (0..indx_blocks_height_max - 1) |_| {
@@ -1644,6 +1784,7 @@ fn insert_indx_blocks(
         };
 
         if (target.space >= pending_bs.len) {
+            log.debug("fits in target indx block", .{});
             const start_ofs = path[path_cursor].key_idx;
             assert(start_ofs < indx_block_keys_max);
 
@@ -1665,11 +1806,15 @@ fn insert_indx_blocks(
                 break :size_delta delta;
             };
 
-            indx_block_update_len(path, @intCast(size_delta));
+            block_update_parents_len(
+                path[0..path_cursor],
+                @intCast(size_delta),
+            );
             return if (path_clobbered) null else path;
         }
 
         if (path_cursor == 0) {
+            log.debug("root is full; creating new root and splitting", .{});
             // we are at the root, so we can't split anymore.
             // Instead, we need to creat a new root and make this an internal
             // layer.
@@ -1817,7 +1962,7 @@ fn insert_indx_blocks(
             assert(path_cursor > 0);
             const entry = target.entry orelse break :right null;
             const has_right =
-                entry.key_idx + 1 < indx_block_keys_max and
+                @as(KeysLen, entry.key_idx) + 1 < indx_block_keys_max and
                 !IndxBlock.raw_key_is_null(
                 entry.parent_block.keys[entry.key_idx + 1],
             );
@@ -1919,7 +2064,7 @@ fn insert_indx_blocks(
                 break :size_delta delta;
             };
 
-            indx_block_update_len(path[0 .. path_cursor - 1], @intCast(
+            block_update_parents_len(path[0 .. path_cursor - 1], @intCast(
                 size_delta,
             ));
             return if (path_clobbered) null else path;
@@ -1949,6 +2094,7 @@ fn insert_indx_blocks(
             target.space +
             (if (target_r) |r_| r_.space else 0) >= pending_bs.len)
         {
+            log.debug("fits in target + target_l + target_r indx blocks", .{});
             // this + left + (right?) is enough space
 
             const prefix_len = path[path_cursor].key_idx;
@@ -2074,7 +2220,7 @@ fn insert_indx_blocks(
                 }
                 break :size_delta delta;
             };
-            indx_block_update_len(path[0 .. path_cursor - 1], @intCast(
+            block_update_parents_len(path[0..path_cursor], @intCast(
                 size_delta,
             ));
 
@@ -2119,6 +2265,8 @@ fn insert_indx_blocks(
                 .block = r_.block,
             },
         } else unreachable;
+
+        log.debug("splitting left = {}, right = {}", .{ split_l, split_r });
 
         // see assumptions in doc comment: we have two full blocks worth of
         // scratch space.
@@ -2711,15 +2859,18 @@ inline fn indx_block_shr(ib: *IndxBlock, ofs: KeyIdx, amt: KeysLen) void {
 
 /// Update the parents of the given leaf block of the path to reflect the
 /// new length of the leaf block.
-fn indx_block_update_len(
+fn block_update_parents_len(
     path: []BlockPathEntry,
     len_delta: ByteIdxDelta,
 ) void {
+    log.debug("block_update_parents_len(path: {any}, len_delta: {d})", .{
+        path,
+        len_delta,
+    });
     if (len_delta == 0) return;
 
     for (path) |entry| {
-        const old_len =
-            int_from_bytes(
+        const old_len = int_from_bytes(
             SubtreeByteSize,
             entry.parent_block.keys[entry.key_idx],
         );
@@ -2728,6 +2879,27 @@ fn indx_block_update_len(
             @intCast(@as(ByteIdxDelta, @intCast(old_len)) +
                 len_delta),
         ));
+
+        // Path shouldn't contain the leaf
+        assert(!entry.parent_block.meta.is_leaf);
+    }
+}
+
+fn block_update_parents_len2(
+    path: []BlockPathEntry,
+    len: SubtreeByteSize,
+) void {
+    log.debug("block_update_parents_len2(path: {any}, len: {d})", .{
+        path,
+        len,
+    });
+
+    var next_len = len;
+
+    for (path) |entry| {
+        entry.parent_block.keys[entry.key_idx] =
+            bytes_from_int(@as(SubtreeByteSize, next_len));
+        next_len = entry.parent_block.sum_subtree_sizes();
 
         // Path shouldn't contain the leaf
         assert(!entry.parent_block.meta.is_leaf);
@@ -3030,7 +3202,8 @@ pub fn format(
     var s = r.absolute_cursor_at(0);
     var i: usize = 0;
     while (true) : (i += 1) {
-        if (i >= 100) @panic("reached max iterations. probably a bug.");
+        if (i >= ((rope_bytes_max + 99) / 100))
+            @panic("reached max iterations. probably a bug.");
 
         var buf: [100]u8 = undefined;
         const len = s.reader(r).readAll(&buf) catch unreachable;
@@ -3142,6 +3315,8 @@ test insert {
     try std.testing.expectFmt("hello world", "{}", .{&rope});
 }
 
+// TODO: make separate tests for large insertions and small ones
+//       different scenarios
 test "insert-fuzz" {
     std.testing.log_level = .debug;
     // makes for easier print debugging
@@ -3152,8 +3327,8 @@ test "insert-fuzz" {
 
     var str = std.ArrayList(u8).init(std.testing.allocator);
 
-    var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
-    // var prng = std.Random.DefaultPrng.init(0x3bdac17f);
+    // var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
+    var prng = std.Random.DefaultPrng.init(0xaee7e859);
     const rand = prng.random();
 
     var buf: [1024 * 1024]u8 = undefined;
