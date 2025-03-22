@@ -3,7 +3,8 @@
   description = "Quil deps.";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs-codelldb.url = "github:FraGag/nixpkgs/vscode-extensions.vadimcn.vscode-lldb";
 
     flake-parts.url = "github:hercules-ci/flake-parts";
 
@@ -34,8 +35,21 @@
           ...
         }:
         let
-          zig = inputs'.zig.packages.master-2025-02-22;
+          zig = inputs'.zig.packages.master-2025-04-05;
           zls = inputs'.zls.packages.zls;
+          codelldb-pkgs = inputs'.nixpkgs-codelldb.legacyPackages;
+          # zig-llvmPackages = (
+          #   pkgs.llvmPackages_git.override rec {
+          #     monorepoSrc = pkgs.fetchFromGitHub rec {
+          #       owner = "jacobly0";
+          #       repo = "llvm-project";
+          #       rev = "lldb-zig";
+          #       sha256 = "sha256-M8Nf2CjLiOGbEy3c/IlDOp8o5VlxlzXYdMORtFTlpTA=";
+          #       passthru = { inherit owner repo rev; };
+          #     };
+          #     doCheck = false;
+          #   }
+          # );
         in
         {
           formatter = pkgs.nixfmt-rfc-style;
@@ -44,8 +58,9 @@
             buildInputs = [
               zig
               zls
+              # zig-llvmPackages.lldb
               pkgs.llvmPackages.lldb
-              # pkgs.vscode-extensions.vadimcn.vscode-lldb.adapter
+              codelldb-pkgs.vscode-extensions.vadimcn.vscode-lldb.adapter
             ];
           };
         };
