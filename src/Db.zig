@@ -1,10 +1,12 @@
 const std = @import("std");
 const assert = std.debug.assert;
-const RangedInt = @import("./ranged_int.zig").RangedInt;
+const ranged_int = @import("./ranged_int.zig");
+const RangedInt = ranged_int.RangedInt;
 
 // NOTE: limit the circular dependency by not importing Rope fully
 const config = @import("./Rope2.zig").config;
 const bounds = @import("./Rope2.zig").bounds;
+const RopeBytes = @import("./Rope2.zig").RopeBytes;
 
 const Db = @This();
 
@@ -28,6 +30,14 @@ pub const NumOpt = enum(Num.Int) {
             .null => return null,
             _ => return .cast(@intFromEnum(this)),
         }
+    }
+
+    pub fn eql(a: NumOpt, b: NumOpt) bool {
+        if (a.unwrap() == null and b.unwrap() == null)
+            return true;
+        if (a.unwrap() != null and b.unwrap() != null)
+            return a.unwrap().?.eql(b.unwrap().?);
+        return false;
     }
 };
 
@@ -191,16 +201,105 @@ pub const Slice = struct {
         new.assert_sane();
         return new;
     }
+
+    pub fn bytes(this: Slice) []u8 {
+        return this.block
+            .bytes[this.ofs.to_int()..this.ofs.add(this.len).to_int()];
+    }
 };
 
-pub fn slice(block: *Db, beg: ?Len, end: ?Len) Slice {
+pub fn slice(block: *Db, beg: ?Len, end: Len) Slice {
+    const ofs: Len = beg orelse Len.coerce(0);
     const res: Slice = .{
         .block = block,
-        .ofs = beg orelse Len.coerce(0),
-        .len = end orelse block.meta.bytes,
+        .ofs = ofs,
+        .len = end.sub(ofs),
     };
     res.assert_sane();
     return res;
+}
+
+pub inline fn assert_nonconst_ptr(comptime Ptr: type) void {
+    if (@typeInfo(Ptr) != .pointer or @typeInfo(Ptr).pointer.is_const) {
+        @compileError("must be a non-const pointer. Found: " ++
+            @typeName(Ptr));
+    }
+}
+
+pub inline fn assert_WriteIter(comptime Ptr: type) void {
+    assert_nonconst_ptr(Ptr);
+    const T = @typeInfo(Ptr).pointer.child;
+
+    if (comptime ranged_int.is_ranged_int(T)) {
+        if (T.tag != .bytes) {
+            @compileError("WriteIter must be a RangedInt of tag .bytes. " ++
+                "Found: " ++ @typeName(T));
+        }
+        return;
+    }
+    if (@typeInfo(T) == .int)
+        return;
+
+    if (Ptr == *[]const u8)
+        return;
+
+    @compileError("Incompatilble type for WriteIter: " ++ @typeName(Ptr));
+}
+
+pub fn WriteIter_int_take(iter: anytype, amt: Len) void {
+    assert_WriteIter(@TypeOf(iter));
+    switch (@typeInfo(std.meta.Child(@TypeOf(iter)))) {
+        .int => iter.* = iter.* -| amt.to_int(),
+        else => {
+            iter.* = .cast(iter.*.to_int() -| amt.to_int());
+        },
+    }
+}
+
+pub fn write(dst: Slice, iter: anytype) void {
+    assert_WriteIter(@TypeOf(iter));
+    dst.assert_sane();
+    if (@TypeOf(iter) == *[]const u8) {
+        const write_len: Len = .cast(@min(dst.len.to_int(), iter.len));
+        if (write_len.eql(.min_val)) return;
+
+        std.log.debug("write len = {d}", .{write_len.to_int()});
+        const bytes = iter.*[0..write_len.to_int()];
+        @memcpy(
+            dst.block.bytes[dst.ofs.to_int()..][0..write_len.to_int()],
+            bytes,
+        );
+
+        var newlines: BitMap = 0;
+        for (bytes) |byte| {
+            newlines <<= 1;
+            newlines |= if (byte == '\n') 1 else 0;
+        }
+        const mask =
+            (std.math.boolMask(BitMap, true) << Idx.cast(dst.ofs).to_int()) |
+            (if (dst.ofs.add(.cast(bytes.len)).eql(dst.block.meta.bytes))
+                0
+            else
+                (std.math.boolMask(u128, true) <<
+                    Idx.cast(dst.ofs.add(.cast(bytes.len))).to_int()));
+
+        dst.block.meta.newlines = (mask & dst.block.meta.newlines) |
+            (newlines << Idx.cast(dst.ofs.to_int()).to_int());
+
+        iter.* = iter.*[write_len.to_int()..];
+        return;
+    }
+
+    WriteIter_int_take(iter, dst.len);
+}
+
+pub fn write_from_back(dst: Slice, iter: anytype) void {
+    assert_WriteIter(@TypeOf(iter));
+    dst.assert_sane();
+    if (@TypeOf(iter) == *[]u8) {
+        @panic("not implemented");
+    }
+    WriteIter_int_take(iter, dst.len);
 }
 
 pub fn copy(dst: Slice, src: Slice) void {

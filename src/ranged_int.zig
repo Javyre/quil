@@ -14,7 +14,7 @@ pub fn RangedInt(
         pub const Int = Int_;
 
         /// Runtime cast. Validated at runtime.
-        pub fn try_cast(val: anytype) error{Overflow}!@This() {
+        pub inline fn try_cast(val: anytype) error{Overflow}!@This() {
             const val_ = if (comptime is_ranged_int(@TypeOf(val)))
                 if (@This().tag == @TypeOf(val).tag)
                     val.to_int()
@@ -37,17 +37,14 @@ pub fn RangedInt(
                     std.math.cast(Int, val_) orelse return error.Overflow,
                 );
             } else {
-                switch (val_) {
-                    min_...max_ => return @enumFromInt(
-                        std.math.cast(Int, val_) orelse return error.Overflow,
-                    ),
-                    else => return error.Overflow,
-                }
+                return if (min_ <= val_ and val_ <= max_) @enumFromInt(
+                    std.math.cast(Int, val_) orelse return error.Overflow,
+                ) else error.Overflow;
             }
         }
 
         /// Runtime cast. Validated at runtime. Panics on error.
-        pub fn cast(val: anytype) @This() {
+        pub inline fn cast(val: anytype) @This() {
             return try_cast(val) catch |err| switch (err) {
                 error.Overflow => std.debug.panic(
                     "{d} not in range {d}..={d}",
@@ -63,36 +60,28 @@ pub fn RangedInt(
             };
         }
 
-        /// Infallible coercion. Validated at compile time.
-        pub fn coerce(val: anytype) @This() {
-            const T = @TypeOf(val);
+        pub inline fn is_coercible(val: anytype) bool {
+            const this_meta: RangeMeta = comptime .{
+                .min_val = @This().min_val.to_int(),
+                .max_val = @This().max_val.to_int(),
+                .tag = @This().tag,
+            };
 
-            if (T == @This())
-                @compileError("unnecessary coercion to same type");
+            const meta: RangeMeta = RangeMeta.from(val) orelse return false;
+            return comptime meta.coercible_to(this_meta);
+        }
+
+        /// Infallible coercion. Validated at compile time.
+        pub inline fn coerce(val: anytype) @This() {
+            const T = @TypeOf(val);
 
             const this_meta: RangeMeta = comptime .{
                 .min_val = @This().min_val.to_int(),
                 .max_val = @This().max_val.to_int(),
                 .tag = @This().tag,
             };
-            const meta: RangeMeta = comptime if (is_ranged_int(T)) .{
-                .min_val = T.min_val.to_int(),
-                .max_val = T.max_val.to_int(),
-                .tag = T.tag,
-            } else switch (@typeInfo(T)) {
-                .int => .{
-                    .min_val = std.math.minInt(T),
-                    .max_val = std.math.maxInt(T),
-                    .tag = null,
-                },
-                .comptime_int => .{
-                    .min_val = val,
-                    .max_val = val,
-                    .tag = null,
-                },
-                else => @compileError("not a range-compatible type: " ++
-                    @typeName(T)),
-            };
+            const meta: RangeMeta = RangeMeta.from(val) orelse
+                @compileError("not a range-compatible type: " ++ @typeName(T));
 
             if (comptime !meta.coercible_to(this_meta))
                 @compileError(std.fmt.comptimePrint(
@@ -100,10 +89,24 @@ pub fn RangedInt(
                     .{ meta, this_meta },
                 ));
 
+            if (!is_coercible(val))
+                @compileError("BUG: is_coercible(val) is false");
+
             if (comptime is_ranged_int(T))
                 return @enumFromInt(val.to_int())
             else
                 return @enumFromInt(val);
+        }
+
+        pub inline fn retag(
+            this: @This(),
+            from_tag: @TypeOf(.enum_literal),
+            to_tag: @TypeOf(.enum_literal),
+        ) RangedInt(to_tag, min_, max_) {
+            if (@This().tag != from_tag)
+                @compileError("Incorrect from tag " ++ @tagName(from_tag) ++
+                    ". Expected " ++ @tagName(@This().tag));
+            return @enumFromInt(this.to_int());
         }
 
         pub fn to_int(this: @This()) Int {
@@ -142,10 +145,24 @@ pub fn RangedInt(
                 @This().min_val.to_int(),
             ));
         }
+
+        pub fn format(
+            this: @This(),
+            comptime fmt: []const u8,
+            options: std.fmt.FormatOptions,
+            writer: anytype,
+        ) !void {
+            _ = fmt;
+            _ = options;
+            try writer.print("{d} in {}", .{
+                this.to_int(),
+                RangeMeta.from(this).?,
+            });
+        }
     };
 }
 
-fn is_ranged_int(comptime T: type) bool {
+pub fn is_ranged_int(comptime T: type) bool {
     return @typeInfo(T) == .@"enum" and
         (@hasDecl(T, "min_val") and @TypeOf(T.min_val) == T) and
         (@hasDecl(T, "max_val") and @TypeOf(T.max_val) == T) and
@@ -176,8 +193,29 @@ const RangeMeta = struct {
         }
     }
 
-    fn coercible_to(from: RangeMeta, to: RangeMeta) bool {
-        if (from.tag) |from_tag| {
+    inline fn from(val: anytype) ?RangeMeta {
+        const T = @TypeOf(val);
+        return comptime if (is_ranged_int(T)) .{
+            .min_val = T.min_val.to_int(),
+            .max_val = T.max_val.to_int(),
+            .tag = T.tag,
+        } else switch (@typeInfo(T)) {
+            .int => .{
+                .min_val = std.math.minInt(T),
+                .max_val = std.math.maxInt(T),
+                .tag = null,
+            },
+            .comptime_int => .{
+                .min_val = val,
+                .max_val = val,
+                .tag = null,
+            },
+            else => null,
+        };
+    }
+
+    fn coercible_to(this: RangeMeta, to: RangeMeta) bool {
+        if (this.tag) |from_tag| {
             if (to.tag) |to_tag| {
                 if (from_tag != to_tag) return false;
             }
@@ -186,8 +224,8 @@ const RangeMeta = struct {
             comptime_int,
             to.min_val,
             to.max_val,
-            from.min_val,
-            from.max_val,
+            this.min_val,
+            this.max_val,
         );
     }
 };
