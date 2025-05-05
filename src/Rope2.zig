@@ -202,6 +202,8 @@ fn ib_at(r: *Rope, num: Ib.Num) *Ib {
     return r.indx_blocks.at(num.to_int());
 }
 
+const BlockPath =
+    std.BoundedArray(BlockPathEntry, bounds.indx_blocks_height_max);
 const BlockPathEntry = struct {
     // index to the key in the parent block
     key_idx: Ib.Len,
@@ -211,16 +213,14 @@ const BlockPathEntry = struct {
 fn find_data_block(
     r: *Rope,
     ofs: RopeBytes,
-    path_store: []BlockPathEntry,
 ) struct {
-    path: []BlockPathEntry,
+    path: BlockPath,
     ofs_in_db: Db.Len,
 } {
     const root_ib = r.ib_at(r.indx_root);
-    assert(path_store.len >= bounds.indx_blocks_height_max);
     assert(ofs.to_int() <= root_ib.sum_subtree_bytes().to_int());
 
-    var path = std.ArrayListUnmanaged(BlockPathEntry).initBuffer(path_store);
+    var path: BlockPath = .{};
 
     var parent: *Ib = root_ib;
     var rest_ofs: RopeBytes = ofs;
@@ -233,7 +233,7 @@ fn find_data_block(
             .key_idx = res.key_idx,
             .parent_ib = parent,
         });
-        assert(path.items.len == height);
+        assert(path.len == height);
 
         rest_ofs = .cast(rest_ofs.to_int() - res.child_ofs.to_int());
 
@@ -247,17 +247,17 @@ fn find_data_block(
             assert(r.indx_height.eql(.cast(height)));
         }
     }
-    assert(r.indx_height.eql(.cast(path.items.len)));
-    assert(path.items[path.items.len - 1].parent_ib == parent);
+    assert(r.indx_height.eql(.cast(path.len)));
+    assert(path.slice()[path.len - 1].parent_ib == parent);
 
     return .{
-        .path = path.items,
+        .path = path,
         .ofs_in_db = .cast(rest_ofs),
     };
 }
 
 fn update_parent_keys(
-    path: []BlockPathEntry,
+    path: []const BlockPathEntry,
     new_len: TreeSize,
 ) void {
     assert(path.len <= bounds.indx_blocks_height_max);
@@ -283,121 +283,66 @@ fn alloc_at(r: *Rope, ofs: RopeBytes, alloc_len: RopeBytes) !struct {
 } {
     @setEvalBranchQuota(2_000);
 
-    var path_store: [bounds.indx_blocks_height_max]BlockPathEntry = undefined;
-    const db_query = r.find_data_block(ofs, &path_store);
-    assert_slice_of(&path_store, db_query.path);
-    assert(r.indx_height.eql(.cast(db_query.path.len)));
+    const db_query_ = r.find_data_block(ofs);
+    var path = db_query_.path;
+    const ofs_in_targ_db = db_query_.ofs_in_db;
 
-    const targ_db_entry = db_query.path[db_query.path.len - 1];
-    // const parent_ib = db_query.path[db_query.path.len - 1].parent_ib;
-    // const targ_key_idx: Ib.Idx =
-    //     .cast(db_query.path[db_query.path.len - 1].key_idx);
+    assert(r.indx_height.eql(.cast(path.len)));
+
+    const targ_db_entry = path.slice()[path.len - 1];
 
     {
         const targ_db: *const Db = r.db_at(targ_db_entry.parent_ib
             .child_at(.cast(targ_db_entry.key_idx))
             .as(Db.Num));
-        assert(db_query.ofs_in_db.to_int() <= targ_db.meta.bytes.to_int());
+        assert(ofs_in_targ_db.to_int() <= targ_db.meta.bytes.to_int());
     }
 
-    var direct_space: RopeBytes = .coerce(0);
-    const DbInfo = struct { block: *Db, len: Db.Len, key_idx: Ib.Idx };
-    var dbs: struct {
-        left: ?DbInfo,
-        targ: DbInfo,
-        right: ?DbInfo,
-    } = .{
-        .left = null,
-        .targ = undefined,
-        .right = null,
-    };
+    var alloc_iter: RopeBytes = alloc_len;
+    const path_len_prev = path.len;
+    const res = try r.insert_in_vicinity(Db, RopeBytes, &alloc_iter, .{
+        .path = &path,
+        .path_cursor = .cast(path.len - 1),
+        .ofs_in_targ = ofs_in_targ_db,
+        .alloc_len = alloc_len,
+    });
+    const dbs = res.vicinity;
+    // path shouldn't be changed at all.
+    assert(path_len_prev == path.len);
 
-    inline for (.{ .targ, .right, .left }) |side| {
-        @field(dbs, @tagName(side)), const new_space: Db.Len = targ_db: {
-            const key_idx: Ib.Idx = switch (side) {
-                .targ => .cast(targ_db_entry.key_idx),
-                .right => dbs.targ.key_idx.try_add(.coerce(1)) catch
-                    break :targ_db .{ null, .coerce(0) },
-                .left => dbs.targ.key_idx.try_sub(.coerce(1)) catch
-                    break :targ_db .{ null, .coerce(0) },
-                else => unreachable,
-            };
+    if (res.insert_result) |ins_res| {
+        // insert succeeded
+        assert(alloc_iter.eql(.min_val));
+        dbs.targ.block.meta.bytes = ins_res.targ_len_new;
+        if (dbs.right) |right|
+            right.block.meta.bytes = ins_res.right_len_new.?;
+        if (dbs.left) |left|
+            left.block.meta.bytes = ins_res.left_len_new.?;
 
-            if (side == .right and
-                targ_db_entry.parent_ib.key_at(key_idx).unwrap() == null)
-            {
-                break :targ_db .{ null, .coerce(0) };
-            }
+        targ_db_entry.parent_ib.key_at(dbs.targ.key_idx).* =
+            .some(.coerce(ins_res.targ_len_new));
+        if (dbs.right) |right|
+            targ_db_entry.parent_ib.key_at(right.key_idx).* =
+                .some(.coerce(ins_res.right_len_new.?));
+        if (dbs.left) |left|
+            targ_db_entry.parent_ib.key_at(left.key_idx).* =
+                .some(.coerce(ins_res.left_len_new.?));
 
-            const block = r.db_at(targ_db_entry.parent_ib
-                .child_at(key_idx).as(Db.Num));
-            const len: Db.Len = .cast(targ_db_entry.parent_ib
-                .key_at(key_idx).unwrap().?);
-            break :targ_db .{
-                .{
-                    .len = len,
-                    .block = block,
-                    .key_idx = key_idx,
-                },
-                Db.Len.max_val.sub(len),
-            };
-        };
-        log.debug(
-            "{any} has space = {d}",
-            .{ side, new_space.to_int() },
+        update_parent_keys(
+            path.slice()[0 .. path.len - 1],
+            .cast(targ_db_entry.parent_ib.sum_subtree_bytes()),
         );
-        direct_space = direct_space.add(.coerce(new_space));
 
-        if (direct_space.to_int() >= alloc_len.to_int()) {
-            log.debug("fits in direct_space = {d}", .{direct_space.to_int()});
-
-            var alloc_iter: RopeBytes = alloc_len;
-            const res = insert_in_blocks(Db, RopeBytes, &alloc_iter, .{
-                .targ = .{
-                    .block = dbs.targ.block,
-                    .len = dbs.targ.len,
-                },
-                .right = if (dbs.right) |right| .{
-                    .block = right.block,
-                    .len = right.len,
-                } else null,
-                .left = if (dbs.left) |left| .{
-                    .block = left.block,
-                    .len = left.len,
-                } else null,
-                .ofs = db_query.ofs_in_db,
-            });
-
-            dbs.targ.block.meta.bytes = res.targ_len_new;
-            if (dbs.right) |right|
-                right.block.meta.bytes = res.right_len_new.?;
-            if (dbs.left) |left|
-                left.block.meta.bytes = res.left_len_new.?;
-
-            targ_db_entry.parent_ib.key_at(dbs.targ.key_idx).* =
-                .some(.coerce(res.targ_len_new));
-            if (dbs.right) |right|
-                targ_db_entry.parent_ib.key_at(right.key_idx).* =
-                    .some(.coerce(res.right_len_new.?));
-            if (dbs.left) |left|
-                targ_db_entry.parent_ib.key_at(left.key_idx).* =
-                    .some(.coerce(res.left_len_new.?));
-
-            update_parent_keys(
-                db_query.path[0 .. db_query.path.len - 1],
-                .cast(targ_db_entry.parent_ib.sum_subtree_bytes()),
-            );
-
-            return .{
-                .cursor = .{ .data_block = res.block, .ofs = res.ofs },
-                .alloc_len = alloc_len,
-            };
-        }
+        return .{
+            .cursor = .{ .data_block = ins_res.block, .ofs = ins_res.ofs },
+            .alloc_len = alloc_len,
+        };
     }
 
     // NOTE: Now we know that we need to split target and r/l to create new
     //       data blocks for alloc_len.
 
+    const DbInfo = BInfo(Db);
     const split: struct { left: DbInfo, right: DbInfo } = if (dbs.left) |left|
         .{
             .left = left,
@@ -428,10 +373,10 @@ fn alloc_at(r: *Rope, ofs: RopeBytes, alloc_len: RopeBytes) !struct {
     // new right/left db lens now and piggyback on the update_parent_keys
 
     const prefix_len: RopeBytes = if (split.left.block == dbs.targ.block)
-        .coerce(db_query.ofs_in_db)
+        .coerce(ofs_in_targ_db)
     else if (split.right.block == dbs.targ.block)
         RopeBytes.coerce(split.left.len)
-            .add(.coerce(db_query.ofs_in_db))
+            .add(.coerce(ofs_in_targ_db))
     else
         unreachable;
     const postfix_len: RopeBytes = RopeBytes.coerce(split.right.len)
@@ -465,9 +410,8 @@ fn alloc_at(r: *Rope, ofs: RopeBytes, alloc_len: RopeBytes) !struct {
         .some(.coerce(split_right_len_new));
 
     // do the split
-    db_query.path[db_query.path.len - 1].key_idx = .cast(split.right.key_idx);
-    const actual_new_dbs =
-        try r.insert_dbs(db_query.path, &path_store, new_dbs);
+    path.slice()[path.len - 1].key_idx = .cast(split.right.key_idx);
+    const actual_new_dbs = try r.insert_dbs(&path, new_dbs);
     assert(actual_new_dbs.to_int() <= new_dbs.to_int());
 
     assert(!Db.Num.eql(
@@ -573,171 +517,70 @@ fn alloc_at(r: *Rope, ofs: RopeBytes, alloc_len: RopeBytes) !struct {
 
 fn insert_dbs(
     r: *Rope,
-    path_: []BlockPathEntry,
-    path_store: []BlockPathEntry,
+    path: *BlockPath,
     new_dbs: Db.Num,
 ) !Db.Num {
-    assert_slice_of(path_store, path_);
-    var path = path_;
-
-    const IbInfo = struct { block: *Ib, len: Ib.Len, key_idx: Ib.Idx };
-    var ibs: struct {
-        left: ?IbInfo,
-        targ: struct { block: *Ib, len: Ib.Len, key_idx: ?Ib.Idx },
-        right: ?IbInfo,
-    } = .{
-        .left = null,
-        .targ = undefined,
-        .right = null,
-    };
-
     // null if targ is root ib
-    var targ_ib_entry = if (path.len > 1) path[path.len - 2] else null;
-    var direct_space: Db.Num = .coerce(0);
+    // var targ_ib_entry = if (path.len > 1) path[path.len - 2] else null;
+    var path_cursor: ?PathLen =
+        if (path.len >= 2) .cast(path.len - 2) else null;
 
-    inline for (.{ .targ, .reroot, .right, .left }) |side| sides: {
-        log.debug("side = {any}", .{side});
-        if (side == .reroot) {
-            if (path.len > 1) break :sides;
+    const next_db: Db.Num = path.slice()[path.len - 1].parent_ib
+        .child_at(.cast(path.slice()[path.len - 1].key_idx))
+        .as(Db.Num);
+    var dbs_iter: GenIbDbChildren = .init(r, .{
+        .len = new_dbs.retag(.db_num, .ib_keys),
+        .next = .some(next_db),
+        .prev = r.db_at(next_db).meta.prev,
+    });
+    const IbTotalLen = RangedInt(
+        Ib.Len.tag,
+        Db.Num.min_val.to_int(),
+        Db.Num.max_val.to_int(),
+    );
+    const res = try r.insert_in_vicinity(Ib, IbTotalLen, &dbs_iter, .{
+        .path = path, // mutable ref
+        .path_cursor = path_cursor,
+        .ofs_in_targ = path.slice()[path.len - 1].key_idx,
+        .alloc_len = new_dbs.retag(.db_num, .ib_keys),
+    });
 
-            log.debug("root is full; rerooting", .{});
+    const ibs = res.vicinity;
+    path_cursor = res.path_cursor;
+    const targ_ib_entry =
+        if (path_cursor) |c| path.slice()[c.to_int()] else null;
 
-            assert(ibs.targ.block == r.ib_at(r.indx_root));
-            const targ_ib_num: Ib.Num = r.indx_root;
-            assert(ibs.targ.len.to_int() >= 2);
+    if (res.insert_result) |_| {
+        // insert succeeded
+        assert(dbs_iter.next() == null);
+        assert(dbs_iter.next_back() == null);
 
-            const new_root_num: Ib.Num = .cast(r.indx_blocks.len);
-            const new_root: *Ib = try r.indx_blocks.addOne(r.gpa);
-            new_root.* = .empty;
-
-            // new root needs at least 2 children
-            const new_sibling_num: Ib.Num = .cast(r.indx_blocks.len);
-            const new_sibling: *Ib = try r.indx_blocks.addOne(r.gpa);
-            new_sibling.* = .empty;
-
-            r.indx_root = new_root_num;
-
-            ibs.targ.key_idx = .coerce(0);
-            new_root.key_at(.coerce(0)).* =
+        if (targ_ib_entry) |e|
+            e.parent_ib.key_at(.cast(ibs.targ.key_idx.?)).* =
                 .some(.cast(ibs.targ.block.sum_subtree_bytes()));
-            new_root.child_at(.coerce(0)).* = .wrap_ib_num(targ_ib_num);
+        if (ibs.right) |right|
+            targ_ib_entry.?.parent_ib.key_at(right.key_idx).* =
+                .some(.cast(right.block.sum_subtree_bytes()));
+        if (ibs.left) |left|
+            targ_ib_entry.?.parent_ib.key_at(left.key_idx).* =
+                .some(.cast(left.block.sum_subtree_bytes()));
 
-            new_root.key_at(.coerce(1)).* = .some(.coerce(0));
-            new_root.child_at(.coerce(1)).* = .wrap_ib_num(new_sibling_num);
-
-            assert(path.len == 1);
-            path.len += 1;
-            r.indx_height = r.indx_height.add(.coerce(1));
-            assert_slice_of(path_store, path);
-
-            path[1] = path[0];
-            path[0] = .{
-                .key_idx = .coerce(0),
-                .parent_ib = new_root,
-            };
-            targ_ib_entry = path[0];
-
-            break :sides;
-        }
-
-        @field(ibs, @tagName(side)), const new_space: Ib.Len = targ_ib: {
-            const IbIdx = if (side == .targ) ?Ib.Idx else Ib.Idx;
-            const key_idx: IbIdx = switch (side) {
-                .targ => if (targ_ib_entry) |e| .cast(e.key_idx) else null,
-                .right => ibs.targ.key_idx.?.try_add(.coerce(1)) catch
-                    break :targ_ib .{ null, .coerce(0) },
-                .left => ibs.targ.key_idx.?.try_sub(.coerce(1)) catch
-                    break :targ_ib .{ null, .coerce(0) },
-                else => unreachable,
-            };
-
-            if (side == .right and
-                targ_ib_entry.?.parent_ib.key_at(key_idx).unwrap() == null)
-            {
-                break :targ_ib .{ null, .coerce(0) };
-            }
-
-            const block = if (side == .targ)
-                path[path.len - 1].parent_ib
-            else
-                r.ib_at(targ_ib_entry.?.parent_ib
-                    .child_at(key_idx).as(Ib.Num));
-            const len = block.count_keys();
-            break :targ_ib .{
-                .{
-                    .len = len,
-                    .block = block,
-                    .key_idx = key_idx,
-                },
-                Ib.Len.max_val.sub(len),
-            };
-        };
-        log.debug(
-            "{any} has space = {d}",
-            .{ side, new_space.to_int() },
-        );
-        direct_space = direct_space.add(.coerce(new_space.to_int()));
-
-        if (direct_space.to_int() >= new_dbs.to_int()) {
-            log.debug("fits in direct_space = {d}", .{direct_space.to_int()});
-
-            const next_db: Db.Num = ibs.targ.block
-                .child_at(.cast(path[path.len - 1].key_idx))
-                .as(Db.Num);
-            var dbs_iter: GenIbDbChildren = .init(r, .{
-                .len = new_dbs.retag(.db_num, .ib_keys),
-                .next = .some(next_db),
-                .prev = r.db_at(next_db).meta.prev,
-            });
-            const IbTotalLen = RangedInt(
-                Ib.Len.tag,
-                Db.Num.min_val.to_int(),
-                Db.Num.max_val.to_int(),
+        if (targ_ib_entry) |e| {
+            update_parent_keys(
+                path.slice()[0 .. path.len - 1],
+                .cast(e.parent_ib.sum_subtree_bytes()),
             );
-            _ = insert_in_blocks(Ib, IbTotalLen, &dbs_iter, .{
-                .targ = .{
-                    .block = ibs.targ.block,
-                    .len = ibs.targ.len,
-                },
-                .right = if (ibs.right) |right| .{
-                    .block = right.block,
-                    .len = right.len,
-                } else null,
-                .left = if (ibs.left) |left| .{
-                    .block = left.block,
-                    .len = left.len,
-                } else null,
-                .ofs = path[path.len - 1].key_idx,
-            });
-            assert(dbs_iter.next() == null);
-            assert(dbs_iter.next_back() == null);
-
-            if (targ_ib_entry) |e|
-                e.parent_ib.key_at(.cast(ibs.targ.key_idx.?)).* =
-                    .some(.cast(ibs.targ.block.sum_subtree_bytes()));
-            if (ibs.right) |right|
-                targ_ib_entry.?.parent_ib.key_at(right.key_idx).* =
-                    .some(.cast(right.block.sum_subtree_bytes()));
-            if (ibs.left) |left|
-                targ_ib_entry.?.parent_ib.key_at(left.key_idx).* =
-                    .some(.cast(left.block.sum_subtree_bytes()));
-
-            if (targ_ib_entry) |e| {
-                update_parent_keys(
-                    path[0 .. path.len - 1],
-                    .cast(e.parent_ib.sum_subtree_bytes()),
-                );
-            } else {
-                assert(path.len == 1);
-            }
-
-            return new_dbs;
+        } else {
+            assert(path.len == 1);
         }
+
+        return new_dbs;
     }
 
     // NOTE: Now we know that we need to split target and r/l to create new
     //       data blocks for alloc_len.
 
+    const IbInfo = BInfo(Ib);
     const ibs_targ: IbInfo = .{
         .block = ibs.targ.block,
         .len = ibs.targ.len,
@@ -754,7 +597,7 @@ fn insert_dbs(
             .right = right,
         }
     else
-        // an indx block sohuld always have at least one sibling in the
+        // an indx block should always have at least one sibling in the
         // same parent
         unreachable;
     log.debug("splitting {any}", .{split});
@@ -891,8 +734,218 @@ const GenIbDbChildren = struct {
     }
 };
 
-// TODO: alloc_len -> u8/Db/Ib slice write
-//       (optionally null -> alloc undefined space)
+fn BInfo(comptime B: type) type {
+    return struct { block: *B, len: B.Len, key_idx: Ib.Idx };
+}
+
+fn Vicinity(comptime B: type) type {
+    return struct {
+        left: ?BInfo(B),
+        targ: switch (B) {
+            Db => BInfo(B), // Db can't be root
+            Ib => struct {
+                block: *B,
+                len: B.Len,
+                key_idx: ?Ib.Idx, // Ib might be root so no parent (yet)
+            },
+            else => unreachable,
+        },
+        right: ?BInfo(B),
+    };
+}
+
+const PathLen = RangedInt(.path_entries, 0, bounds.indx_blocks_height_max);
+
+fn insert_in_vicinity(
+    r: *Rope,
+    comptime B: type,
+    comptime BTotalLen: type,
+    items: anytype,
+    args: struct {
+        path: *BlockPath,
+        path_cursor: ?PathLen,
+        ofs_in_targ: B.Len,
+        alloc_len: BTotalLen,
+    },
+) !struct {
+    vicinity: Vicinity(B),
+    insert_result: ?insert_in_blocks_Result(B),
+    path_cursor: ?PathLen,
+} {
+    const path = args.path;
+    var path_cursor = args.path_cursor;
+
+    // path_cursor = null means we are at the root.
+    // i.e. no path entry corresponds to targ.
+    log.debug("path = {any}", .{path.slice()});
+    log.debug("path_cursor = {any}", .{path_cursor});
+    assert(path.len >= if (path_cursor) |c| c.add(.coerce(1)).to_int() else 0);
+    assert(path.len == r.indx_height.to_int());
+
+    var vty: Vicinity(B) = .{
+        .left = null,
+        .targ = undefined,
+        .right = null,
+    };
+    var direct_space: BTotalLen = .coerce(0);
+    inline for (.{ .targ, .reroot, .right, .left }) |side| sides: {
+        log.debug("side = {any}", .{side});
+
+        // can't reroot a db as it is never the root.
+        if (side == .reroot) {
+            if (B == Db) break :sides;
+            assert(B == Ib);
+            if (path.len > 1) break :sides;
+
+            log.debug("root is full; rerooting", .{});
+
+            assert(vty.targ.block == r.ib_at(r.indx_root));
+            const targ_ib_num: Ib.Num = r.indx_root;
+            assert(vty.targ.len.to_int() >= 2);
+
+            const new_root_num: Ib.Num = .cast(r.indx_blocks.len);
+            const new_root: *Ib = try r.indx_blocks.addOne(r.gpa);
+            new_root.* = .empty;
+
+            // new root needs at least 2 children
+            const new_sibling_num: Ib.Num = .cast(r.indx_blocks.len);
+            const new_sibling: *Ib = try r.indx_blocks.addOne(r.gpa);
+            new_sibling.* = .empty;
+
+            r.indx_root = new_root_num;
+
+            vty.targ.key_idx = .coerce(0);
+            new_root.key_at(.coerce(0)).* =
+                .some(.cast(vty.targ.block.sum_subtree_bytes()));
+            new_root.child_at(.coerce(0)).* = .wrap_ib_num(targ_ib_num);
+
+            new_root.key_at(.coerce(1)).* = .some(.coerce(0));
+            new_root.child_at(.coerce(1)).* = .wrap_ib_num(new_sibling_num);
+
+            assert(path.len == 1);
+            path.insert(0, .{
+                .key_idx = .coerce(0),
+                .parent_ib = new_root,
+            }) catch unreachable;
+            r.indx_height = r.indx_height.add(.coerce(1));
+
+            assert(path_cursor == null);
+            path_cursor = .coerce(0);
+
+            break :sides;
+        }
+
+        @field(vty, @tagName(side)), const new_space: B.Len = targ_b: {
+            const targ_entry: ?BlockPathEntry =
+                if (path_cursor) |c| path.slice()[c.to_int()] else null;
+
+            const TargKeyIdx =
+                if (side == .targ and B == Ib) ?Ib.Idx else Ib.Idx;
+
+            const key_idx: TargKeyIdx = key_idx: {
+                if (side == .targ) {
+                    if (B == Ib and targ_entry == null) break :key_idx null;
+                    break :key_idx .cast(targ_entry.?.key_idx);
+                }
+                // If we reach a sigbling, then we are guaranteed that targ is
+                // not root. (never was or was rerooted)
+                assert(targ_entry != null);
+                const targ_key_idx = @as(?Ib.Idx, vty.targ.key_idx).?;
+                break :key_idx switch (side) {
+                    .right => targ_key_idx.try_add(.coerce(1)) catch
+                        break :targ_b .{ null, .coerce(0) },
+                    .left => targ_key_idx.try_sub(.coerce(1)) catch
+                        break :targ_b .{ null, .coerce(0) },
+                    else => unreachable,
+                };
+            };
+
+            if (side == .right and
+                targ_entry.?.parent_ib.key_at(key_idx).unwrap() == null)
+            {
+                break :targ_b .{ null, .coerce(0) };
+            }
+
+            const block: *B = switch (B) {
+                Ib => switch (side) {
+                    .targ => path.slice()[
+                        // Ib guaranteed to be parent of *something*
+                        if (path_cursor) |c| c.to_int() + 1 else 0
+                    ].parent_ib,
+                    .right, .left => r.ib_at(
+                        targ_entry.?.parent_ib.child_at(key_idx).as(Ib.Num),
+                    ),
+                    else => unreachable,
+                },
+                Db => r.db_at(
+                    targ_entry.?.parent_ib.child_at(key_idx).as(Db.Num),
+                ),
+                else => unreachable,
+            };
+            const len: B.Len = switch (B) {
+                Ib => block.count_keys(),
+                Db => .cast(targ_entry.?.parent_ib.key_at(key_idx).unwrap().?),
+                else => unreachable,
+            };
+            break :targ_b .{
+                .{
+                    .len = len,
+                    .block = block,
+                    .key_idx = key_idx,
+                },
+                B.Len.max_val.sub(len),
+            };
+        };
+        log.debug(
+            "{any} has space = {d}",
+            .{ side, new_space.to_int() },
+        );
+        direct_space = direct_space.add(.coerce(new_space.to_int()));
+
+        if (direct_space.to_int() >= args.alloc_len.to_int()) {
+            log.debug("fits in direct_space = {d}", .{direct_space.to_int()});
+
+            const res = insert_in_blocks(B, BTotalLen, items, .{
+                .targ = .{
+                    .block = vty.targ.block,
+                    .len = vty.targ.len,
+                },
+                .right = if (vty.right) |right| .{
+                    .block = right.block,
+                    .len = right.len,
+                } else null,
+                .left = if (vty.left) |left| .{
+                    .block = left.block,
+                    .len = left.len,
+                } else null,
+                .ofs = args.ofs_in_targ,
+            });
+
+            return .{
+                .vicinity = vty,
+                .insert_result = res,
+                .path_cursor = path_cursor,
+            };
+        }
+    }
+
+    return .{
+        .vicinity = vty,
+        .insert_result = null,
+        .path_cursor = path_cursor,
+    };
+}
+
+fn insert_in_blocks_Result(comptime B: type) type {
+    return struct {
+        block: *B,
+        ofs: B.Len,
+        left_len_new: ?B.Len,
+        targ_len_new: B.Len,
+        right_len_new: ?B.Len,
+    };
+}
+
 fn insert_in_blocks(
     comptime T: type,
     comptime TTotalLen: type,
@@ -903,13 +956,7 @@ fn insert_in_blocks(
         right: ?struct { block: *T, len: T.Len } = null,
         ofs: T.Len,
     },
-) struct {
-    block: *T,
-    ofs: T.Len,
-    left_len_new: ?T.Len,
-    targ_len_new: T.Len,
-    right_len_new: ?T.Len,
-} {
+) insert_in_blocks_Result(T) {
     log.debug("alloc_in_blocks(args = {any})", .{args});
 
     const generic_len = struct {
