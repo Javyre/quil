@@ -4,6 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const test_filters: []const []const u8 = b.option(
+        []const []const u8,
+        "test-filter",
+        "Skip tests that do not match any of the specified filters",
+    ) orelse &.{};
+
     const libuv_dep = b.dependency("zig_libuv", .{
         .target = target,
         .optimize = optimize,
@@ -72,10 +78,16 @@ pub fn build(b: *std.Build) void {
 
     // Test
 
-    const lib_unit_tests = b.addTest(.{ .root_module = lib_mod });
+    const lib_unit_tests = b.addTest(.{
+        .root_module = lib_mod,
+        .filters = test_filters,
+    });
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
-    const exe_unit_tests = b.addTest(.{ .root_module = exe_mod });
+    const exe_unit_tests = b.addTest(.{
+        .root_module = exe_mod,
+        .filters = test_filters,
+    });
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
     const test_step = b.step("test", "Run unit tests");

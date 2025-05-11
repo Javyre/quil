@@ -206,6 +206,21 @@ pub const Slice = struct {
         return this.block
             .bytes[this.ofs.to_int()..this.ofs.add(this.len).to_int()];
     }
+
+    pub fn take_db_slice(this: *Slice, n_: usize) Slice {
+        const n = Len.cast(@min(n_, this.len.to_int()));
+        const head = this.slice(null, n);
+        this.* = this.slice(n, null);
+        return head;
+    }
+
+    pub fn take_db_slice_back(this: *Slice, n_: usize) Slice {
+        const n = Len.cast(@min(n_, this.len.to_int()));
+        const tail = this.slice(this.len.sub(n), null);
+        assert(tail.len.eql(n));
+        this.* = this.slice(null, this.len.sub(n));
+        return tail;
+    }
 };
 
 pub fn slice(block: *Db, beg: ?Len, end: Len) Slice {
@@ -219,87 +234,141 @@ pub fn slice(block: *Db, beg: ?Len, end: Len) Slice {
     return res;
 }
 
-pub inline fn assert_nonconst_ptr(comptime Ptr: type) void {
-    if (@typeInfo(Ptr) != .pointer or @typeInfo(Ptr).pointer.is_const) {
-        @compileError("must be a non-const pointer. Found: " ++
-            @typeName(Ptr));
+fn recalc_newlines(dst: Slice) void {
+    var newlines: BitMap = 0;
+    const bytes = dst.bytes();
+    for (bytes) |byte| {
+        newlines <<= 1;
+        newlines |= if (byte == '\n') 1 else 0;
     }
+    const mask =
+        (std.math.boolMask(BitMap, true) << Idx.cast(dst.ofs).to_int()) |
+        (if (dst.ofs.add(.cast(bytes.len)).eql(dst.block.meta.bytes))
+            0
+        else
+            (std.math.boolMask(u128, true) <<
+                Idx.cast(dst.ofs.add(.cast(bytes.len))).to_int()));
+
+    dst.block.meta.newlines = (mask & dst.block.meta.newlines) |
+        (newlines << Idx.cast(dst.ofs.to_int()).to_int());
 }
 
-pub inline fn assert_WriteIter(comptime Ptr: type) void {
-    assert_nonconst_ptr(Ptr);
-    const T = @typeInfo(Ptr).pointer.child;
+pub fn write(dst: Slice, iter: anytype) Len {
+    const hasMethod = std.meta.hasMethod;
 
-    if (comptime ranged_int.is_ranged_int(T)) {
-        if (T.tag != .bytes) {
-            @compileError("WriteIter must be a RangedInt of tag .bytes. " ++
-                "Found: " ++ @typeName(T));
-        }
-        return;
-    }
-    if (@typeInfo(T) == .int)
-        return;
-
-    if (Ptr == *[]const u8)
-        return;
-
-    @compileError("Incompatilble type for WriteIter: " ++ @typeName(Ptr));
-}
-
-pub fn WriteIter_int_take(iter: anytype, amt: Len) void {
-    assert_WriteIter(@TypeOf(iter));
-    switch (@typeInfo(std.meta.Child(@TypeOf(iter)))) {
-        .int => iter.* = iter.* -| amt.to_int(),
-        else => {
-            iter.* = .cast(iter.*.to_int() -| amt.to_int());
-        },
-    }
-}
-
-pub fn write(dst: Slice, iter: anytype) void {
-    assert_WriteIter(@TypeOf(iter));
     dst.assert_sane();
-    if (@TypeOf(iter) == *[]const u8) {
-        const write_len: Len = .cast(@min(dst.len.to_int(), iter.len));
-        if (write_len.eql(.min_val)) return;
+    if (hasMethod(@TypeOf(iter), "take_db_slice")) {
+        const src = iter.take_db_slice(dst.len.to_int());
+        const subdst = dst.slice(null, src.len);
 
-        std.log.debug("write len = {d}", .{write_len.to_int()});
-        const bytes = iter.*[0..write_len.to_int()];
-        @memcpy(
-            dst.block.bytes[dst.ofs.to_int()..][0..write_len.to_int()],
-            bytes,
+        copy(subdst, src);
+
+        return subdst.len;
+    } else if (hasMethod(@TypeOf(iter), "take_str")) {
+        const bytes: []const u8 = iter.take_str(dst.len.to_int());
+        if (bytes.len == 0) return .coerce(0);
+        const subdst = dst.slice(null, .cast(bytes.len));
+
+        @memcpy(subdst.bytes(), bytes);
+        recalc_newlines(subdst);
+
+        return subdst.len;
+    } else if (hasMethod(@TypeOf(iter), "take_nop")) {
+        return .cast(iter.take_nop(dst.len.to_int()));
+    } else {
+        @compileError("invalid iter type. missing take_str or take_nop " ++
+            @typeName(@TypeOf(iter)));
+    }
+}
+
+pub fn write_back(dst: Slice, iter: anytype) Len {
+    const hasMethod = std.meta.hasMethod;
+    dst.assert_sane();
+    if (hasMethod(@TypeOf(iter), "take_db_slice_back")) {
+        const src = iter.take_db_slice_back(dst.len.to_int());
+        const subdst = dst.slice(dst.len.sub(src.len), null);
+
+        copy(subdst, src);
+
+        return subdst.len;
+    } else if (hasMethod(@TypeOf(iter), "take_str_back")) {
+        @compileError("not implemented");
+    } else if (hasMethod(@TypeOf(iter), "take_nop_back")) {
+        return .cast(iter.take_nop_back(dst.len.to_int()));
+    } else {
+        @compileError(
+            "invalid iter type. missing take_back_str or take_nop_back " ++
+                @typeName(@TypeOf(iter)),
         );
-
-        var newlines: BitMap = 0;
-        for (bytes) |byte| {
-            newlines <<= 1;
-            newlines |= if (byte == '\n') 1 else 0;
-        }
-        const mask =
-            (std.math.boolMask(BitMap, true) << Idx.cast(dst.ofs).to_int()) |
-            (if (dst.ofs.add(.cast(bytes.len)).eql(dst.block.meta.bytes))
-                0
-            else
-                (std.math.boolMask(u128, true) <<
-                    Idx.cast(dst.ofs.add(.cast(bytes.len))).to_int()));
-
-        dst.block.meta.newlines = (mask & dst.block.meta.newlines) |
-            (newlines << Idx.cast(dst.ofs.to_int()).to_int());
-
-        iter.* = iter.*[write_len.to_int()..];
-        return;
     }
-
-    WriteIter_int_take(iter, dst.len);
 }
 
-pub fn write_from_back(dst: Slice, iter: anytype) void {
-    assert_WriteIter(@TypeOf(iter));
+/// Copy src into dst.
+///
+/// Must be same block and dst.ofs <= src.ofs.
+pub fn copyForwards(dst: Slice, src: Slice) void {
     dst.assert_sane();
-    if (@TypeOf(iter) == *[]u8) {
-        @panic("not implemented");
-    }
-    WriteIter_int_take(iter, dst.len);
+    src.assert_sane();
+    assert(dst.len.eql(src.len));
+    assert(dst.block == src.block);
+
+    if (dst.len.eql(.coerce(0))) return;
+    assert(dst.ofs.to_int() <= src.ofs.to_int());
+    if (dst.eql(src)) return;
+
+    // len != 0 so these casts are safe
+    const dst_ofs: Idx = .cast(dst.ofs);
+    const src_ofs: Idx = .cast(src.ofs);
+
+    // populate N low bits
+    const m = if (dst.len.eql(.max_val))
+        std.math.boolMask(BitMap, false)
+    else
+        ~(std.math.boolMask(BitMap, true) << @intCast(dst.len.to_int()));
+
+    // apply ofs to m
+    const dst_mask = m << dst_ofs.to_int();
+    const src_mask = m << src_ofs.to_int();
+
+    const src_copy = src.block.meta.newlines & src_mask;
+    dst.block.meta.newlines &= ~dst_mask;
+    dst.block.meta.newlines |= src_copy >> src_ofs.sub(dst_ofs).to_int();
+
+    std.mem.copyForwards(u8, dst.bytes(), src.bytes());
+}
+
+/// Copy src into dst.
+///
+/// Must be same block and dst.ofs >= src.ofs.
+pub fn copyBackwards(dst: Slice, src: Slice) void {
+    dst.assert_sane();
+    src.assert_sane();
+    assert(dst.len.eql(src.len));
+    assert(dst.block == src.block);
+
+    if (dst.len.eql(.coerce(0))) return;
+    assert(dst.ofs.to_int() >= src.ofs.to_int());
+    if (dst.eql(src)) return;
+
+    // len != 0 so these casts are safe
+    const dst_ofs: Idx = .cast(dst.ofs);
+    const src_ofs: Idx = .cast(src.ofs);
+
+    // populate N low bits
+    const m = if (dst.len.eql(.max_val))
+        std.math.boolMask(BitMap, false)
+    else
+        ~(std.math.boolMask(BitMap, true) << @intCast(dst.len.to_int()));
+
+    // apply ofs to m
+    const dst_mask = m << dst_ofs.to_int();
+    const src_mask = m << src_ofs.to_int();
+
+    const src_copy = src.block.meta.newlines & src_mask;
+    dst.block.meta.newlines &= ~dst_mask;
+    dst.block.meta.newlines |= src_copy << dst_ofs.sub(src_ofs).to_int();
+
+    std.mem.copyBackwards(u8, dst.bytes(), src.bytes());
 }
 
 pub fn copy(dst: Slice, src: Slice) void {
@@ -322,36 +391,21 @@ pub fn copy(dst: Slice, src: Slice) void {
     const dst_mask = m << dst_ofs.to_int();
     const src_mask = m << src_ofs.to_int();
 
+    const src_copy = src.block.meta.newlines & src_mask;
     dst.block.meta.newlines &= ~dst_mask;
 
-    if (dst_ofs.to_int() > src_ofs.to_int()) {
-        dst.block.meta.newlines |=
-            (src.block.meta.newlines & src_mask) <<
-            dst_ofs.sub(src_ofs).to_int();
-    } else {
-        dst.block.meta.newlines |=
-            (src.block.meta.newlines & src_mask) >>
-            src_ofs.sub(dst_ofs).to_int();
-    }
+    if (dst_ofs.to_int() > src_ofs.to_int())
+        dst.block.meta.newlines |= src_copy << dst_ofs.sub(src_ofs).to_int()
+    else
+        dst.block.meta.newlines |= src_copy >> src_ofs.sub(dst_ofs).to_int();
 
     // these ifs should usually be eliminated by the compiler when inlining
     if (dst.block != src.block) {
-        @memcpy(
-            dst.block.bytes[dst_ofs.to_int()..][0..src.len.to_int()],
-            src.block.bytes[src_ofs.to_int()..][0..src.len.to_int()],
-        );
+        @memcpy(dst.bytes(), src.bytes());
     } else if (dst_ofs.to_int() <= src_ofs.to_int()) {
-        std.mem.copyForwards(
-            u8,
-            dst.block.bytes[dst_ofs.to_int()..][0..src.len.to_int()],
-            src.block.bytes[src_ofs.to_int()..][0..src.len.to_int()],
-        );
+        std.mem.copyForwards(u8, dst.bytes(), src.bytes());
     } else {
         assert(dst_ofs.to_int() > src_ofs.to_int());
-        std.mem.copyBackwards(
-            u8,
-            dst.block.bytes[dst_ofs.to_int()..][0..src.len.to_int()],
-            src.block.bytes[src_ofs.to_int()..][0..src.len.to_int()],
-        );
+        std.mem.copyBackwards(u8, dst.bytes(), src.bytes());
     }
 }

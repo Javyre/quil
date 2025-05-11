@@ -48,7 +48,7 @@ pub const RawChild = enum(u32) {
     }
     pub fn as(this: RawChild, comptime T: type) T {
         switch (T) {
-            Db.Num, Num => {},
+            Db.Num, Ib.Num => {},
             else => @compileError("Invalid target type"),
         }
         return T.cast(@intFromEnum(this));
@@ -120,6 +120,11 @@ pub fn find_ofs(this: Ib, ofs: RopeBytes) ?struct {
 
         cum_ofs = .cast(cum_ofs.to_int() + subsize.to_int());
         i += 1;
+
+        // take first 0-len child as the last candidate
+        // this is mostly to cover for the case of ofs == 0 and all
+        // children len == 0. we want to return the first child.
+        if (subsize.eql(.min_val)) break;
     }
     if (cum_ofs == ofs) {
         const last_subsize: TreeSize = this.keys[i - 1].unwrap().?;
@@ -198,6 +203,40 @@ pub const Slice = struct {
         new.assert_sane();
         return new;
     }
+
+    pub fn keys(this: Slice) []RawKey {
+        return this.block.keys[this.ofs.to_int()..][0..this.len.to_int()];
+    }
+    pub fn children(this: Slice) []RawChild {
+        return this.block.children[this.ofs.to_int()..][0..this.len.to_int()];
+    }
+
+    pub fn take(this: *Slice, n_: usize) struct {
+        keys: []RawKey,
+        children: []RawChild,
+    } {
+        const n = Len.cast(n_).min(this.len);
+        const head = this.slice(null, n);
+        this.* = this.slice(n, null);
+        return .{
+            .keys = head.keys(),
+            .children = head.children(),
+        };
+    }
+
+    pub fn take_back(this: *Slice, n_: usize) struct {
+        keys: []RawKey,
+        children: []RawChild,
+    } {
+        const n = Len.cast(n_).min(this.len);
+        const tail = this.slice(this.len.sub(n), null);
+        assert(tail.len.eql(n));
+        this.* = this.slice(null, this.len.sub(n));
+        return .{
+            .keys = tail.keys(),
+            .children = tail.children(),
+        };
+    }
 };
 
 pub fn slice(block: *Ib, beg: ?Len, end: Len) Slice {
@@ -211,47 +250,71 @@ pub fn slice(block: *Ib, beg: ?Len, end: Len) Slice {
     return res;
 }
 
-pub fn assert_WriteIter(comptime Ptr: type) void {
-    if (@typeInfo(Ptr) != .pointer or @typeInfo(Ptr).pointer.is_const) {
-        @compileError("WriteIter must be a non-const pointer");
-    }
-    const T = @typeInfo(Ptr).pointer.child;
-    if (!@hasDecl(T, "next") or !@hasDecl(T, "next_back")) {
-        @compileError("WriteIter must have next() and next_back()");
+pub fn write(dst: Slice, iter: anytype) Len {
+    const hasMethod = std.meta.hasMethod;
+    dst.assert_sane();
+    if (hasMethod(@TypeOf(iter), "take")) {
+        const res = iter.take(dst.len.to_int());
+        assert(res.keys.len == res.children.len);
+        const actual_dst = dst.slice(null, .cast(res.keys.len));
+        @memcpy(actual_dst.keys(), res.keys);
+        @memcpy(actual_dst.children(), res.children);
+        return .cast(res.keys.len);
+    } else {
+        var written: Len = .coerce(0);
+        for (0..dst.len.to_int()) |i| {
+            const el = iter.next() orelse break;
+            dst.keys()[i] = el.key;
+            dst.children()[i] = el.child;
+            written = written.add(.coerce(1));
+        }
+        return written;
     }
 }
 
-pub fn write(dst: Slice, iter: anytype) void {
-    assert_WriteIter(@TypeOf(iter));
-
+pub fn write_back(dst: Slice, iter: anytype) Len {
+    const hasMethod = std.meta.hasMethod;
     dst.assert_sane();
-    if (dst.len.eql(.coerce(0))) return;
-
-    var i: Len = .coerce(0);
-    while (iter.next()) |el| {
-        assert(i.to_int() < dst.len.to_int());
-        dst.block.keys[dst.ofs.to_int() + i.to_int()] = .some(el.key);
-        dst.block.children[dst.ofs.to_int() + i.to_int()] = el.child;
-        i = i.add(.coerce(1));
+    if (hasMethod(@TypeOf(iter), "take_back")) {
+        const res = iter.take_back(dst.len.to_int());
+        assert(res.keys.len == res.children.len);
+        const actual_dst = dst.slice(dst.len.sub(.cast(res.keys.len)), null);
+        @memcpy(actual_dst.keys(), res.keys);
+        @memcpy(actual_dst.children(), res.children);
+        return .cast(res.keys.len);
+    } else {
+        var written: Len = .coerce(0);
+        for (0..dst.len.to_int()) |i_rev| {
+            const i = dst.len.to_int() - i_rev - 1;
+            const el = iter.next_back() orelse break;
+            dst.keys()[i] = el.key;
+            dst.children()[i] = el.child;
+            written = written.add(.coerce(1));
+        }
+        return written;
     }
-    // Must fill dst
-    assert(i.eql(dst.len));
 }
 
-pub fn write_from_back(dst: Slice, iter: anytype) void {
-    assert_WriteIter(@TypeOf(iter));
-
+pub fn copyForwards(dst: Slice, src: Slice) void {
     dst.assert_sane();
-    if (dst.len.eql(.coerce(0))) return;
+    src.assert_sane();
+    assert(dst.len.eql(src.len));
+    if (dst.block == src.block)
+        assert(dst.ofs.to_int() <= src.ofs.to_int());
 
-    var i: Len = dst.len;
-    while (iter.next_back()) |el| {
-        dst.block.keys[dst.ofs.to_int() + i.to_int() - 1] = .some(el.key);
-        dst.block.children[dst.ofs.to_int() + i.to_int() - 1] = el.child;
-        i = i.sub(.coerce(1));
-    }
-    // Must fill dst
-    assert(i.eql(.coerce(0)));
+    std.mem.copyForwards(RawKey, dst.keys(), src.keys());
+    std.mem.copyForwards(RawChild, dst.children(), src.children());
+}
+
+pub fn copyBackwards(dst: Slice, src: Slice) void {
+    dst.assert_sane();
+    src.assert_sane();
+    assert(dst.len.eql(src.len));
+    if (dst.block == src.block)
+        assert(dst.ofs.to_int() >= src.ofs.to_int());
+
+    std.mem.copyBackwards(RawKey, dst.keys(), src.keys());
+    std.mem.copyBackwards(RawChild, dst.children(), src.children());
 }
 
 pub fn copy(dst: Slice, src: Slice) void {
@@ -264,36 +327,14 @@ pub fn copy(dst: Slice, src: Slice) void {
 
     // these ifs should usually be eliminated by the compiler when inlining
     if (dst.block != src.block) {
-        @memcpy(
-            dst.block.keys[dst.ofs.to_int()..][0..src.len.to_int()],
-            src.block.keys[src.ofs.to_int()..][0..src.len.to_int()],
-        );
-        @memcpy(
-            dst.block.children[dst.ofs.to_int()..][0..src.len.to_int()],
-            src.block.children[src.ofs.to_int()..][0..src.len.to_int()],
-        );
+        @memcpy(dst.keys(), src.keys());
+        @memcpy(dst.children(), src.children());
     } else if (dst.ofs.to_int() <= src.ofs.to_int()) {
-        std.mem.copyForwards(
-            RawKey,
-            dst.block.keys[dst.ofs.to_int()..][0..src.len.to_int()],
-            src.block.keys[src.ofs.to_int()..][0..src.len.to_int()],
-        );
-        std.mem.copyForwards(
-            RawChild,
-            dst.block.children[dst.ofs.to_int()..][0..src.len.to_int()],
-            src.block.children[src.ofs.to_int()..][0..src.len.to_int()],
-        );
+        std.mem.copyForwards(RawKey, dst.keys(), src.keys());
+        std.mem.copyForwards(RawChild, dst.children(), src.children());
     } else {
         assert(dst.ofs.to_int() > src.ofs.to_int());
-        std.mem.copyBackwards(
-            RawKey,
-            dst.block.keys[dst.ofs.to_int()..][0..src.len.to_int()],
-            src.block.keys[src.ofs.to_int()..][0..src.len.to_int()],
-        );
-        std.mem.copyBackwards(
-            RawChild,
-            dst.block.children[dst.ofs.to_int()..][0..src.len.to_int()],
-            src.block.children[src.ofs.to_int()..][0..src.len.to_int()],
-        );
+        std.mem.copyBackwards(RawKey, dst.keys(), src.keys());
+        std.mem.copyBackwards(RawChild, dst.children(), src.children());
     }
 }

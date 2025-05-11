@@ -46,17 +46,30 @@ pub fn RangedInt(
         /// Runtime cast. Validated at runtime. Panics on error.
         pub inline fn cast(val: anytype) @This() {
             return try_cast(val) catch |err| switch (err) {
-                error.Overflow => std.debug.panic(
-                    "{d} not in range {d}..={d}",
-                    .{
-                        if (comptime is_ranged_int(@TypeOf(val)))
-                            val.to_int()
-                        else
-                            val,
-                        @This().min_val.to_int(),
-                        @This().max_val.to_int(),
-                    },
-                ),
+                error.Overflow => if (@inComptime())
+                    @compileError(std.fmt.comptimePrint(
+                        "{d} not in range {d}..={d}",
+                        .{
+                            if (is_ranged_int(@TypeOf(val)))
+                                val.to_int()
+                            else
+                                val,
+                            @This().min_val.to_int(),
+                            @This().max_val.to_int(),
+                        },
+                    ))
+                else
+                    std.debug.panic(
+                        "{d} not in range {d}..={d}",
+                        .{
+                            if (comptime is_ranged_int(@TypeOf(val)))
+                                val.to_int()
+                            else
+                                val,
+                            @This().min_val.to_int(),
+                            @This().max_val.to_int(),
+                        },
+                    ),
             };
         }
 
@@ -154,10 +167,11 @@ pub fn RangedInt(
         ) !void {
             _ = fmt;
             _ = options;
-            try writer.print("{d} in {}", .{
-                this.to_int(),
-                RangeMeta.from(this).?,
-            });
+            try writer.print("{d}", .{this.to_int()});
+            // try writer.print("{d} in {}", .{
+            //     this.to_int(),
+            //     RangeMeta.from(this).?,
+            // });
         }
     };
 }
