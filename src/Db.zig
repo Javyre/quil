@@ -67,6 +67,21 @@ pub const Meta = struct {
             },
         );
     }
+
+    pub fn jsonStringify(this: *const Meta, jw: anytype) !void {
+        const BM = struct {
+            bm: *const BitMap,
+            pub fn jsonStringify(bm: *const @This(), jw_: anytype) !void {
+                try jw_.print("\"{b}\"", .{bm.bm.*});
+            }
+        };
+        try jw.write(.{
+            .bytes = this.bytes,
+            .newlines = BM{ .bm = &this.newlines },
+            .next = this.next,
+            .prev = this.prev,
+        });
+    }
 };
 
 meta: Meta align(config.dcache_line_bytes),

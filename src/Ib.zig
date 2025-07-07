@@ -160,6 +160,14 @@ pub fn format(
     return writer.writeAll(" } }");
 }
 
+pub fn jsonStringify(this: *const Ib, jw: anytype) !void {
+    const len = this.count_keys().to_int();
+    try jw.write(.{
+        .keys = this.keys[0..len],
+        .children = this.children[0..len],
+    });
+}
+
 pub const Slice = struct {
     block: *Ib,
     ofs: Len,
@@ -215,7 +223,7 @@ pub const Slice = struct {
         keys: []RawKey,
         children: []RawChild,
     } {
-        const n = Len.cast(n_).min(this.len);
+        const n = Len.cast(@min(n_, this.len.to_int()));
         const head = this.slice(null, n);
         this.* = this.slice(n, null);
         return .{
@@ -228,7 +236,7 @@ pub const Slice = struct {
         keys: []RawKey,
         children: []RawChild,
     } {
-        const n = Len.cast(n_).min(this.len);
+        const n = Len.cast(@min(n_, this.len.to_int()));
         const tail = this.slice(this.len.sub(n), null);
         assert(tail.len.eql(n));
         this.* = this.slice(null, this.len.sub(n));

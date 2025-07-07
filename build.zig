@@ -93,4 +93,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_exe_unit_tests.step);
+    // these are useful for running in profiler
+    // test_step.dependOn(&b.addInstallArtifact(lib_unit_tests, .{}).step);
+    // test_step.dependOn(&b.addInstallArtifact(exe_unit_tests, .{}).step);
 }

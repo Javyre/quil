@@ -3,7 +3,9 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-const log = std.log.scoped(.rope);
+// const log = @import("./log.zig").scoped(.rope);
+const log = @import("./log.zig").noop;
+const tlog = @import("./log.zig").scoped(.rope_test);
 
 const Rope = @This();
 const ranged_int = @import("./ranged_int.zig");
@@ -200,7 +202,15 @@ fn db_at(r: *Rope, num: Db.Num) *Db {
     return r.data_blocks.at(num.to_int());
 }
 
+fn db_at_const(r: *const Rope, num: Db.Num) *const Db {
+    return r.data_blocks.at(num.to_int());
+}
+
 fn ib_at(r: *Rope, num: Ib.Num) *Ib {
+    return r.indx_blocks.at(num.to_int());
+}
+
+fn ib_at_const(r: *const Rope, num: Ib.Num) *const Ib {
     return r.indx_blocks.at(num.to_int());
 }
 
@@ -284,7 +294,7 @@ fn alloc_at(r: *Rope, ofs: RopeBytes, alloc_len: RopeBytes) !struct {
     alloc_len: RopeBytes,
 } {
     @setEvalBranchQuota(2_000);
-    log.debug("alloc_at(ofs = {}, alloc_len = {})", .{ ofs, alloc_len });
+    log.info(@src(), "alloc_at()", .{ .ofs = ofs, .alloc_len = alloc_len });
 
     const db_query_ = r.find_data_block(ofs);
     var path = db_query_.path;
@@ -339,7 +349,9 @@ fn alloc_at(r: *Rope, ofs: RopeBytes, alloc_len: RopeBytes) !struct {
 
     if (ins_res_p) |ins_res| {
         // insert succeeded
-        log.debug("insert succeeded without split", .{});
+        log.debug(@src(), "insert succeeded without split", .{
+            .ins_res = ins_res,
+        });
         assert(alloc_iter.rest_len().eql(.coerce(0)));
 
         dbs.targ.block.meta.bytes = ins_res.targ_len_new;
@@ -393,7 +405,6 @@ fn alloc_at(r: *Rope, ofs: RopeBytes, alloc_len: RopeBytes) !struct {
         // a data block should always have at least one sibling in the same
         // parent
         unreachable;
-    log.debug("=== splitting {any}", .{split});
 
     const split_lens = calc_split_lens(Db, RopeBytes, .{
         .b_len_min = .coerce(bounds.data_block_bytes_min),
@@ -403,7 +414,10 @@ fn alloc_at(r: *Rope, ofs: RopeBytes, alloc_len: RopeBytes) !struct {
         .left = split.left,
         .right = split.right,
     });
-    log.debug("split_lens = {any}", .{split_lens});
+    log.info(@src(), "splitting", .{
+        .split = split,
+        .split_lens = split_lens,
+    });
 
     assert(RopeBytes.add(
         .coerce(split_lens.prefix),
@@ -427,17 +441,17 @@ fn alloc_at(r: *Rope, ofs: RopeBytes, alloc_len: RopeBytes) !struct {
     const left_db_num: Db.Num = split.right.block.meta.prev.unwrap().?;
     const right_db_num: Db.Num = split.left.block.meta.next.unwrap().?;
     path.slice()[path.len - 1].key_idx = .coerce(split.right.key_idx);
-    log.debug("pre-insert_dbs parent: {any}", .{
-        path.slice()[path.len - 1].parent_ib,
+    log.debug(@src(), "pre-insert_dbs parent", .{
+        .parent = path.slice()[path.len - 1].parent_ib,
     });
-    log.debug("left: {any}", .{split.left.block});
-    log.debug("right: {any}", .{split.right.block});
+    log.debug(@src(), "left", .{ .left = split.left.block });
+    log.debug(@src(), "right", .{ .right = split.right.block });
     const actual_new_dbs = try r.insert_dbs(&path, split_lens.new_bs);
-    log.debug("post-insert_dbs parent: {any}", .{
-        path.slice()[path.len - 1].parent_ib,
+    log.debug(@src(), "post-insert_dbs parent", .{
+        .parent = path.slice()[path.len - 1].parent_ib,
     });
-    log.debug("left: {any}", .{split.left.block});
-    log.debug("right: {any}", .{split.right.block});
+    log.debug(@src(), "left", .{ .left = split.left.block });
+    log.debug(@src(), "right", .{ .right = split.right.block });
     assert(actual_new_dbs.to_int() > 0);
     assert(actual_new_dbs.to_int() <= split_lens.new_bs.to_int());
 
@@ -505,6 +519,11 @@ fn insert_dbs(
     path: *BlockPath,
     new_dbs: Db.Num,
 ) !Db.Num {
+    log.info(@src(), "insert_dbs()", .{
+        .path = path.slice(),
+        .new_dbs = new_dbs,
+    });
+
     // null if targ is root ib
     var path_cursor: ?PathLen =
         if (path.len >= 2) .cast(path.len - 2) else null;
@@ -540,14 +559,22 @@ fn insert_dbs(
     if (Ib.Len.max_val.sub(targ_pre_reroot.len).to_int() >= new_dbs.to_int()) {
         const targ = targ_pre_reroot;
 
-        _ = insert_in_blocks(Ib, IbTotalLen, new_dbs_iter, .{
+        const ins_res = insert_in_blocks(Ib, IbTotalLen, new_dbs_iter, .{
             .targ = .{ .block = targ.block, .len = targ.len },
             .ofs = ofs_in_targ_ib,
         });
         // insert succeeded
-        log.debug("insert succeeded without split", .{});
+        log.debug(@src(), "insert succeeded without split", .{
+            .ins_res = ins_res,
+        });
         assert(new_dbs_iter.next() == null);
         assert(new_dbs_iter.next_back() == null);
+        assert(ins_res.block == targ.block);
+
+        // fix sentinels
+        if (ins_res.targ_len_new.to_int() < Ib.Len.max_val.to_int()) {
+            targ.block.key_at(.cast(ins_res.targ_len_new)).* = .null;
+        }
 
         if (targ.path_entry) |e| {
             e.parent_ib.key_at(.cast(e.key_idx)).* =
@@ -569,11 +596,7 @@ fn insert_dbs(
         .right = null,
     };
     ibs.targ = if (path_cursor == null) targ: {
-        log.debug("=== root is full; rerooting", .{});
-        // NOTE: reroot creates a new sibling block but leaves it empty.
-        //       this temporarily violates the min of 2 children rule, but
-        //       this should be resolved either by insert_in_blocks or by the
-        //       split.
+        log.info(@src(), "root is full; rerooting", .{});
         const old_len = path.len;
         const targ = try r.reroot(path, targ_pre_reroot);
         assert(path.len == old_len + 1);
@@ -589,10 +612,13 @@ fn insert_dbs(
         .ofs_in_targ = ofs_in_targ_ib,
     })) |ins_res| {
         // insert succeeded
-        log.debug("insert succeeded without split", .{});
+        log.debug(@src(), "insert succeeded without split", .{
+            .ins_res = ins_res,
+        });
         assert(new_dbs_iter.next() == null);
         assert(new_dbs_iter.next_back() == null);
 
+        // fix sentinels
         if (ins_res.targ_len_new.to_int() < Ib.Len.max_val.to_int()) {
             ibs.targ.block.key_at(.cast(ins_res.targ_len_new)).* = .null;
         }
@@ -653,7 +679,6 @@ fn insert_dbs(
         // an indx block should always have at least one sibling in the
         // same parent
         unreachable;
-    log.debug("=== splitting {any}", .{split});
 
     const split_lens = calc_split_lens(Ib, IbTotalLen, .{
         .b_len_min = .coerce(@as(comptime_int, bounds.indx_block_keys_min)),
@@ -662,6 +687,10 @@ fn insert_dbs(
         .targ = ibs.targ,
         .left = split.left,
         .right = split.right,
+    });
+    log.info(@src(), "splitting", .{
+        .split = split,
+        .split_lens = split_lens,
     });
 
     const actual_new_ibs = Ib.Num.min(
@@ -687,13 +716,28 @@ fn insert_dbs(
     });
 
     // iter over prefix + new_dbs + postfix dbs
-    const right_last: Ib.Idx = .cast(split.right.len.sub(.coerce(1)));
-    assert(split.left.block.key_at(.coerce(0)).unwrap() != null);
-    assert(split.right.block.key_at(right_last).unwrap() != null);
-    const prefix_head: Db.Num =
-        split.left.block.child_at(.coerce(0)).as(Db.Num);
-    const postfix_tail: Db.Num =
-        split.right.block.child_at(right_last).as(Db.Num);
+    // COMBAK: account for right being empty due to rerooting. postfix_tail
+    // should be left.last and we should assert that left.block is targ.block
+
+    // split.right might be empty due to a reroot
+    const postfix_last: struct {
+        key_idx: Ib.Idx,
+        parent_ib: IbInfo,
+    } = if (split.right.len.to_int() > 0) .{
+        .key_idx = .cast(split.right.len.sub(.coerce(1))),
+        .parent_ib = split.right,
+    } else .{
+        .key_idx = .cast(split.left.len.sub(.coerce(1))),
+        .parent_ib = split.left,
+    };
+    assert(split.left.block
+        .key_at(.coerce(0)).unwrap() != null);
+    assert(postfix_last.parent_ib.block
+        .key_at(postfix_last.key_idx).unwrap() != null);
+    const prefix_head: Db.Num = split.left.block
+        .child_at(.coerce(0)).as(Db.Num);
+    const postfix_tail: Db.Num = postfix_last.parent_ib.block
+        .child_at(postfix_last.key_idx).as(Db.Num);
 
     var prefix_iter: DbIter = .{
         .r = r,
@@ -784,13 +828,87 @@ const PendingIbSlice = struct {
     keys: []Ib.RawKey,
     children: []Ib.RawChild,
 
-    pub fn from_IbSlice(slice: Ib.Slice) PendingIbSlice {
+    pub fn slice(this: PendingIbSlice, beg: usize, end: ?usize) PendingIbSlice {
+        assert(this.keys.len == this.children.len);
+        const end_ = end orelse this.keys.len;
+        assert(beg <= end_);
         return .{
-            .keys = slice.block
-                .keys[slice.ofs.to_int()..][0..slice.len.to_int()],
-            .children = slice.block
-                .children[slice.ofs.to_int()..][0..slice.len.to_int()],
+            .keys = this.keys[beg..end_],
+            .children = this.children[beg..end_],
         };
+    }
+
+    pub fn shr(this: PendingIbSlice, amt: usize) void {
+        std.mem.copyBackwards(
+            Ib.RawChild,
+            this.children[amt..],
+            this.children[0 .. this.children.len - amt],
+        );
+        std.mem.copyBackwards(
+            Ib.RawKey,
+            this.keys[amt..],
+            this.keys[0 .. this.keys.len - amt],
+        );
+    }
+
+    pub fn write(dst: PendingIbSlice, iter: anytype) usize {
+        const hasMethod = std.meta.hasMethod;
+        assert(dst.keys.len == dst.children.len);
+        if (hasMethod(@TypeOf(iter), "take")) {
+            const res = iter.take(dst.keys.len);
+            assert(res.keys.len == res.children.len);
+            const actual_dst = dst.slice(0, res.keys.len);
+            @memcpy(actual_dst.keys, res.keys);
+            @memcpy(actual_dst.children, res.children);
+            return res.keys.len;
+        } else {
+            var written: usize = 0;
+            for (0..dst.keys.len) |i| {
+                const el = iter.next() orelse break;
+                dst.keys[i] = el.key;
+                dst.children[i] = el.child;
+                written += 1;
+            }
+            return written;
+        }
+    }
+
+    pub fn rest_len(this: PendingIbSlice) usize {
+        assert(this.keys.len == this.children.len);
+        return this.keys.len;
+    }
+
+    pub fn take(this: *PendingIbSlice, n_: usize) struct {
+        keys: []Ib.RawKey,
+        children: []Ib.RawChild,
+    } {
+        assert(this.keys.len == this.children.len);
+        const n = @min(n_, this.keys.len);
+        const head = .{
+            .keys = this.keys[0..n],
+            .children = this.children[0..n],
+        };
+        this.* = .{
+            .keys = this.keys[n..],
+            .children = this.children[n..],
+        };
+        return .{ .keys = head.keys, .children = head.children };
+    }
+    pub fn take_back(this: *PendingIbSlice, n_: usize) struct {
+        keys: []Ib.RawKey,
+        children: []Ib.RawChild,
+    } {
+        assert(this.keys.len == this.children.len);
+        const n = @min(n_, this.keys.len);
+        const tail = .{
+            .keys = this.keys[this.keys.len - n ..],
+            .children = this.children[this.children.len - n ..],
+        };
+        this.* = .{
+            .keys = this.keys[0 .. this.keys.len - n],
+            .children = this.children[0 .. this.children.len - n],
+        };
+        return .{ .keys = tail.keys, .children = tail.children };
     }
 };
 
@@ -802,8 +920,11 @@ fn insert_ibs(
     pending_ib_keys: *PendingIbKeys,
     pending_ib_childs: *PendingIbChilds,
 ) !void {
-    _ = r;
-
+    log.info(@src(), "insert_ibs()", .{
+        .path = path.slice(),
+        .pending_ib_keys = pending_ib_keys.slice(),
+        .pending_ib_childs = pending_ib_childs.slice(),
+    });
     // null if targ is root ib
     var path_cursor: ?PathLen =
         if (path.len >= 3) .cast(path.len - 3) else null;
@@ -813,51 +934,11 @@ fn insert_ibs(
         assert(pending_ib_keys.len > 0);
         assert(pending_ib_childs.len > 0);
         assert(pending_ib_keys.len == pending_ib_childs.len);
+        const new_ibs: Ib.Num = .cast(pending_ib_keys.len);
 
-        var new_ibs_iter: struct {
-            keys: []Ib.RawKey,
-            childs: []Ib.RawChild,
-
-            pub fn rest_len(this: @This()) usize {
-                assert(this.keys.len == this.childs.len);
-                return this.keys.len;
-            }
-
-            pub fn take(this: *@This(), n_: usize) struct {
-                keys: []Ib.RawKey,
-                childs: []Ib.RawChild,
-            } {
-                assert(this.keys.len == this.childs.len);
-                const n = @min(n_, this.keys.len);
-                const head = .{
-                    .keys = this.keys[0..n],
-                    .childs = this.childs[0..n],
-                };
-                this.* = .{
-                    .keys = this.keys[n..],
-                    .childs = this.childs[n..],
-                };
-                return .{ .keys = head.keys, .childs = head.childs };
-            }
-            pub fn take_back(this: *@This(), n_: usize) struct {
-                keys: []Ib.RawKey,
-                childs: []Ib.RawChild,
-            } {
-                assert(this.keys.len == this.childs.len);
-                const n = @min(n_, this.keys.len);
-                const tail = .{
-                    .keys = this.keys[this.keys.len - n ..],
-                    .childs = this.childs[this.childs.len - n ..],
-                };
-                this.* = .{
-                    .keys = this.keys[0 .. this.keys.len - n],
-                    .childs = this.childs[0 .. this.childs.len - n],
-                };
-                return .{ .keys = tail.keys, .childs = tail.childs };
-            }
-        } = .{
+        var new_ibs_iter: PendingIbSlice = .{
             .keys = pending_ib_keys.slice(),
-            .childs = pending_ib_childs.slice(),
+            .children = pending_ib_childs.slice(),
         };
 
         const IbTotalLen = RangedInt(
@@ -870,17 +951,25 @@ fn insert_ibs(
 
         const targ_pre_reroot = vty_targ_ib(path, path_cursor);
         if (Ib.Len.max_val.sub(targ_pre_reroot.len).to_int() >=
-            pending_ib_keys.len)
+            new_ibs.to_int())
         {
             const targ = targ_pre_reroot;
 
-            _ = insert_in_blocks(Ib, IbTotalLen, &new_ibs_iter, .{
+            const ins_res = insert_in_blocks(Ib, IbTotalLen, &new_ibs_iter, .{
                 .targ = .{ .block = targ.block, .len = targ.len },
                 .ofs = ofs_in_targ_ib,
             });
             // insert succeeded
-            log.debug("insert succeeded without split", .{});
+            log.debug(@src(), "insert succeeded without split", .{
+                .ins_res = ins_res,
+            });
             assert(new_ibs_iter.rest_len() == 0);
+            assert(ins_res.block == targ.block);
+
+            // fix sentinels
+            if (ins_res.targ_len_new.to_int() < Ib.Len.max_val.to_int()) {
+                targ.block.key_at(.cast(ins_res.targ_len_new)).* = .null;
+            }
 
             if (targ.path_entry) |e| {
                 e.parent_ib.key_at(.cast(e.key_idx)).* =
@@ -891,13 +980,247 @@ fn insert_ibs(
                 );
             } else {
                 assert(path_cursor == null);
-                assert(path.len == 1);
             }
             return;
         }
+
+        var ibs: Vicinity(Ib) = .{
+            .left = null,
+            .targ = undefined,
+            .right = null,
+        };
+        ibs.targ = if (path_cursor == null) targ: {
+            log.info(@src(), "root is full; rerooting", .{});
+            const old_len = path.len;
+            const targ = try r.reroot(path, targ_pre_reroot);
+            assert(path.len == old_len + 1);
+            path_cursor = .coerce(0);
+
+            break :targ targ;
+        } else targ_pre_reroot;
+
+        if (try r.insert_with_siblings(Ib, IbTotalLen, &new_ibs_iter, .{
+            .path = path, // mutable ref
+            .path_cursor = path_cursor,
+            .vty = &ibs,
+            .ofs_in_targ = ofs_in_targ_ib,
+        })) |ins_res| {
+            // insert succeeded
+            log.debug(@src(), "insert succeeded without split", .{
+                .ins_res = ins_res,
+            });
+            assert(new_ibs_iter.rest_len() == 0);
+
+            if (ins_res.targ_len_new.to_int() < Ib.Len.max_val.to_int()) {
+                ibs.targ.block.key_at(.cast(ins_res.targ_len_new)).* = .null;
+            }
+            if (ins_res.right_len_new) |right_len_new| {
+                if (right_len_new.to_int() < Ib.Len.max_val.to_int())
+                    ibs.right.?.block.key_at(.cast(right_len_new)).* = .null;
+            }
+            if (ins_res.left_len_new) |left_len_new| {
+                if (left_len_new.to_int() < Ib.Len.max_val.to_int())
+                    ibs.left.?.block.key_at(.cast(left_len_new)).* = .null;
+            }
+
+            if (ibs.targ.path_entry) |e|
+                e.parent_ib.key_at(.cast(e.key_idx)).* =
+                    .some(.cast(ibs.targ.block.sum_subtree_bytes()));
+            if (ibs.right) |right|
+                ibs.targ.path_entry.?.parent_ib.key_at(right.key_idx).* =
+                    .some(.cast(right.block.sum_subtree_bytes()));
+            if (ibs.left) |left|
+                ibs.targ.path_entry.?.parent_ib.key_at(left.key_idx).* =
+                    .some(.cast(left.block.sum_subtree_bytes()));
+
+            if (ibs.targ.path_entry) |e| {
+                update_parent_keys(
+                    path.slice()[0..path_cursor.?.to_int()],
+                    .cast(e.parent_ib.sum_subtree_bytes()),
+                );
+            } else {
+                assert(path_cursor == null);
+            }
+            return;
+        }
+
+        // NOTE: Now we know that we need to split target and r/l to create new
+        //       data blocks for alloc_len.
+
+        const IbInfo = BInfo(Ib);
+        // targ is not root at this point
+        assert(path_cursor != null);
+        const targ_binfo: IbInfo = .{
+            .block = ibs.targ.block,
+            .len = ibs.targ.len,
+            .key_idx = .cast(ibs.targ.path_entry.?.key_idx),
+        };
+        const Split = struct { left: IbInfo, right: IbInfo };
+        const split: Split = if (ibs.left) |left|
+            .{
+                .left = left,
+                .right = targ_binfo,
+            }
+        else if (ibs.right) |right|
+            .{
+                .left = targ_binfo,
+                .right = right,
+            }
+        else
+            // an indx block should always have at least one sibling in the
+            // same parent
+            unreachable;
+
+        const split_lens = calc_split_lens(Ib, IbTotalLen, .{
+            .b_len_min = .coerce(@as(comptime_int, bounds.indx_block_keys_min)),
+            .alloc_len = new_ibs.retag(.ib_num, .ib_keys),
+            .ofs_in_targ = ofs_in_targ_ib,
+            .targ = ibs.targ,
+            .left = split.left,
+            .right = split.right,
+        });
+        log.info(@src(), "splitting", .{
+            .split = split,
+            .split_lens = split_lens,
+        });
+
+        assert(split_lens.new_bs.to_int() > 0);
+        // this should already be true of the size of pending_ib and from that
+        // initial list forward, the size should be decreasing.
+        assert(split_lens.new_bs.to_int() <= new_leaf_blocks_max.to_int());
+
+        // see assumptions in doc comment: we have two full blocks worth of
+        // scratch space.
+        {
+            var left_rest = split.left.block.slice(null, split.left.len);
+            var right_rest = split.right.block.slice(null, split.right.len);
+            const prefix = split_lens.prefix.to_int();
+            pending_ib_childs
+                .resize(pending_ib_childs.len + prefix) catch unreachable;
+            pending_ib_keys
+                .resize(pending_ib_keys.len + prefix) catch unreachable;
+            var slice: PendingIbSlice = .{
+                .keys = pending_ib_keys.slice(),
+                .children = pending_ib_childs.slice(),
+            };
+            slice.shr(prefix);
+            var cursor: usize = 0;
+            for ([_]*Ib.Slice{ &left_rest, &right_rest }) |part_rest| {
+                cursor += slice.slice(cursor, prefix).write(part_rest);
+            }
+            assert(cursor == prefix);
+
+            cursor = pending_ib_childs.len;
+            const postfix = split_lens.postfix.to_int();
+            pending_ib_childs
+                .resize(pending_ib_childs.len + postfix) catch unreachable;
+            pending_ib_keys
+                .resize(pending_ib_keys.len + postfix) catch unreachable;
+            slice = .{
+                .keys = pending_ib_keys.slice(),
+                .children = pending_ib_childs.slice(),
+            };
+            for ([_]*Ib.Slice{ &left_rest, &right_rest }) |part_rest| {
+                cursor += slice.slice(cursor, null).write(part_rest);
+            }
+            assert(cursor == pending_ib_childs.len);
+            assert(left_rest.len.eql(.min_val));
+            assert(right_rest.len.eql(.min_val));
+        }
+
+        log.debug(@src(), "pre-bundle pending ibs", .{
+            .pending_ib_childs = pending_ib_childs.slice(),
+            .pending_ib_keys = pending_ib_keys.slice(),
+        });
+
+        var pending_ibs: PendingIbSlice = .{
+            .keys = pending_ib_keys.slice(),
+            .children = pending_ib_childs.slice(),
+        };
+
+        // bundle pending blocks into new parents (back into left/pending/right)
+        split.left.block.* = .empty;
+        assert(Ib.write(
+            split.left.block.slice(null, split_lens.left_new),
+            &pending_ibs,
+        ).eql(split_lens.left_new));
+        const new_left_key = split.left.block.sum_subtree_bytes();
+
+        for (0..split_lens.new_bs.to_int()) |cursor| {
+            const new_child_num: Ib.Num = .cast(r.indx_blocks.len);
+            const new_child: *Ib = try r.indx_blocks.addOne(r.gpa);
+            new_child.* = .empty;
+            assert(Ib.write(
+                new_child.slice(null, .cast(bounds.indx_block_keys_min)),
+                &pending_ibs,
+            ).eql(.cast(bounds.indx_block_keys_min)));
+            const new_child_key = new_child.sum_subtree_bytes();
+
+            // we share the same buffer but always write slower than we
+            // read. So no clobbering.
+            {
+                const write_ptr = &pending_ib_childs.slice()[cursor];
+                const read_ptr = pending_ibs.children.ptr;
+                assert(@intFromPtr(write_ptr) < @intFromPtr(read_ptr));
+            }
+
+            log.debug(@src(), "new_child", .{ .new_child = new_child });
+
+            pending_ib_keys.slice()[cursor] = .some(.cast(new_child_key));
+            pending_ib_childs.slice()[cursor] = .wrap_ib_num(new_child_num);
+        }
+        assert(pending_ibs.rest_len() == split_lens.right_new.to_int());
+
+        split.right.block.* = .empty;
+        assert(Ib.write(
+            split.right.block.slice(null, split_lens.right_new),
+            &pending_ibs,
+        ).eql(split_lens.right_new));
+        assert(pending_ibs.rest_len() == 0);
+        const new_right_key = split.right.block.sum_subtree_bytes();
+
+        pending_ib_childs.resize(split_lens.new_bs.to_int()) catch unreachable;
+        pending_ib_keys.resize(split_lens.new_bs.to_int()) catch unreachable;
+        log.debug(@src(), "post-bundle pending ibs", .{
+            .pending_ib_childs = pending_ib_childs.slice(),
+            .pending_ib_keys = pending_ib_keys.slice(),
+        });
+
+        // the split will call update_parent_keys so we set up the new right/left
+        // ib keys now and piggyback on the update_parent_keys
+        ibs.targ.path_entry.?.parent_ib
+            .key_at(split.left.key_idx).* = .some(.cast(new_left_key));
+        ibs.targ.path_entry.?.parent_ib
+            .key_at(split.right.key_idx).* = .some(.cast(new_right_key));
+
+        // set next insert target
+        if (split.left.block == ibs.targ.block) {
+            const path_entry = &path.slice()[path_cursor.?.to_int()];
+            assert(r.ib_at(
+                path_entry.parent_ib
+                    .child_at(.cast(path_entry.key_idx))
+                    .as(Ib.Num),
+            ) == split.left.block);
+            path_entry.key_idx = path_entry.key_idx.add(.coerce(1));
+        } else {
+            assert(split.right.block == ibs.targ.block);
+            const path_entry = &path.slice()[path_cursor.?.to_int()];
+            assert(std.meta.eql(path_entry.*, ibs.targ.path_entry.?));
+            assert(r.ib_at(
+                path_entry.parent_ib
+                    .child_at(.cast(path_entry.key_idx))
+                    .as(Ib.Num),
+            ) == split.right.block);
+        }
+        path_cursor = path_cursor.?.try_sub(.coerce(1)) catch null;
     }
+    @panic("reached max iterations! probably a bug.");
 }
 
+/// NOTE: reroot creates a new sibling block but leaves it empty.
+///       this temporarily violates the min of 2 children rule, but
+///       this should be resolved either by insert_in_blocks or by the
+///       split.
 fn reroot(
     r: *Rope,
     path: *BlockPath,
@@ -1351,12 +1674,15 @@ fn insert_with_siblings(
 
         const new_space: B.Len =
             if (binfo) |bi| B.Len.max_val.sub(bi.len) else .coerce(0);
-        log.debug("{any} has space = {d}", .{ side, new_space.to_int() });
+        log.debug(@src(), "side has space", .{
+            .side = side,
+            .space = new_space.to_int(),
+        });
         direct_space = direct_space.add(.coerce(new_space.to_int()));
 
         if (direct_space.to_int() >= alloc_len.to_int()) {
-            log.debug("=== fits in direct_space = {d}", .{
-                direct_space.to_int(),
+            log.info(@src(), "fits in direct_space", .{
+                .direct_space = direct_space,
             });
 
             return insert_in_blocks(B, BTotalLen, items, .{
@@ -1410,7 +1736,7 @@ fn insert_in_blocks(
         ofs: T.Len,
     },
 ) insert_in_blocks_Result(T) {
-    log.debug("insert_in_blocks(items = {any}, args = {any})", .{ items, args });
+    log.debug(@src(), "insert_in_blocks()", .{ .items = items, .args = args });
 
     const orig_alloc_len: TTotalLen = .cast(items.rest_len());
 
@@ -1585,9 +1911,9 @@ test alloc_at {
     }) |e| {
         const len, const char = e;
 
-        log.debug("======== alloc_at len = {d} ========", .{len});
-        log.debug("rope.indx_root = {any}", .{r.indx_root});
-        log.debug("rope.indx_root = {any}", .{r.ib_at(r.indx_root)});
+        tlog.info("======== alloc_at ========", .{ .len = len });
+        tlog.debug(@src(), "rope.indx_root", .{ .indx_root = r.indx_root });
+        tlog.debug(@src(), "rope.indx_root", .{ .indx_root = r.ib_at(r.indx_root) });
         _ = try r.alloc_at(.coerce(0), .cast(len));
         try r.expect_valid();
         var cur = r.abs_cursor_at(.coerce(0));
@@ -1599,7 +1925,7 @@ pub fn insert(r: *Rope, pos: RopeBytes, text: []const u8) !void {
     var rest: RopeBytes = .cast(text.len);
     var i: usize = 0;
     while (rest.to_int() > 0) : (i += 1) {
-        if (i >= 100) @panic("reached max iterations. probably a bug.");
+        if (i >= 1000) @panic("reached max iterations. probably a bug.");
 
         const res = try r.alloc_at(pos, rest);
         rest = rest.sub(res.alloc_len);
@@ -1611,7 +1937,7 @@ pub fn insert(r: *Rope, pos: RopeBytes, text: []const u8) !void {
 test "insert-fuzz" {
     std.testing.log_level = .debug;
     // makes for easier print debugging
-    const gen_ascii = true;
+    const gen_ascii = false;
 
     var rope = Rope.init(std.testing.allocator);
     defer rope.deinit();
@@ -1619,45 +1945,62 @@ test "insert-fuzz" {
     try rope.expect_valid();
 
     var str = std.ArrayList(u8).init(std.testing.allocator);
+    defer str.deinit();
 
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
-    // var prng = std.Random.DefaultPrng.init(0x18a32a03);
+    // var prng = std.Random.DefaultPrng.init(0xd946e30);
     const rand = prng.random();
 
     // not used to generate actual test case but just inserted data.
     var prng2 = std.Random.DefaultPrng.init(std.testing.random_seed);
     const rand2 = prng2.random();
 
-    var buf: [1024 * 1024]u8 = undefined;
+    var buf: [1 << 19]u8 = undefined;
 
-    log.debug(".r.indx_root = {any}", .{rope.indx_root});
-    for (64..buf.len + 1) |max_len| {
-        for (0..100) |_| {
+    var total_rope_ns: u64 = 0;
+    var total_str_ns: u64 = 0;
+
+    for (0..20) |exp| {
+        const max_len = @as(usize, 1) << @as(u5, @intCast(exp));
+
+        for (0..200) |_| {
+            // for (0..20) |_| {
             const pos: RopeBytes =
                 .cast(rand.uintAtMost(usize, rope.get_len().to_int()));
             const text = buf[0..rand.uintLessThan(usize, max_len)];
-            if (gen_ascii) {
+            if (comptime gen_ascii) {
                 // for (text) |*c| c.* = rand2.uintLessThan(u8, 'z' - 'a') + 'a';
                 @memset(text, rand2.uintLessThan(u8, 'z' - 'a') + 'a' - (if (rand2.boolean()) ('a' - 'A') else @as(u8, 0)));
             } else {
                 rand2.bytes(text);
             }
-            std.debug.print("pos: {d}, text: `{s}`\n", .{ pos, text });
+            // tlog.info(@src(), "-- INSERT --", .{ .pos = pos, .text = text });
+            var timer = std.time.Timer.start() catch unreachable;
             try rope.insert(pos, text);
+            total_rope_ns += timer.lap();
             try str.insertSlice(pos.to_int(), text);
-            try rope.expect_valid();
-            // std.debug.print("len: {d}, rope: `{}`\n", .{
-            //     rope.get_len(),
-            //     &rope,
-            // });
-            std.debug.print("len: {d}\n", .{rope.get_len()});
-            try std.testing.expectFmt(str.items, "{}", .{&rope});
+            total_str_ns += timer.lap();
+            // try rope.expect_valid();
+            // try std.testing.expectFmt(str.items, "{s}", .{&rope});
         }
     }
+
+    try rope.expect_valid();
+    try std.testing.expectFmt(str.items, "{s}", .{&rope});
+
+    const total_rope_s = @as(f64, @floatFromInt(total_rope_ns)) /
+        @as(f64, @floatFromInt(std.time.ns_per_s));
+    const total_str_s = @as(f64, @floatFromInt(total_str_ns)) /
+        @as(f64, @floatFromInt(std.time.ns_per_s));
+    tlog.info(@src(), "PASS", .{
+        .len = rope.get_len(),
+        .rope_s = total_rope_s,
+        .str_s = total_str_s,
+    });
 }
 
-pub fn get_len(r: *Rope) RopeBytes {
-    return r.ib_at(r.indx_root).sum_subtree_bytes();
+pub fn get_len(r: *const Rope) RopeBytes {
+    return r.ib_at_const(r.indx_root).sum_subtree_bytes();
 }
 
 pub fn format(
@@ -1666,22 +2009,37 @@ pub fn format(
     options: std.fmt.FormatOptions,
     writer: anytype,
 ) !void {
-    _ = fmt;
     _ = options;
 
-    var s = r.abs_cursor_at(.coerce(0));
-    var i: usize = 0;
-    while (true) : (i += 1) {
-        const buf_len = 100;
-        var buf: [buf_len]u8 = undefined;
+    if (std.mem.eql(u8, fmt, "s")) {
+        var s = r.abs_cursor_at(.coerce(0));
+        var i: usize = 0;
+        while (true) : (i += 1) {
+            const buf_len = 100;
+            var buf: [buf_len]u8 = undefined;
 
-        if (i >= div_ceil(usize, config.rope_bytes_max, buf_len))
-            @panic("reached max iterations. probably a bug.");
+            if (i >= div_ceil(usize, config.rope_bytes_max, buf_len))
+                @panic("reached max iterations. probably a bug.");
 
-        const read_len = try s.reader(r).readAll(&buf);
-        try std.fmt.format(writer, "{s}", .{buf[0..read_len]});
-        if (read_len < buf.len) break;
+            const read_len = try s.reader(r).readAll(&buf);
+            try std.fmt.format(writer, "{s}", .{buf[0..read_len]});
+            if (read_len < buf.len) break;
+        }
+    } else {
+        try std.fmt.format(writer, "Rope{{ ", .{});
+        try std.fmt.format(writer, ".ib_root = {}, ", .{r.indx_root});
+        try std.fmt.format(writer, ".ib_height = {}, ", .{r.indx_height});
+        try std.fmt.format(writer, ".len = {}, ", .{r.get_len()});
+        try std.fmt.format(writer, "}}", .{});
     }
+}
+
+pub fn jsonStringify(r: *const Rope, jw: anytype) !void {
+    try jw.write(.{
+        .ib_root = r.indx_root,
+        .ib_height = r.indx_height,
+        .len = r.get_len(),
+    });
 }
 
 pub fn abs_cursor_at(r: *Rope, pos: RopeBytes) AbsCursor {
@@ -1953,11 +2311,10 @@ fn expect_valid_ib(
         try std.testing.expect(ib.count_keys().to_int() >= 2);
     } else {
         try std.testing.expect(r.ib_at(r.indx_root) != ib);
-        std.debug.print("ib.count_keys() = {}\n", .{ib.count_keys()});
         // rerooting creataes an empty block on the right that should be filled
         // by instert_in_blocks (or split) to have at least 2 children.
         if (ib.count_keys().to_int() < 2) {
-            std.debug.print("ib = {any}\n", .{ib});
+            tlog.err(@src(), "", .{ .ib = ib });
             return error.TestExpectedIBMinTwoChildren;
         }
         // try std.testing.expect(
@@ -1974,9 +2331,14 @@ fn expect_valid_ib(
 
         const res: ValidBlockResult = if (is_leaf) x: {
             if (last_db) |l| if (l.eql(child.as(Db.Num))) {
-                std.debug.print(
-                    "repeated db in traversal: last_db ({any}) == child ({any})\n",
-                    .{ l, child.as(Db.Num) },
+                tlog.err(
+                    @src(),
+                    "repeated db in traversal: last_db == child",
+                    .{
+                        .last_db = l,
+                        .child = child.as(Db.Num),
+                        .ib = ib,
+                    },
                 );
                 return error.TestExpectedNonRepeatingDbNum;
             };
