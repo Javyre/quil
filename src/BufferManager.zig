@@ -1,6 +1,5 @@
 const std = @import("std");
 const uv = @import("uv");
-const Rope = @import("./Rope.zig");
 const Rope2 = @import("./Rope2.zig");
 
 const MultiArrayPool = @import("./multi_array_pool.zig").MultiArrayPool;
@@ -10,9 +9,7 @@ const BufferManager = @This();
 test {
     std.testing.refAllDecls(@This());
     // TODO: figure out why we need this line if the above line already exists
-    // _ = Rope;
     _ = Rope2;
-    // _ = @import("Rope.zig");
 }
 
 alloc: std.mem.Allocator,
