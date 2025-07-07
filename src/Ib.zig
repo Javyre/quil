@@ -3,10 +3,10 @@ const assert = std.debug.assert;
 const RangedInt = @import("./ranged_int.zig").RangedInt;
 
 // NOTE: limit the circular dependency by not importing Rope fully
-const config = @import("./Rope2.zig").config;
-const bounds = @import("./Rope2.zig").bounds;
-const TreeSize = @import("./Rope2.zig").TreeSize;
-const RopeBytes = @import("./Rope2.zig").RopeBytes;
+const config = @import("./Rope.zig").config;
+const bounds = @import("./Rope.zig").bounds;
+const TreeSize = @import("./Rope.zig").TreeSize;
+const RopeBytes = @import("./Rope.zig").RopeBytes;
 
 const Db = @import("./Db.zig");
 const Ib = @This();

@@ -4,9 +4,9 @@ const ranged_int = @import("./ranged_int.zig");
 const RangedInt = ranged_int.RangedInt;
 
 // NOTE: limit the circular dependency by not importing Rope fully
-const config = @import("./Rope2.zig").config;
-const bounds = @import("./Rope2.zig").bounds;
-const RopeBytes = @import("./Rope2.zig").RopeBytes;
+const config = @import("./Rope.zig").config;
+const bounds = @import("./Rope.zig").bounds;
+const RopeBytes = @import("./Rope.zig").RopeBytes;
 
 const Db = @This();
 
