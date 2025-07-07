@@ -716,8 +716,6 @@ fn insert_dbs(
     });
 
     // iter over prefix + new_dbs + postfix dbs
-    // COMBAK: account for right being empty due to rerooting. postfix_tail
-    // should be left.last and we should assert that left.block is targ.block
 
     // split.right might be empty due to a reroot
     const postfix_last: struct {
@@ -1924,14 +1922,15 @@ test alloc_at {
 pub fn insert(r: *Rope, pos: RopeBytes, text: []const u8) !void {
     var rest: RopeBytes = .cast(text.len);
     var i: usize = 0;
+    var pos_cursor: Cursor = undefined;
     while (rest.to_int() > 0) : (i += 1) {
         if (i >= 1000) @panic("reached max iterations. probably a bug.");
 
         const res = try r.alloc_at(pos, rest);
         rest = rest.sub(res.alloc_len);
+        pos_cursor = res.cursor;
     }
-    var s = r.abs_cursor_at(pos);
-    s.writer(r).writeAll(text) catch unreachable;
+    pos_cursor.writer(r).writeAll(text) catch unreachable;
 }
 
 test "insert-fuzz" {
