@@ -168,6 +168,10 @@ pub fn jsonStringify(this: *const Ib, jw: anytype) !void {
     });
 }
 
+/// Slice over a single Index Block
+///
+/// NOTE: fields and some methods are expected to match with `Db.Slice` in many
+///       callsites.
 pub const Slice = struct {
     block: *Ib,
     ofs: Len,
@@ -268,6 +272,8 @@ pub fn write(dst: Slice, iter: anytype) Len {
         @memcpy(actual_dst.keys(), res.keys);
         @memcpy(actual_dst.children(), res.children);
         return .cast(res.keys.len);
+    } else if (hasMethod(@TypeOf(iter), "take_nop")) {
+        return .cast(iter.take_nop(dst.len.to_int()));
     } else {
         var written: Len = .coerce(0);
         for (0..dst.len.to_int()) |i| {
@@ -290,6 +296,8 @@ pub fn write_back(dst: Slice, iter: anytype) Len {
         @memcpy(actual_dst.keys(), res.keys);
         @memcpy(actual_dst.children(), res.children);
         return .cast(res.keys.len);
+    } else if (hasMethod(@TypeOf(iter), "take_nop_back")) {
+        return .cast(iter.take_nop_back(dst.len.to_int()));
     } else {
         var written: Len = .coerce(0);
         for (0..dst.len.to_int()) |i_rev| {

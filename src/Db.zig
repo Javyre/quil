@@ -173,6 +173,10 @@ pub fn format(
     });
 }
 
+/// Slice over a single Data Block
+///
+/// NOTE: fields and some methods are expected to match with `Ib.Slice` in many
+///       callsites.
 pub const Slice = struct {
     block: *Db,
     ofs: Len,

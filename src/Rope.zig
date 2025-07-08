@@ -7,6 +7,8 @@ const assert = std.debug.assert;
 const log = @import("./log.zig").noop;
 const tlog = @import("./log.zig").scoped(.rope_test);
 
+const SegmentedPool = @import("./segmented_pool.zig").SegmentedPool;
+
 const Rope = @This();
 const ranged_int = @import("./ranged_int.zig");
 const RangedInt = ranged_int.RangedInt;
@@ -18,8 +20,8 @@ const IbHeight =
 gpa: std.mem.Allocator,
 indx_root: Ib.Num,
 indx_height: IbHeight,
-indx_blocks: std.SegmentedList(Ib, 16),
-data_blocks: std.SegmentedList(Db, 128),
+indx_blocks: SegmentedPool(Ib, Ib.Num, .coerce(16)),
+data_blocks: SegmentedPool(Db, Db.Num, .coerce(128)),
 
 const Config = struct {
     dcache_line_bytes: u8,
@@ -161,15 +163,14 @@ pub fn init(gpa: std.mem.Allocator) Rope {
 
     // These addOne calls dont allocate as we have a stack allocated portion
     // that is large enough for init.
-    r.indx_root = .cast(r.indx_blocks.len);
-    const root_ib = r.indx_blocks.addOne(r.gpa) catch unreachable;
-    root_ib.* = .empty;
+    const root_ib = r.indx_blocks.create(r.gpa) catch unreachable;
+    root_ib.ptr.* = .empty;
+    r.indx_root = root_ib.num;
 
     var dbs: [2]struct { ptr: *Db, num: Db.Num } = undefined;
     for (0..2) |i| {
-        const num: Db.Num = .cast(r.data_blocks.len);
-        const ptr = r.data_blocks.addOne(r.gpa) catch unreachable;
-        ptr.* = .{
+        const db = r.data_blocks.create(r.gpa) catch unreachable;
+        db.ptr.* = .{
             .meta = .{
                 .bytes = .coerce(0),
                 .newlines = undefined,
@@ -178,9 +179,9 @@ pub fn init(gpa: std.mem.Allocator) Rope {
             },
             .bytes = undefined,
         };
-        dbs[i] = .{ .ptr = ptr, .num = num };
-        root_ib.keys[i] = .some(.coerce(0));
-        root_ib.children[i] = .wrap_db_num(num);
+        dbs[i] = .{ .ptr = db.ptr, .num = db.num };
+        root_ib.ptr.keys[i] = .some(.coerce(0));
+        root_ib.ptr.children[i] = .wrap_db_num(db.num);
     }
     dbs[0].ptr.meta.next = .some(dbs[1].num);
     dbs[1].ptr.meta.prev = .some(dbs[0].num);
@@ -199,19 +200,19 @@ test init {
 }
 
 fn db_at(r: *Rope, num: Db.Num) *Db {
-    return r.data_blocks.at(num.to_int());
+    return r.data_blocks.at(num);
 }
 
 fn db_at_const(r: *const Rope, num: Db.Num) *const Db {
-    return r.data_blocks.at(num.to_int());
+    return r.data_blocks.at(num);
 }
 
 fn ib_at(r: *Rope, num: Ib.Num) *Ib {
-    return r.indx_blocks.at(num.to_int());
+    return r.indx_blocks.at(num);
 }
 
 fn ib_at_const(r: *const Rope, num: Ib.Num) *const Ib {
-    return r.indx_blocks.at(num.to_int());
+    return r.indx_blocks.at(num);
 }
 
 const BlockPath =
@@ -769,15 +770,14 @@ fn insert_dbs(
     const new_left_key = split.left.block.sum_subtree_bytes();
 
     for (0..actual_new_ibs.to_int()) |_| {
-        const new_leaf_num: Ib.Num = .cast(r.indx_blocks.len);
-        const new_leaf = try r.indx_blocks.addOne(r.gpa);
-        new_leaf.* = .empty;
-        const s = new_leaf.slice(null, .cast(bounds.indx_block_keys_min));
+        const new_leaf = try r.indx_blocks.create(r.gpa);
+        new_leaf.ptr.* = .empty;
+        const s = new_leaf.ptr.slice(null, .cast(bounds.indx_block_keys_min));
         assert(Ib.write(s, &all_dbs_iter_kv).eql(s.len));
         pending_ib_keys.appendAssumeCapacity(.some(.cast(
-            new_leaf.sum_subtree_bytes(),
+            new_leaf.ptr.sum_subtree_bytes(),
         )));
-        pending_ib_childs.appendAssumeCapacity(.wrap_ib_num(new_leaf_num));
+        pending_ib_childs.appendAssumeCapacity(.wrap_ib_num(new_leaf.num));
     }
     assert(pending_ib_keys.len == actual_new_ibs.to_int());
     assert(pending_ib_childs.len == actual_new_ibs.to_int());
@@ -1145,14 +1145,13 @@ fn insert_ibs(
         const new_left_key = split.left.block.sum_subtree_bytes();
 
         for (0..split_lens.new_bs.to_int()) |cursor| {
-            const new_child_num: Ib.Num = .cast(r.indx_blocks.len);
-            const new_child: *Ib = try r.indx_blocks.addOne(r.gpa);
-            new_child.* = .empty;
+            const new_child = try r.indx_blocks.create(r.gpa);
+            new_child.ptr.* = .empty;
             assert(Ib.write(
-                new_child.slice(null, .cast(bounds.indx_block_keys_min)),
+                new_child.ptr.slice(null, .cast(bounds.indx_block_keys_min)),
                 &pending_ibs,
             ).eql(.cast(bounds.indx_block_keys_min)));
-            const new_child_key = new_child.sum_subtree_bytes();
+            const new_child_key = new_child.ptr.sum_subtree_bytes();
 
             // we share the same buffer but always write slower than we
             // read. So no clobbering.
@@ -1165,7 +1164,7 @@ fn insert_ibs(
             log.debug(@src(), "new_child", .{ .new_child = new_child });
 
             pending_ib_keys.slice()[cursor] = .some(.cast(new_child_key));
-            pending_ib_childs.slice()[cursor] = .wrap_ib_num(new_child_num);
+            pending_ib_childs.slice()[cursor] = .wrap_ib_num(new_child.num);
         }
         assert(pending_ibs.rest_len() == split_lens.right_new.to_int());
 
@@ -1234,28 +1233,26 @@ fn reroot(
     // assert(targ.len.to_int() > ofs_in_targ.to_int());
     const targ_num: Ib.Num = r.indx_root;
 
-    const new_root_num: Ib.Num = .cast(r.indx_blocks.len);
-    const new_root: *Ib = try r.indx_blocks.addOne(r.gpa);
-    new_root.* = .empty;
+    const new_root = try r.indx_blocks.create(r.gpa);
+    new_root.ptr.* = .empty;
 
     // new root needs at least 2 children
-    const new_sibling_num: Ib.Num = .cast(r.indx_blocks.len);
-    const new_sibling: *Ib = try r.indx_blocks.addOne(r.gpa);
-    new_sibling.* = .empty;
+    const new_sibling = try r.indx_blocks.create(r.gpa);
+    new_sibling.ptr.* = .empty;
 
-    r.indx_root = new_root_num;
+    r.indx_root = new_root.num;
 
-    new_root.key_at(.coerce(0)).* =
+    new_root.ptr.key_at(.coerce(0)).* =
         .some(.cast(targ.block.sum_subtree_bytes()));
-    new_root.child_at(.coerce(0)).* = .wrap_ib_num(targ_num);
+    new_root.ptr.child_at(.coerce(0)).* = .wrap_ib_num(targ_num);
 
-    assert(new_sibling.sum_subtree_bytes().eql(.coerce(0)));
-    new_root.key_at(.coerce(1)).* = .some(.coerce(0));
-    new_root.child_at(.coerce(1)).* = .wrap_ib_num(new_sibling_num);
+    assert(new_sibling.ptr.sum_subtree_bytes().eql(.coerce(0)));
+    new_root.ptr.key_at(.coerce(1)).* = .some(.coerce(0));
+    new_root.ptr.child_at(.coerce(1)).* = .wrap_ib_num(new_sibling.num);
 
     const path_entry: BlockPathEntry = .{
         .key_idx = .coerce(0),
-        .parent_ib = new_root,
+        .parent_ib = new_root.ptr,
     };
     path.insert(0, path_entry) catch unreachable;
     r.indx_height = r.indx_height.add(.coerce(1));
@@ -1338,9 +1335,8 @@ const InsertDbIter = struct {
         defer this.len = this.len.sub(.coerce(1));
 
         const len: Db.Len = .cast(bounds.data_block_bytes_min);
-        const num: Db.Num = .cast(this.r.data_blocks.len);
-        const db: *Db = this.r.data_blocks.addOne(this.r.gpa) catch unreachable;
-        db.* = .{
+        const db = this.r.data_blocks.create(this.r.gpa) catch unreachable;
+        db.ptr.* = .{
             .meta = .{
                 .bytes = len,
                 .newlines = undefined,
@@ -1354,16 +1350,16 @@ const InsertDbIter = struct {
         };
 
         if (this.prev_.unwrap()) |p|
-            this.r.db_at(p).meta.next = .some(num);
+            this.r.db_at(p).meta.next = .some(db.num);
         if (this.len.eql(.coerce(1))) {
             if (this.next_.unwrap()) |n|
-                this.r.db_at(n).meta.prev = .some(num);
+                this.r.db_at(n).meta.prev = .some(db.num);
         }
-        this.prev_ = .some(num);
+        this.prev_ = .some(db.num);
 
         return .{
-            .db = db,
-            .num = num,
+            .db = db.ptr,
+            .num = db.num,
         };
     }
 
@@ -1372,9 +1368,8 @@ const InsertDbIter = struct {
         defer this.len = this.len.sub(.coerce(1));
 
         const len: Db.Len = .cast(bounds.data_block_bytes_min);
-        const num: Db.Num = .cast(this.r.data_blocks.len);
-        const db: *Db = this.r.data_blocks.addOne(this.r.gpa) catch unreachable;
-        db.* = .{
+        const db = this.r.data_blocks.create(this.r.gpa) catch unreachable;
+        db.ptr.* = .{
             .meta = .{
                 .bytes = len,
                 .newlines = undefined,
@@ -1388,16 +1383,16 @@ const InsertDbIter = struct {
         };
 
         if (this.next_.unwrap()) |n|
-            this.r.db_at(n).meta.prev = .some(num);
+            this.r.db_at(n).meta.prev = .some(db.num);
         if (this.len.eql(.coerce(1))) {
             if (this.prev_.unwrap()) |p|
-                this.r.db_at(p).meta.next = .some(num);
+                this.r.db_at(p).meta.next = .some(db.num);
         }
-        this.next_ = .some(num);
+        this.next_ = .some(db.num);
 
         return .{
-            .db = db,
-            .num = num,
+            .db = db.ptr,
+            .num = db.num,
         };
     }
 };
@@ -1889,6 +1884,69 @@ fn insert_in_blocks(
     };
 }
 
+fn join_blocks(
+    comptime T: type,
+    args: struct {
+        left: T.Slice,
+        right: T.Slice,
+    },
+) struct {
+    left_len_new: T.Len,
+    right_len_new: T.Len,
+} {
+    const TTotalLen = RangedInt(
+        T.Len.tag,
+        T.Len.min_val.to_int(),
+        T.Len.max_val.to_int() * 2,
+    );
+
+    assert(args.left.ofs.eql(.coerce(0)));
+    assert(args.left.block != args.right.block);
+
+    const len_total =
+        TTotalLen.coerce(args.left.len).add(.coerce(args.right.len));
+    const len_l_new, //
+    const len_r_new = x: {
+        var len_l_new: T.Len = .trunc(len_total);
+        var len_r_new: T.Len = .cast(len_total.sub(len_l_new));
+        if (T == Ib) {
+            // We need a min of 2 blocks in Ibs for eventual splitting
+            if (0 < len_r_new.to_int() and len_r_new.to_int() < 2) {
+                const diff: T.Len = .cast(2).sub(len_r_new);
+                len_l_new = len_l_new.sub(diff);
+                len_r_new = len_r_new.add(diff);
+                assert(len_l_new.to_int() >= 2);
+                assert(len_r_new.to_int() >= 2);
+            }
+        }
+        break :x .{ len_l_new, len_r_new };
+    };
+
+    var wslice = args.right;
+    assert(args.left.ofs.eql(.coerce(0)));
+    const dst_l = args.left.block.slice(args.left.len, len_l_new);
+    T.write(dst_l, &wslice);
+    assert(wslice.len.eql(len_r_new));
+    const dst_r = args.right.block.slice(null, len_r_new);
+    // NOTE: we are relying on T.copy detecting the overlapping write and using
+    //       `std.mem.copyForwards`
+    T.copy(dst_r, wslice);
+
+    return .{
+        .left_len_new = len_l_new,
+        .right_len_new = len_r_new,
+    };
+}
+
+/// Find the nearest neighbour of the parent_ib at the tip of the left path.
+fn delete__find_nearest_neighbour(
+    r: *Rope,
+    left: []const BlockPathEntry,
+    right: []const BlockPathEntry,
+) BlockPath {
+    // search both left and right sides concurrently so we can find the nearest
+}
+
 test alloc_at {
     std.testing.log_level = .debug;
 
@@ -1912,14 +1970,30 @@ test alloc_at {
         tlog.info("======== alloc_at ========", .{ .len = len });
         tlog.debug(@src(), "rope.indx_root", .{ .indx_root = r.indx_root });
         tlog.debug(@src(), "rope.indx_root", .{ .indx_root = r.ib_at(r.indx_root) });
-        _ = try r.alloc_at(.coerce(0), .cast(len));
-        try r.expect_valid();
-        var cur = r.abs_cursor_at(.coerce(0));
+        var rest = len;
+        var cur: Cursor = undefined;
+        while (rest.to_int() > 0) {
+            const res = try r.alloc_at(.coerce(0), .cast(len));
+            try r.expect_valid();
+            rest = rest.sub(res.alloc_len);
+            cur = res.cursor;
+        }
         try cur.writer(&r).writeByteNTimes(char, len);
     }
 }
 
 pub fn insert(r: *Rope, pos: RopeBytes, text: []const u8) !void {
+    // TODO: idea for better cache locality:
+    // - First write all text to dbs
+    // - Then iteratively insert dbs into tree
+    // - Bonus: store dbs in a SoA such that the bytes end up all in one single
+    //   big array. Then unfragmented reads are physically identical to normal
+    //   string reads and cache prediction basically is 100% correct.
+    // - Bonus^2: If we do all the above, we can defragment a rope by just
+    //   inserting it's content to a new rope. (insert can take an iterator of
+    //   bytes that can delete text chunks from the old rope as we read them. A
+    //   sort of "sink" or "drain" iterator.)
+
     var rest: RopeBytes = .cast(text.len);
     var i: usize = 0;
     var pos_cursor: Cursor = undefined;
@@ -1987,15 +2061,289 @@ test "insert-fuzz" {
     try rope.expect_valid();
     try std.testing.expectFmt(str.items, "{s}", .{&rope});
 
+    const block_counts = rope.count_blocks();
+
     const total_rope_s = @as(f64, @floatFromInt(total_rope_ns)) /
         @as(f64, @floatFromInt(std.time.ns_per_s));
     const total_str_s = @as(f64, @floatFromInt(total_str_ns)) /
         @as(f64, @floatFromInt(std.time.ns_per_s));
+
     tlog.info(@src(), "PASS", .{
         .len = rope.get_len(),
         .rope_s = total_rope_s,
         .str_s = total_str_s,
+        .ib_count = rope.indx_blocks.segm_list.len,
+        .db_count = rope.data_blocks.segm_list.len,
+        .block_counts = block_counts.slice(),
     });
+}
+
+pub fn delete(r: *Rope, start: RopeBytes, end: RopeBytes) void {
+    assert(start.to_int() <= end.to_int());
+    if (start.eql(end)) return;
+
+    // The left and right paths are like beams cutting through the tree, and
+    // together they form the CONE OF DESTRUCTION.
+    const dbq_l = r.find_data_block(start);
+    const dbq_r = r.find_data_block(end);
+    assert(dbq_l.path.len == dbq_r.path.len);
+    assert(dbq_l.path.len == r.indx_height.to_int());
+    assert(r.indx_height.to_int() > 0);
+
+    // TODO: handle here the bytes layer in the same way as the below db and ib
+    // layers
+    {
+        const i = dbq_l.path.len - 1;
+        const entry_l: BlockPathEntry = dbq_l.path.slice()[i];
+        const entry_r: BlockPathEntry = dbq_r.path.slice()[i];
+
+        // Special Case: delete slice within same parent
+        if (std.meta.eql(entry_l, entry_r)) {
+            // Most interactive deletions are local to a single data block.
+            @branchHint(.likely);
+
+            // The delete operation is within a single data block.
+            _ = Db.Len.try_cast(end.sub(start)) catch unreachable;
+
+            const db = r.db_at(entry_l.parent_ib
+                .child_at(.cast(entry_l.key_idx)).as(Db.Num));
+            // copy to avoid aliasing in the below write
+            const db_copy = db.*;
+
+            // TODO: write Db.shl and use it here
+            const slice_to = db.slice(.cast(start), db.meta.bytes);
+            var slice_from = db_copy.slice(.cast(end), db.meta.bytes);
+            Db.write(slice_to, &slice_from);
+            assert(slice_from.len.eql(.coerce(0)));
+
+            db.meta.bytes = db.meta.bytes.sub(.cast(end.sub(start)));
+
+            update_parent_keys(dbq_l.path.slice(), .coerce(db.meta.bytes));
+        } else {
+            const db_l_num = entry_l.parent_ib
+                .child_at(.cast(entry_l.key_idx)).as(Db.Num);
+            const db_r_num = entry_r.parent_ib
+                .child_at(.cast(entry_r.key_idx)).as(Db.Num);
+            const db_l = r.db_at(db_l_num);
+            const db_r = r.db_at(db_r_num);
+
+            const res = r.join_blocks(Db, .{
+                .left = entry_l.parent_ib.slice(null, dbq_l.ofs_in_db),
+                .right = entry_r.parent_ib
+                    .slice(dbq_r.ofs_in_db, db_r.meta.bytes),
+            });
+
+            db_l.meta.bytes = res.right_len_new;
+            db_r.meta.bytes = res.left_len_new;
+
+            // Skip over deleted data block range in linked list
+            //
+            // (the data blocks themselves will be deleted as part of cone of
+            // destruction subtree deletion below without needing to worry
+            // anymore about the linked list fixup)
+            //
+            db_l.meta.next = db_r_num;
+            db_r.meta.prev = db_l_num;
+
+            update_parent_keys(dbq_l.path.slice(), .coerce(db_l.meta.bytes));
+            update_parent_keys(dbq_r.path.slice(), .coerce(db_r.meta.bytes));
+        }
+    }
+
+    // delete all full blocks within the CONE OF DESTRUCTION.
+    for (0..dbq_l.path.len) |i_rev| {
+        const i = dbq_l.path.len - i_rev - 1;
+        if (i_rev == 0) assert(i == dbq_l.path.len - 1);
+        if (i == 0) assert(i_rev == dbq_l.path.len - 1);
+
+        const entry_l: BlockPathEntry = dbq_l.path.slice()[i];
+        const entry_r: BlockPathEntry = dbq_r.path.slice()[i];
+
+        if (std.meta.eql(entry_l, entry_r)) {
+            break;
+        }
+
+        const key_l = entry_l.parent_ib.key_at(entry_l.key_idx).unwrap().?;
+        const key_r = entry_r.parent_ib.key_at(entry_r.key_idx).unwrap().?;
+
+        // include 0-len start/end blocks in rm range
+        // these ends are 0 if the cone-of-destr. perfectly lines up with
+        // the edge of the ib subtree and so the lower-layer deletion makes
+        // the parent end up empty.
+        const rm_l_start = if (key_l.eql(.coerce(0)))
+            entry_l.key_idx
+        else
+            entry_l.key_idx.add(.coerce(1));
+        const rm_r_end = if (key_r.eql(.coerce(0)))
+            entry_r.key_idx.add(.coerce(1))
+        else
+            entry_r.key_idx;
+        assert(rm_l_start.to_int() <= rm_r_end.to_int());
+
+        // Special Case: delete slice within same parent
+        if (entry_l.parent_ib == entry_r.parent_ib) {
+            // Less likely as most of the time we are on a layer that isn't the
+            // root of the cone of destruction.
+            @branchHint(.unlikely);
+
+            {
+                const rm = entry_l.parent_ib.slice(rm_l_start, rm_r_end);
+                if (i_rev == 0) {
+                    for (rm.children()) |c|
+                        r.data_blocks.destroy(c.as(Db.Num));
+                } else {
+                    for (rm.children()) |c|
+                        r.delete__destroy_subtree(c.as(Ib.Num));
+                }
+            }
+
+            // Shift the right content to be adjacent to the left
+            const len_old = entry_l.parent_ib.count_keys();
+            const len_new = len_old.sub(rm_r_end.sub(rm_l_start));
+
+            var slice_from = entry_l.parent_ib.slice(rm_r_end, len_old);
+            const slice_to = entry_l.parent_ib.slice(rm_l_start, len_old);
+            Ib.write(slice_to, &slice_from);
+            assert(slice_from.len.eql(.coerce(0)));
+
+            if (!len_new.eql(Ib.Len.max_val))
+                entry_l.parent_ib.key_at(.cast(len_new)).* = .null;
+            assert(entry_l.parent_ib.count_keys().eql(len_new));
+
+            update_parent_keys(
+                dbq_l.path.slice()[0..i],
+                .cast(entry_l.parent_ib.sum_subtree_bytes()),
+            );
+        } else {
+            const len_l_old = entry_l.parent_ib.count_keys();
+            const len_r_old = entry_r.parent_ib.count_keys();
+            const rm_ls = entry_l.parent_ib.slice(rm_l_start, len_l_old);
+            const rm_rs = entry_r.parent_ib.slice(null, rm_r_end);
+
+            if (i_rev == 0) {
+                for (rm_ls.children()) |rm_l|
+                    r.data_blocks.destroy(rm_l.as(Db.Num));
+                for (rm_rs.children()) |rm_r|
+                    r.data_blocks.destroy(rm_r.as(Db.Num));
+            } else {
+                for (rm_ls.children()) |rm_l|
+                    r.delete__destroy_subtree(rm_l.as(Ib.Num));
+                for (rm_rs.children()) |rm_r|
+                    r.delete__destroy_subtree(rm_r.as(Ib.Num));
+            }
+
+            // Now join this layer's left and right and update the immediate
+            // parents
+
+            const res = r.join_blocks(Ib, .{
+                .left = entry_l.parent_ib.slice(null, rm_l_start),
+                .right = entry_r.parent_ib.slice(rm_r_end, len_r_old),
+            });
+
+            if (!res.left_len_new.eql(.max_value))
+                entry_l.parent_ib.key_at(.cast(res.left_len_new)).* = .null;
+
+            if (!res.right_len_new.eql(.max_value))
+                entry_r.parent_ib.key_at(.cast(res.right_len_new)).* = .null;
+
+            assert(res.right_len_new.eql(.coerce(0)) or
+                res.right_len_new.to_int() >= 2);
+
+            if (res.left_len_new.eql(.coerce(1))) {
+                assert(res.right_len_new.eql(.coerce(0)));
+
+                // Either fit this into a neighbour block or take one away from
+                // a neighbour block.
+                //
+                // neighbour candidates:
+                // 1. just left of entry_l.parent_ib
+                // 2. just right of entry_r.parent_ib
+                //    this works because if left_len_new == 1 then right_len_new
+                //    must be 0.
+                // 3. NO NEIGHBOURS, this means we need to reroot
+
+                // const left_neighbour =
+                //
+                // need the path of the neighbour block so we can update the
+                // parent keys
+            }
+
+            update_parent_keys(
+                dbq_l.path.slice()[0..i],
+                .cast(entry_l.parent_ib.sum_subtree_bytes()),
+            );
+            update_parent_keys(
+                dbq_r.path.slice()[0..i],
+                .cast(entry_r.parent_ib.sum_subtree_bytes()),
+            );
+        }
+    }
+
+    // Reroot top layers if they are not necessary
+    // TODO
+    // for (0..dbq_l.path
+
+    // 78
+    // 25 26 27
+    // 7 7 7 4  7 8 7 4  8 8 3 8
+    // 2221 2122 2122  22  2221 2222 2122 22  2222 ...
+    //
+    // [78]
+    // [25 26] 27
+    // 7 7 7 [4  7 8] 7 4  8 8 3 8
+    // 2221 2122 2122  2[2  2221 22]22 2122 22  2222 ...
+    //
+    // [78]
+    // [25 26] 27
+    // 7 7 7 [4  _ 8] 7 4  8 8 3 8
+    // 2221 2122 2122  2[2  ____ _2]22 2122 22  2222 ...
+
+}
+
+pub fn delete__destroy_subtree(r: *Rope, num: Ib.Num) void {
+    var stack: std.BoundedArray(struct {
+        ib: *Ib,
+        num: Ib.Num,
+        len: Ib.Len,
+        key_idx: Ib.Len = .coerce(0),
+    }, bounds.indx_blocks_height_max) = .{};
+
+    const ib = r.ib_at(num);
+    stack.appendAssumeCapacity(.{
+        .ib = ib,
+        .num = num,
+        .len = ib.count_keys(),
+    });
+
+    var i: usize = 0;
+    while (stack.len > 0) {
+        if (i >= bounds.indx_blocks_max)
+            @panic("reached max iterations. probably a bug.");
+        i += 1;
+
+        const frame = &stack.slice()[stack.len - 1];
+        assert(frame.key_idx.to_int() <= frame.len.to_int());
+
+        if (frame.key_idx.to_int() < frame.len.to_int()) {
+            const child_num = frame.ib.child_at(frame.key_idx);
+            if (stack.len < r.indx_height.to_int()) {
+                const child_ib = r.ib_at(child_num.as(Ib.Num));
+                stack.appendAssumeCapacity(.{
+                    .ib = child_ib,
+                    .num = child_num.as(Ib.Num),
+                    .len = child_ib.count_keys(),
+                });
+            } else {
+                assert(stack.len == r.indx_height.to_int());
+                r.data_blocks.destroy(child_num.as(Db.Num));
+            }
+            frame.key_idx = frame.key_idx.add(.coerce(1));
+        } else {
+            assert(frame.key_idx.eql(frame.len));
+            r.indx_blocks.destroy(frame.num);
+            stack.pop() orelse unreachable;
+        }
+    }
 }
 
 pub fn get_len(r: *const Rope) RopeBytes {
@@ -2388,3 +2736,44 @@ fn expect_valid_db(
     );
     return db.meta.bytes;
 }
+
+const count_blocks = struct {
+    const Counts = std.BoundedArray(u32, bounds.indx_blocks_height_max);
+    fn count_blocks(r: *Rope) Counts {
+        var counts: Counts = .{
+            .buffer = @splat(0),
+            .len = r.indx_height.to_int(),
+        };
+
+        // root ib should give min height of 1
+        assert(r.indx_height.to_int() > 0);
+        visit_ib(
+            r,
+            r.ib_at(r.indx_root),
+            r.indx_height.sub(.coerce(1)),
+            &counts,
+        );
+
+        return counts;
+    }
+
+    fn visit_ib(r: *Rope, ib: *Ib, height: IbHeight, counts: *Counts) void {
+        counts.slice()[height.add(.coerce(1)).to_int()] += 1;
+
+        for (ib.keys, ib.children) |keyp, child| {
+            const key: TreeSize = keyp.unwrap() orelse break;
+            _ = key;
+
+            if (height.eql(.min_val)) {
+                counts.slice()[0] += 1;
+            } else {
+                visit_ib(
+                    r,
+                    r.ib_at(child.as(Ib.Num)),
+                    height.sub(.coerce(1)),
+                    counts,
+                );
+            }
+        }
+    }
+}.count_blocks;

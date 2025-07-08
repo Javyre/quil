@@ -73,6 +73,28 @@ pub fn RangedInt(
             };
         }
 
+        pub inline fn trunc(val: anytype) @This() {
+            const val_ = if (comptime is_ranged_int(@TypeOf(val)))
+                if (@This().tag == @TypeOf(val).tag)
+                    val.to_int()
+                else
+                    @compileError("can't cast " ++
+                        @tagName(@TypeOf(val).tag) ++
+                        " to incompatible tag " ++
+                        @tagName(@This().tag))
+            else switch (@typeInfo(@TypeOf(val))) {
+                .int => val,
+                .comptime_int => val,
+                else => @compileError("not a range-compatible type: " ++
+                    @typeName(@TypeOf(val))),
+            };
+
+            return @enumFromInt(@max(
+                @This().min_val.to_int(),
+                @min(val_, @This().max_val.to_int()),
+            ));
+        }
+
         pub inline fn is_coercible(val: anytype) bool {
             const this_meta: RangeMeta = comptime .{
                 .min_val = @This().min_val.to_int(),
@@ -150,6 +172,9 @@ pub fn RangedInt(
             return @This().try_cast(res);
         }
         pub fn sub_saturating(this: @This(), other: @This()) @This() {
+            // WARN: NOT TESTED OR THOUGHT OF YET FOR SIGNED INTS
+            // we probably need some more comptime cases for signed ints...
+
             if (comptime @This().min_val.to_int() == 0) {
                 return .cast(this.to_int() -| other.to_int());
             }
