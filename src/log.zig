@@ -40,7 +40,7 @@ fn log(
         },
     );
     inline for (comptime std.meta.fieldNames(@TypeOf(fields))) |field| {
-        std.debug.print(" {[dim]s}{[field]s}={[reset]s}{[val]}", .{
+        std.debug.print(" {[dim]s}{[field]s}={[reset]s}{[val]f}", .{
             .field = field,
             .val = std.json.fmt(@field(fields, field), .{}),
             .dim = DIM,

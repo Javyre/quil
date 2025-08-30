@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const StringIndexContext = struct {
-    bytes: *const std.ArrayListUnmanaged(u8),
+    bytes: *const std.ArrayList(u8),
 
     pub fn eql(_: @This(), a: Idx, b: Idx) bool {
         return a == b;
@@ -13,7 +13,7 @@ const StringIndexContext = struct {
 };
 
 const StringIndexAdapter = struct {
-    bytes: *const std.ArrayListUnmanaged(u8),
+    bytes: *const std.ArrayList(u8),
 
     pub fn eql(ctx: @This(), a: []const u8, b: Idx) bool {
         return std.mem.eql(u8, a, std.mem.sliceTo(ctx.bytes.items[b..], 0));
@@ -31,7 +31,7 @@ map: std.HashMapUnmanaged(
     StringIndexContext,
     std.hash_map.default_max_load_percentage,
 ),
-bytes: std.ArrayListUnmanaged(u8),
+bytes: std.ArrayList(u8),
 
 pub const Idx = u16;
 const EgcPool = @This();

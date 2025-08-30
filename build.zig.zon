@@ -1,7 +1,7 @@
 .{
     .name = .quil,
     .version = "0.0.0",
-    .minimum_zig_version = "0.14.0",
+    .minimum_zig_version = "0.15.1",
     .fingerprint = 0x50c64fc366bade3e,
 
     .paths = .{
@@ -11,13 +11,13 @@
     },
 
     .dependencies = .{
-        .zig_libuv = .{
-            .url = "https://github.com/Javyre/zig-libuv/archive/64d783f4b5c6cf507a7693f93e7d5b6a12f4be49.tar.gz",
-            .hash = "12204af572513b1a3d3838064108617e3631fef95234eadeebba2b56eb5215c9764a",
+        .uucode = .{
+            .url = "git+https://github.com/jacobsandlund/uucode.git#5fde3a6ebf317137068f77a1bd9f7cbd038c2728",
+            .hash = "uucode-0.0.0-ZZjBPt_FPwBRIaIl9_Fe4qy5i2QzTd-L0UouJITObNJs",
         },
-        .zg = .{
-            .url = "https://codeberg.org/dude_the_builder/zg/archive/7ddce488e074c3f052949ba513a340446cea86e9.tar.gz",
-            .hash = "12205e2e7108385a1ec280b6365166e902a690d6a0e8fcc015fdea62d63cf79be8ec",
+        .zig_libuv = .{
+            .url = "git+https://github.com/Javyre/zig-libuv.git#34c992d9e22d7062ed77d02b4d8328f93aa9fe0d",
+            .hash = "zig_libuv-0.0.0-yr__lg04FABpwRhLXByuD2UiUjQ1dxUAobu85zrv-p-w",
         },
     },
 }

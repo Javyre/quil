@@ -1,7 +1,7 @@
 const std = @import("std");
-const uv = @import("uv");
 
-const uv_utils = @import("./uv_utils.zig");
+const uv = @import("./uv.zig");
+const c = uv.c;
 const MultiArrayPool = @import("./multi_array_pool.zig").MultiArrayPool;
 const Render = @import("./Render.zig");
 const WindowManager = @import("./WindowManager.zig");
@@ -15,8 +15,8 @@ test {
     std.testing.refAllDecls(@This());
 }
 
-const upgrade_baton = uv_utils.upgrade_baton;
-const downgrade_baton = uv_utils.downgrade_baton;
+const upgrade_baton = uv.upgrade_baton;
+const downgrade_baton = uv.downgrade_baton;
 
 const Error = if (std.meta.fieldIndex(@import("root"), "QuilError")) |_|
     @import("root").QuilError
@@ -33,7 +33,7 @@ const Commands = MultiArrayPool(Command);
 
 pub const Quil = struct {
     alloc: std.mem.Allocator,
-    loop: uv.Loop,
+    loop: *c.uv_loop_t,
     cmds: Commands = .empty,
     render: Render,
     win_manager: WindowManager,
@@ -41,7 +41,8 @@ pub const Quil = struct {
     is_alive: bool = false,
 
     pub fn init(q: *Quil, alloc: std.mem.Allocator) !void {
-        const loop = try uv.Loop.init(alloc);
+        const loop = try alloc.create(c.uv_loop_t);
+        try uv.unwrapErr(c.uv_loop_init(loop));
 
         q.* = Quil{
             .alloc = alloc,
@@ -55,15 +56,16 @@ pub const Quil = struct {
     pub fn deinit(q: *Quil) void {
         std.debug.assert(!q.is_alive);
 
-        uv.c.uv_walk(q.loop.loop, struct {
-            fn cb(handle: ?*uv.c.uv_handle_t, _: ?*anyopaque) callconv(.C) void {
+        c.uv_walk(q.loop, struct {
+            fn cb(handle: ?*c.uv_handle_t, _: ?*anyopaque) callconv(.c) void {
                 std.debug.panic(
                     "Handle `{s}` still open on shutdown! This is a bug.\n",
-                    .{uv.c.uv_handle_type_name(handle.?.type)},
+                    .{c.uv_handle_type_name(handle.?.type)},
                 );
             }
         }.cb, null);
-        q.loop.deinit(q.alloc);
+        uv.unwrapErr(c.uv_loop_close(q.loop)) catch unreachable;
+        q.alloc.destroy(q.loop);
 
         q.render.deinit();
         q.buf_manager.deinit();
@@ -134,7 +136,10 @@ pub fn run(q: *Quil, setup_cb: ?fn (*Quil) Error!void) !void {
     defer q.is_alive = false;
 
     // drive teardown requests.
-    defer _ = q.loop.run(.default) catch unreachable;
+    defer {
+        const active_reqs_p = c.uv_run(q.loop, c.UV_RUN_DEFAULT);
+        uv.unwrapErr(active_reqs_p) catch unreachable;
+    }
 
     // Setup Renderer
     try q.render.setup();
@@ -151,20 +156,20 @@ pub fn run(q: *Quil, setup_cb: ?fn (*Quil) Error!void) !void {
     // Handle Signals for graceful shutdown
 
     const SigHandle = extern struct {
-        raw_handle: uv.c.uv_signal_t = undefined,
+        raw_handle: c.uv_signal_t = undefined,
         q: *Quil,
     };
     var sigint_handle: SigHandle = .{ .q = q };
     var sighup_handle: SigHandle = .{ .q = q };
-    const sigint_raw_handle = downgrade_baton(&sigint_handle, uv.c.uv_signal_t);
-    const sighup_raw_handle = downgrade_baton(&sighup_handle, uv.c.uv_signal_t);
+    const sigint_raw_handle = downgrade_baton(&sigint_handle, c.uv_signal_t);
+    const sighup_raw_handle = downgrade_baton(&sighup_handle, c.uv_signal_t);
 
     const handle_signal = struct {
-        fn handler(raw_handle: ?*uv.c.uv_signal_t, signum: c_int) callconv(.C) void {
+        fn handler(raw_handle: ?*c.uv_signal_t, signum: c_int) callconv(.c) void {
             const handle = upgrade_baton(raw_handle.?, SigHandle);
 
             switch (signum) {
-                uv.c.SIGINT, uv.c.SIGHUP => handle.q.loop.stop(),
+                c.SIGINT, c.SIGHUP => c.uv_stop(handle.q.loop),
                 // we haven't listened for any other signums
                 else => unreachable,
             }
@@ -172,18 +177,18 @@ pub fn run(q: *Quil, setup_cb: ?fn (*Quil) Error!void) !void {
     }.handler;
 
     inline for (.{
-        .{ sighup_raw_handle, uv.c.SIGHUP },
-        .{ sigint_raw_handle, uv.c.SIGINT },
+        .{ sighup_raw_handle, c.SIGHUP },
+        .{ sigint_raw_handle, c.SIGINT },
     }) |sig| {
-        try uv.convertError(uv.c.uv_signal_init(q.loop.loop, sig[0]));
-        try uv.convertError(
-            uv.c.uv_signal_start(sig[0], handle_signal, sig[1]),
+        try uv.unwrapErr(c.uv_signal_init(q.loop, sig[0]));
+        try uv.unwrapErr(
+            c.uv_signal_start(sig[0], handle_signal, sig[1]),
         );
     }
     defer {
         inline for (.{ sigint_raw_handle, sighup_raw_handle }) |raw_handle| {
-            std.debug.assert(uv.c.uv_is_closing(@ptrCast(raw_handle)) == 0);
-            uv.c.uv_close(@ptrCast(raw_handle), null);
+            std.debug.assert(c.uv_is_closing(@ptrCast(raw_handle)) == 0);
+            c.uv_close(@ptrCast(raw_handle), null);
         }
     }
 
@@ -201,7 +206,9 @@ pub fn run(q: *Quil, setup_cb: ?fn (*Quil) Error!void) !void {
 
     // Run Main Loop
 
-    _ = try q.loop.run(.default);
+    const active_reqs_p = c.uv_run(q.loop, c.UV_RUN_DEFAULT);
+    try uv.unwrapErr(active_reqs_p);
+    // _ = active_reqs_p; // we should probably log if this is nonzero
     // Teardown defers run here after loop.stop()
 }
 

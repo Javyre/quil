@@ -1,6 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const RangedInt = @import("ranged_int.zig").RangedInt;
+const log = @import("./log.zig").scoped(.segmented_pool);
 
 const is_debug = @import("builtin").mode == .Debug;
 
@@ -31,7 +32,7 @@ pub fn SegmentedPool(
 
         pub fn deinit(pool: *Pool, alloc: std.mem.Allocator) void {
             if ((comptime is_debug) and !pool.len.eql(.coerce(0)))
-                std.debug.panic("Pool leaked {} items", .{pool.len});
+                log.debug(@src(), "Pool leaked items", .{ .items = pool.len });
             pool.segm_list.deinit(alloc);
             pool.* = undefined;
         }

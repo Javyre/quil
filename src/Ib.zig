@@ -138,26 +138,22 @@ pub fn find_ofs(this: Ib, ofs: RopeBytes) ?struct {
 
 pub fn format(
     this: *const Ib,
-    comptime fmt: []const u8,
-    options: std.fmt.FormatOptions,
-    writer: anytype,
-) !void {
-    _ = fmt;
-    _ = options;
-    try writer.writeAll("Ib{ .keys = .{ ");
+    w: *std.Io.Writer,
+) std.Io.Writer.Error!void {
+    try w.writeAll("Ib{ .keys = .{ ");
 
     const len = this.count_keys().to_int();
 
     for (0..len, this.keys[0..len]) |i, key| {
-        try writer.print("{any}", .{key.unwrap().?.to_int()});
-        if (i + 1 < len) try writer.writeAll(", ");
+        try w.print("{any}", .{key.unwrap().?.to_int()});
+        if (i + 1 < len) try w.writeAll(", ");
     }
-    try writer.writeAll(" }, .children = .{ ");
+    try w.writeAll(" }, .children = .{ ");
     for (0..len, this.children[0..len]) |i, child| {
-        try writer.print("{any}", .{child.as(Db.Num).to_int()});
-        if (i + 1 < len) try writer.writeAll(", ");
+        try w.print("{any}", .{child.as(Db.Num).to_int()});
+        if (i + 1 < len) try w.writeAll(", ");
     }
-    return writer.writeAll(" } }");
+    return w.writeAll(" } }");
 }
 
 pub fn jsonStringify(this: *const Ib, jw: anytype) !void {

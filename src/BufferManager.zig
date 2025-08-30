@@ -1,5 +1,6 @@
 const std = @import("std");
-const uv = @import("uv");
+const uv = @import("./uv.zig");
+const c = uv.c;
 const Rope = @import("./Rope.zig");
 
 const MultiArrayPool = @import("./multi_array_pool.zig").MultiArrayPool;
@@ -13,7 +14,7 @@ test {
 }
 
 alloc: std.mem.Allocator,
-loop: uv.Loop,
+loop: *c.uv_loop_t,
 
 buffers: Buffers = .empty,
 
@@ -22,12 +23,12 @@ const Buffer = struct {
     lines: Lines = .empty,
     name: []const u8,
 
-    pub const Lines = std.ArrayListUnmanaged(std.ArrayListUnmanaged(u8));
+    pub const Lines = std.ArrayList(std.ArrayList(u8));
 };
 const Buffers = MultiArrayPool(Buffer);
 pub const BufferNum = Buffers.Idx;
 
-pub fn init(alloc: std.mem.Allocator, loop: uv.Loop) !BufferManager {
+pub fn init(alloc: std.mem.Allocator, loop: *c.uv_loop_t) !BufferManager {
     return .{
         .alloc = alloc,
         .loop = loop,

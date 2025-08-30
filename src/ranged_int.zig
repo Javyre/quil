@@ -186,13 +186,22 @@ pub fn RangedInt(
 
         pub fn format(
             this: @This(),
-            comptime fmt: []const u8,
-            options: std.fmt.FormatOptions,
-            writer: anytype,
-        ) !void {
-            _ = fmt;
-            _ = options;
-            try writer.print("{d}", .{this.to_int()});
+            w: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try this.formatNumber(w, .{});
+        }
+
+        pub fn formatNumber(
+            this: @This(),
+            w: *std.Io.Writer,
+            number: std.fmt.Number,
+        ) std.Io.Writer.Error!void {
+            try w.printInt(this.to_int(), number.base, number.case, .{
+                .precision = number.precision,
+                .width = number.width,
+                .alignment = number.alignment,
+                .fill = number.fill,
+            });
             // try writer.print("{d} in {}", .{
             //     this.to_int(),
             //     RangeMeta.from(this).?,
@@ -216,19 +225,15 @@ const RangeMeta = struct {
 
     pub fn format(
         meta: RangeMeta,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
+        w: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
         if (meta.min_val == meta.max_val) {
-            try writer.print("{d}", .{meta.min_val});
+            try w.print("{d}", .{meta.min_val});
         } else {
-            try writer.print("range {d}..={d}", .{ meta.min_val, meta.max_val });
+            try w.print("range {d}..={d}", .{ meta.min_val, meta.max_val });
         }
         if (meta.tag) |tag| {
-            try writer.print(" ({any})", .{tag});
+            try w.print(" ({any})", .{tag});
         }
     }
 

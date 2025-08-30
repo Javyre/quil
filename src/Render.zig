@@ -1,38 +1,33 @@
 const std = @import("std");
-const uv = @import("uv");
-const zg = struct {
-    pub const DisplayWidth = @import("zg_DisplayWidth");
-    pub const grapheme = @import("zg_grapheme");
-    pub const code_point = @import("zg_code_point");
-    pub const ascii = @import("zg_ascii");
-};
+const uucode = @import("uucode");
 
-const uv_utils = @import("./uv_utils.zig");
+const uv = @import("./uv.zig");
+const c = uv.c;
 const MultiArrayPool = @import("./multi_array_pool.zig").MultiArrayPool;
 const EgcPool = @import("./EGCPool.zig");
 
-const upgrade_baton = uv_utils.upgrade_baton;
-const downgrade_baton = uv_utils.downgrade_baton;
+const assert = std.debug.assert;
+const upgrade_baton = uv.upgrade_baton;
+const downgrade_baton = uv.downgrade_baton;
 
 const Render = @This();
 
 alloc: std.mem.Allocator,
-loop: uv.Loop,
+loop: *c.uv_loop_t,
 write_reqs: WriteReqPool,
 
 is_alive: bool = false,
 stdin: Tty = undefined,
 stdout: Tty = undefined,
 
-display_width_data: zg.DisplayWidth.DisplayWidthData,
 egc_pool: EgcPool = .empty,
 grids: Grids = .empty,
 surfaces: Surfaces = .empty,
 surfaces_dirty: bool = false,
-flush_overdraw_bm: std.ArrayListUnmanaged(BitMap.Word) = .empty,
-flush_requdraw_bm: std.ArrayListUnmanaged(BitMap.Word) = .empty,
+flush_overdraw_bm: std.ArrayList(BitMap.Word) = .empty,
+flush_requdraw_bm: std.ArrayList(BitMap.Word) = .empty,
 flush_grid: GridNum = .null,
-stack: std.ArrayListUnmanaged(u16) = .empty,
+stack: std.ArrayList(u16) = .empty,
 
 // TODO: support terminal fg color? (i.e. not using white but rather fg=0)
 // TODO: support terminal predefined colors?
@@ -120,9 +115,9 @@ const Grid = struct {
     /// if == 0        : empty or making room for some wide previous cell.
     /// if in [32, 126]: ASCII char.
     /// if  > 127      : idx+128 to ECG pool.
-    cell_char: std.ArrayListUnmanaged(u16),
-    cell_bg: std.ArrayListUnmanaged(Color),
-    cell_fg: std.ArrayListUnmanaged(Color),
+    cell_char: std.ArrayList(u16),
+    cell_bg: std.ArrayList(Color),
+    cell_fg: std.ArrayList(Color),
 
     pub const empty: Grid = .{
         .dims = .zero,
@@ -157,7 +152,7 @@ const Surface = struct {
     flush_prev_dims: Dimensions = .zero,
 
     /// Bitmap of dirty cells.
-    cell_dirt: std.ArrayListUnmanaged(BitMap.Word) = .empty,
+    cell_dirt: std.ArrayList(BitMap.Word) = .empty,
     /// Backing grid. surfaces can share larger backing grids.
     grid: GridNum = .null,
     /// Position on the backing grid.
@@ -296,7 +291,7 @@ const BitMap = struct {
         dest: View,
         comptime combine_fn: fn (
             views: [N]Word,
-        ) callconv(.Inline) Word,
+        ) callconv(.@"inline") Word,
     ) void {
         comptime std.debug.assert(N > 0);
 
@@ -681,12 +676,12 @@ const Tty = extern struct {
     raw_handle: uv.c.uv_tty_t,
     r: *Render,
 
-    pub fn handle(t: *Tty) uv.Tty {
-        return uv.Tty{ .handle = downgrade_baton(t, uv.c.uv_tty_t) };
+    pub fn handle(t: *Tty) *c.uv_tty_t {
+        return downgrade_baton(t, c.uv_tty_t);
     }
 
-    pub fn fromHandle(t: uv.Tty) *Tty {
-        return upgrade_baton(t.handle, Tty);
+    pub fn fromHandle(t: *c.uv_tty_t) *Tty {
+        return upgrade_baton(t, Tty);
     }
 };
 
@@ -698,19 +693,17 @@ const WriteReq = extern struct {
     overflow_buf: extern struct { ptr: [*]u8, len: u32 },
 };
 
-pub fn init(alloc: std.mem.Allocator, loop: uv.Loop) !Render {
+pub fn init(alloc: std.mem.Allocator, loop: *c.uv_loop_t) !Render {
     return .{
         .alloc = alloc,
         .loop = loop,
         .write_reqs = .init(alloc),
-        .display_width_data = try .init(alloc),
     };
 }
 pub fn deinit(r: *Render) void {
     r.flush_overdraw_bm.deinit(r.alloc);
     r.flush_requdraw_bm.deinit(r.alloc);
     r.egc_pool.deinit(r.alloc);
-    r.display_width_data.deinit();
     r.write_reqs.deinit();
     r.surfaces.deinit(r.alloc);
     r.stack.deinit(r.alloc);
@@ -718,84 +711,104 @@ pub fn deinit(r: *Render) void {
 }
 
 pub fn setup(r: *Render) !void {
-    if (uv.c.uv_guess_handle(0) != uv.c.UV_TTY)
+    if (c.uv_guess_handle(0) != c.UV_TTY)
         return error.StdInNotATty;
-    if (uv.c.uv_guess_handle(1) != uv.c.UV_TTY)
+    if (c.uv_guess_handle(1) != c.UV_TTY)
         return error.StdOutNotATty;
 
     r.stdin.r = r;
     r.stdout.r = r;
-    try uv.convertError(uv.c.uv_tty_init(
-        r.loop.loop,
-        r.stdin.handle().handle,
+    try uv.unwrapErr(c.uv_tty_init(
+        r.loop,
+        r.stdin.handle(),
         std.posix.STDIN_FILENO,
         0,
     ));
-    try uv.convertError(uv.c.uv_tty_init(
-        r.loop.loop,
-        r.stdout.handle().handle,
+    try uv.unwrapErr(uv.c.uv_tty_init(
+        r.loop,
+        r.stdout.handle(),
         std.posix.STDOUT_FILENO,
         0,
     ));
     r.is_alive = true;
 
-    try r.stdout.handle().setMode(.raw);
+    try uv.unwrapErr(c.uv_tty_set_mode(r.stdout.handle(), c.UV_TTY_MODE_RAW));
 
     // enter alternate screen mode
-    try r.write(try r.write_req_create(), &.{"\x1B[?1049h"}, struct {
+    try r.write(try r.write_req_create(), &.{
+        uv.bufFromSlice("\x1B[?1049h"),
+    }, struct {
         fn cb(req: *WriteReq, status: i32) void {
-            uv.convertError(status) catch unreachable;
+            uv.unwrapErr(status) catch unreachable;
             req.r.write_req_destroy(req);
         }
     }.cb);
 
     // start handling input
-    try r.stdin.handle().readStart(
-        struct {
-            fn alloc(h: *uv.Tty, size: usize) ?[]u8 {
-                return Tty.fromHandle(h.*).r.alloc.alloc(u8, size) catch |e|
-                    switch (e) {
+    const cbs = struct {
+        fn alloc_cb(
+            h: [*c]c.uv_handle_t,
+            size: usize,
+            buf: [*c]c.uv_buf_t,
+        ) callconv(.c) void {
+            const r_ = Tty.fromHandle(@ptrCast(h)).r;
+            if (r_.alloc.alloc(u8, size)) |slice| {
+                buf.* = uv.bufFromSlice(slice);
+            } else |e| switch (e) {
+                error.OutOfMemory => {
                     // libuv interprests this as an error
-                    error.OutOfMemory => null,
-                };
+                    buf.* = .{ .base = null, .len = 0 };
+                },
             }
-        }.alloc,
+        }
+        fn read_cb(
+            h: [*c]c.uv_stream_t,
+            nread: isize,
+            buf_: [*c]const c.uv_buf_t,
+        ) callconv(.c) void {
+            uv.unwrapErr(@intCast(nread)) catch |e| switch (e) {
+                error.EOF => {
+                    c.uv_stop(h.*.loop);
+                    return;
+                },
 
-        struct {
-            fn read(h: *uv.Tty, nread: isize, buf: []const u8) void {
-                uv.convertError(@intCast(nread)) catch |e| switch (e) {
-                    error.EOF => h.loop().stop(),
+                // NOTE: actually unreachable.
+                // Not other errors documented as possible.
+                else => unreachable,
+            };
 
-                    // NOTE: actually unreachable.
-                    // Not other errors documented as possible.
-                    else => unreachable,
-                };
-
-                const r_ = Tty.fromHandle(h.*).r;
-                if (nread > 0 and buf.len > 0) {
-                    r_.handle_input(buf) catch unreachable;
-                }
-                r_.alloc.free(buf);
+            const r_ = Tty.fromHandle(@ptrCast(h)).r;
+            const buf = uv.sliceFromBuf(buf_.*);
+            if (nread > 0 and buf.len > 0) {
+                r_.handle_input(buf) catch unreachable;
             }
-        }.read,
-    );
+            r_.alloc.free(buf);
+        }
+    };
+    try uv.unwrapErr(c.uv_read_start(
+        @ptrCast(r.stdin.handle()),
+        cbs.alloc_cb,
+        cbs.read_cb,
+    ));
 }
 pub fn teardown(r: *Render) !void {
     std.debug.assert(r.is_alive);
 
     // leave alternate screen mode
-    try r.write(try r.write_req_create(), &.{"\x1B[?1049l"}, struct {
+    try r.write(try r.write_req_create(), &.{
+        uv.bufFromSlice("\x1B[?1049l"),
+    }, struct {
         fn cb(req: *WriteReq, status: i32) void {
-            uv.convertError(status) catch unreachable;
+            uv.unwrapErr(status) catch unreachable;
             req.r.write_req_destroy(req);
         }
     }.cb);
 
-    try uv.Tty.resetMode();
+    try uv.unwrapErr(c.uv_tty_reset_mode());
 
-    r.stdin.handle().readStop();
-    r.stdin.handle().close(null);
-    r.stdout.handle().close(null);
+    _ = c.uv_read_stop(@ptrCast(r.stdin.handle()));
+    c.uv_close(@ptrCast(r.stdin.handle()), null);
+    c.uv_close(@ptrCast(r.stdout.handle()), null);
     r.is_alive = false;
 }
 
@@ -986,7 +999,6 @@ fn surface_cp_to_grid(
     src_mask: BitMap.View,
 ) void {
     src_mask.assert_valid();
-    const assert = std.debug.assert;
 
     assert(std.meta.eql(src_mask.vp_dims, src_s.dims));
     assert(src_s.dims.w <= dst_g.dims.w);
@@ -1084,7 +1096,6 @@ const GridView = struct {
         dst.assert_valid();
         mask.assert_valid();
 
-        const assert = std.debug.assert;
         assert(std.meta.eql(src.vp_dims, dst.vp_dims));
         assert(std.meta.eql(src.vp_dims, mask.vp_dims));
 
@@ -1124,51 +1135,57 @@ const GridView = struct {
 };
 
 const OverflowingWriter = struct {
-    fixed_writer: std.io.FixedBufferStream([]align(8) u8).Writer,
-    overflow_writer: std.ArrayListUnmanaged(u8).Writer,
+    overflow: *std.Io.Writer,
+    writer: std.Io.Writer,
 
-    const WriteError = std.ArrayListUnmanaged(u8).Writer.Error;
-    const Writer = std.io.Writer(OverflowingWriter, WriteError, OverflowingWriter.write);
+    pub fn init(buf: []u8, overflow: *std.Io.Writer) OverflowingWriter {
+        return .{
+            .overflow = overflow,
+            .writer = .{
+                .buffer = buf,
+                .end = 0,
+                .vtable = &.{
+                    .drain = OverflowingWriter.drain,
+                    .flush = std.Io.Writer.noopFlush,
 
-    fn fixed_buffer_full(self: OverflowingWriter) bool {
-        const pos = self.fixed_writer.context.getPos() catch unreachable;
-        const end_pos = self.fixed_writer.context.getEndPos() catch unreachable;
-        std.debug.assert(pos <= end_pos);
-        return pos == end_pos;
-    }
-
-    pub fn write(self: OverflowingWriter, bytes: []const u8) WriteError!usize {
-        if (self.fixed_buffer_full()) {
-            return try self.overflow_writer.write(bytes);
-        }
-        return self.fixed_writer.write(bytes) catch |err| switch (err) {
-            error.NoSpaceLeft => {
-                return try self.overflow_writer.write(bytes);
+                    // we might be able to implement something here..
+                    .rebase = std.Io.Writer.failingRebase,
+                },
             },
-            else => unreachable,
         };
     }
+    pub fn drain(
+        w: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        // NOTE: we purposely don't ever flush out the buffer as we only want
+        // the overflowing bytes to go into overflow writer.
 
-    pub fn writer(self: OverflowingWriter) Writer {
-        return .{ .context = self };
+        const ofw: *OverflowingWriter = @fieldParentPtr("writer", w);
+        if (w.unusedCapacityLen() == 0)
+            return ofw.overflow.writeSplat(data, splat);
+
+        const old_end = w.end;
+        return std.Io.Writer.fixedDrain(w, data, splat) catch |e| switch (e) {
+            // we aren't out of space, we just need to be polled again so we
+            // can go to the overflow writer
+            error.WriteFailed => w.end - old_end,
+        };
     }
 };
 
 fn grid_direct_draw(r: *Render, grid: Grid, mask: BitMap.View) !void {
     mask.assert_valid();
-    const assert = std.debug.assert;
     assert(std.meta.eql(grid.dims, mask.vp_dims));
 
     var blit_req = try r.write_req_create();
-    var fixed_stream = std.io.fixedBufferStream(&blit_req.buf);
-
-    // freed on write completion
-    var overflow_buf = std.ArrayListUnmanaged(u8){};
-
-    const writer = (OverflowingWriter{
-        .fixed_writer = fixed_stream.writer(),
-        .overflow_writer = overflow_buf.writer(r.alloc),
-    }).writer();
+    var alloc_writer: std.Io.Writer.Allocating = .init(r.alloc);
+    var of_writer: OverflowingWriter = .init(
+        &blit_req.buf,
+        &alloc_writer.writer,
+    );
+    const writer = &of_writer.writer;
 
     var current_cursor: ?struct {
         pos: Position,
@@ -1192,11 +1209,11 @@ fn grid_direct_draw(r: *Render, grid: Grid, mask: BitMap.View) !void {
                 const cell_char = grid.cell_char.items[i];
 
                 const need_pos, const need_cell_bg, const need_cell_fg =
-                    if (current_cursor) |c| .{
-                    !std.meta.eql(c.cell_fg, cell_fg),
-                    !std.meta.eql(c.cell_bg, cell_bg),
-                    !std.meta.eql(c.pos, .{ .x = x, .y = y }),
-                } else .{ true, true, true };
+                    if (current_cursor) |c_| .{
+                        !std.meta.eql(c_.cell_fg, cell_fg),
+                        !std.meta.eql(c_.cell_bg, cell_bg),
+                        !std.meta.eql(c_.pos, .{ .x = x, .y = y }),
+                    } else .{ true, true, true };
 
                 // HVP - set cursor position
                 if (need_pos) {
@@ -1230,7 +1247,7 @@ fn grid_direct_draw(r: *Render, grid: Grid, mask: BitMap.View) !void {
 
                 switch (cell_char) {
                     0 => writer.writeByte(' ') catch unreachable,
-                    32...126 => |c| writer.writeByte(@intCast(c)) catch unreachable,
+                    32...126 => |c_| writer.writeByte(@intCast(c_)) catch unreachable,
                     128...std.math.maxInt(@TypeOf(cell_char)) => |egc_idx| {
                         const gc = r.egc_pool.get(egc_idx - 128);
                         writer.writeAll(gc) catch unreachable;
@@ -1252,18 +1269,19 @@ fn grid_direct_draw(r: *Render, grid: Grid, mask: BitMap.View) !void {
         }
     }
 
-    const of_buf_slice = overflow_buf.allocatedSlice();
+    const of_list = alloc_writer.toArrayList();
+    const of_buf = of_list.allocatedSlice();
     blit_req.overflow_buf = .{
-        .ptr = of_buf_slice.ptr,
-        .len = @intCast(of_buf_slice.len),
+        .ptr = of_buf.ptr,
+        .len = @intCast(of_buf.len),
     };
 
     try r.write(blit_req, &.{
-        fixed_stream.getWritten(),
-        overflow_buf.items,
+        uv.bufFromSlice(of_writer.writer.buffered()),
+        uv.bufFromSlice(of_list.items),
     }, struct {
         fn cb(req: *WriteReq, status: i32) void {
-            uv.convertError(status) catch unreachable;
+            uv.unwrapErr(status) catch unreachable;
             req.r.alloc.free(req.overflow_buf.ptr[0..req.overflow_buf.len]);
             req.r.write_req_destroy(req);
         }
@@ -1283,28 +1301,30 @@ fn write_req_destroy(r: *Render, req: *WriteReq) void {
 fn write(
     r: *Render,
     req: *WriteReq,
-    bufs: []const []const u8,
+    bufs: []const c.uv_buf_t,
     comptime cb: fn (req: *WriteReq, status: i32) void,
 ) !void {
-    try r.stdout.handle().write(.{
-        .req = downgrade_baton(req, uv.WriteReq.T),
-    }, bufs, struct {
-        fn cb_(req_: *uv.WriteReq, status: i32) void {
-            @call(.always_inline, cb, .{
-                upgrade_baton(req_.req, WriteReq),
-                status,
-            });
-        }
-    }.cb_);
+    try uv.unwrapErr(c.uv_write(
+        downgrade_baton(req, c.uv_write_t),
+        @ptrCast(r.stdout.handle()),
+        bufs.ptr,
+        @intCast(bufs.len),
+        struct {
+            fn cb_(cbreq: [*c]c.uv_write_t, status: c_int) callconv(.c) void {
+                @call(.always_inline, cb, .{
+                    upgrade_baton(cbreq, WriteReq),
+                    status,
+                });
+            }
+        }.cb_,
+    ));
 }
 
 pub fn tty_get_dimensions(r: *Render) !Dimensions {
     var c_w: c_int = undefined;
     var c_h: c_int = undefined;
 
-    try uv.convertError(
-        uv.c.uv_tty_get_winsize(&r.stdin.raw_handle, &c_w, &c_h),
-    );
+    try uv.unwrapErr(c.uv_tty_get_winsize(&r.stdin.raw_handle, &c_w, &c_h));
     return .{
         .w = @intCast(c_w),
         .h = @intCast(c_h),
@@ -1459,37 +1479,35 @@ pub fn surface_draw_utf8(
 
     const s_cell_dirt_bm = BitMap.View.entire(s_cell_dirt.items, s_dims);
 
-    // ASCII fast path
-    if (zg.ascii.isAsciiOnly(text)) {
-        var cell_count: u32 = 0;
-        for (text) |char| {
-            // is ASCII
-            std.debug.assert(char < 128);
-            if (ascii_char_is_invisible(char)) {
-                continue;
-            }
-
-            const g_pos = grid_pos_from_surface_pos(info, pos);
-            g_grid.items[g_dims.w * g_pos.y + g_pos.x] = char;
-            pos.x += 1;
-            cell_count += 1;
-        }
-        s_cell_dirt_bm.set_rect(.from_pos_dims(pos_, .{ .h = 1, .w = cell_count }), 1);
-        s_dirt.* = .partial;
-        r.surfaces_dirty = true;
-        return;
-    }
+    // // ASCII fast path
+    // if (zg.ascii.isAsciiOnly(text)) {
+    //     var cell_count: u32 = 0;
+    //     for (text) |char| {
+    //         // is ASCII
+    //         std.debug.assert(char < 128);
+    //         if (ascii_char_is_invisible(char)) {
+    //             continue;
+    //         }
+    //
+    //         const g_pos = grid_pos_from_surface_pos(info, pos);
+    //         g_grid.items[g_dims.w * g_pos.y + g_pos.x] = char;
+    //         pos.x += 1;
+    //         cell_count += 1;
+    //     }
+    //     s_cell_dirt_bm.set_rect(.from_pos_dims(pos_, .{ .h = 1, .w = cell_count }), 1);
+    //     s_dirt.* = .partial;
+    //     r.surfaces_dirty = true;
+    //     return;
+    // }
 
     var cell_count: u32 = 0;
-    var gc_it = zg.grapheme.Iterator.init(text, &r.display_width_data.g_data);
+    var gc_it = iter_graphemes(text);
     while (gc_it.next()) |gc| {
         std.debug.assert(gc.len != 0);
         std.debug.assert(pos.x < g_dims.w);
 
-        const gc_bytes = gc.bytes(text);
-
         if (gc.len == 1) {
-            const char = gc_bytes[0];
+            const char = gc[0];
             // is ASCII
             std.debug.assert(char < 128);
             if (ascii_char_is_invisible(char)) continue;
@@ -1499,15 +1517,8 @@ pub fn surface_draw_utf8(
             pos.x += 1;
             cell_count += 1;
         } else {
-            const ecg_idx = try r.egc_pool.register_grapheme(
-                r.alloc,
-                gc_bytes,
-            );
-
-            const width = grapheme_width(
-                &r.display_width_data,
-                gc.bytes(text),
-            );
+            const ecg_idx = try r.egc_pool.register_grapheme(r.alloc, gc);
+            const width = grapheme_width(gc);
 
             const max_x = @min(s_dims.w, pos.x + width);
             {
@@ -1557,32 +1568,64 @@ fn ascii_char_is_invisible(char: u8) bool {
     return char < 32 or char == 127;
 }
 
+const GraphemeIter = struct {
+    cp_iter: uucode.utf8.Iterator,
+
+    fn next(it: *GraphemeIter) ?[]const u8 {
+        const start = it.cp_iter.i;
+        var cp_1 = it.cp_iter.next() orelse return null;
+
+        var cp_2_start = it.cp_iter.i;
+        var state: uucode.grapheme.BreakState = .default;
+        while (it.cp_iter.next()) |cp_2| {
+            if (uucode.grapheme.isBreak(cp_1, cp_2, &state)) {
+                // un-next() cp_2 back into the iterator
+                it.cp_iter.i = cp_2_start;
+                return it.cp_iter.bytes[start..it.cp_iter.i];
+            }
+            cp_1 = cp_2;
+            cp_2_start = it.cp_iter.i;
+        } else {
+            // end of string
+            return it.cp_iter.bytes[start..];
+        }
+    }
+};
+fn iter_graphemes(bytes: []const u8) GraphemeIter {
+    return .{ .cp_iter = .init(bytes) };
+}
+
+// TODO: query for mode 2027 support so we know how terminal handles
+// multi-codepoint grapheme clusters. (wcwidth vs. proper clustering)
+// https://mitchellh.com/writing/grapheme-clusters-in-terminals
+//
+// probably measure grapheme width like this:
+// https://github.com/jameslanska/unicode-display-width?tab=readme-ov-file#how-it-works
 fn grapheme_width(
-    data: *zg.DisplayWidth.DisplayWidthData,
     gc_bytes: []const u8,
-) u8 {
+) u2 {
+    comptime assert(u2 == std.math.IntFittingRange(0, std.math.maxInt(i3)));
+
     // code here adapted from strWidth
-    var cp_iter = zg.code_point.Iterator{ .bytes = gc_bytes };
-    var gc_width: i8 = 0;
+    var cp_iter = uucode.utf8.Iterator{ .bytes = gc_bytes };
+    var gc_width: u2 = 0;
 
     while (cp_iter.next()) |cp| {
-        var w = data.codePointWidth(cp.code);
+        const w: i3 = uucode.get(.wcwidth, cp);
 
-        if (w != 0) {
+        if (w >= 0) {
+            // Only adding width of first non-zero-width code point.
+            assert(gc_width == 0);
+            gc_width = @intCast(w);
             // Handle text emoji sequence.
             if (cp_iter.next()) |ncp| {
                 // emoji text sequence.
-                if (ncp.code == 0xFE0E) w = 1;
-                if (ncp.code == 0xFE0F) w = 2;
+                if (ncp == 0xFE0E) gc_width = 1;
+                if (ncp == 0xFE0F) gc_width = 2;
             }
-
-            // Only adding width of first non-zero-width code point.
-            if (gc_width == 0) {
-                gc_width = w;
-                break;
-            }
+            break;
         }
     }
 
-    return @intCast(gc_width);
+    return gc_width;
 }

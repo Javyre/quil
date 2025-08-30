@@ -3,8 +3,8 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
-// const log = @import("./log.zig").scoped(.rope);
-const log = @import("./log.zig").noop;
+const log = @import("./log.zig").scoped(.rope);
+// const log = @import("./log.zig").noop;
 const tlog = @import("./log.zig").scoped(.rope_test);
 
 const SegmentedPool = @import("./segmented_pool.zig").SegmentedPool;
@@ -215,9 +215,8 @@ fn ib_at_const(r: *const Rope, num: Ib.Num) *const Ib {
     return r.indx_blocks.at(num);
 }
 
-const BlockPath =
-    std.BoundedArray(BlockPathEntry, bounds.indx_blocks_height_max);
-const BlockPathEntry = struct {
+const BPathBuf = [bounds.indx_blocks_height_max]BPathEntry;
+const BPathEntry = struct {
     parent_ib: *Ib,
     // index to the key in the parent block
     key_idx: Ib.Len,
@@ -226,14 +225,13 @@ const BlockPathEntry = struct {
 fn find_data_block(
     r: *Rope,
     ofs: RopeBytes,
-) struct {
-    path: BlockPath,
-    ofs_in_db: Db.Len,
-} {
+    path: *std.ArrayList(BPathEntry),
+) Db.Len {
     const root_ib = r.ib_at(r.indx_root);
     assert(ofs.to_int() <= root_ib.sum_subtree_bytes().to_int());
 
-    var path: BlockPath = .{};
+    path.clearRetainingCapacity();
+    assert(path.capacity >= bounds.indx_blocks_height_max);
 
     var parent: *Ib = root_ib;
     var rest_ofs: RopeBytes = ofs;
@@ -246,7 +244,7 @@ fn find_data_block(
             .key_idx = res.key_idx,
             .parent_ib = parent,
         });
-        assert(path.len == height);
+        assert(path.items.len == height);
 
         rest_ofs = .cast(rest_ofs.to_int() - res.child_ofs.to_int());
 
@@ -260,17 +258,14 @@ fn find_data_block(
             assert(r.indx_height.eql(.cast(height)));
         }
     }
-    assert(r.indx_height.eql(.cast(path.len)));
-    assert(path.slice()[path.len - 1].parent_ib == parent);
+    assert(r.indx_height.eql(.cast(path.items.len)));
+    assert(path.items[path.items.len - 1].parent_ib == parent);
 
-    return .{
-        .path = path,
-        .ofs_in_db = .cast(rest_ofs),
-    };
+    return .cast(rest_ofs);
 }
 
 fn update_parent_keys(
-    path: []const BlockPathEntry,
+    path: []const BPathEntry,
     new_len: TreeSize,
 ) void {
     assert(path.len <= bounds.indx_blocks_height_max);
@@ -297,11 +292,11 @@ fn alloc_at(r: *Rope, ofs: RopeBytes, alloc_len: RopeBytes) !struct {
     @setEvalBranchQuota(2_000);
     log.info(@src(), "alloc_at()", .{ .ofs = ofs, .alloc_len = alloc_len });
 
-    const db_query_ = r.find_data_block(ofs);
-    var path = db_query_.path;
-    const ofs_in_targ_db = db_query_.ofs_in_db;
+    var path_buf: BPathBuf = undefined;
+    var path = std.ArrayList(BPathEntry).initBuffer(&path_buf);
+    const ofs_in_targ_db = r.find_data_block(ofs, &path);
 
-    assert(r.indx_height.eql(.cast(path.len)));
+    assert(r.indx_height.eql(.cast(path.items.len)));
 
     const NopIter = struct {
         const NopIter = @This();
@@ -343,7 +338,7 @@ fn alloc_at(r: *Rope, ofs: RopeBytes, alloc_len: RopeBytes) !struct {
         else
             try r.insert_with_siblings(Db, RopeBytes, &alloc_iter, .{
                 .path = &path,
-                .path_cursor = .cast(path.len - 1),
+                .path_cursor = .cast(path.items.len - 1),
                 .vty = &dbs,
                 .ofs_in_targ = ofs_in_targ_db,
             });
@@ -372,7 +367,7 @@ fn alloc_at(r: *Rope, ofs: RopeBytes, alloc_len: RopeBytes) !struct {
                 .some(.coerce(ins_res.left_len_new.?));
 
         update_parent_keys(
-            path.slice()[0 .. path.len - 1],
+            path.items[0 .. path.items.len - 1],
             .cast(dbs.targ.path_entry.parent_ib.sum_subtree_bytes()),
         );
 
@@ -441,15 +436,15 @@ fn alloc_at(r: *Rope, ofs: RopeBytes, alloc_len: RopeBytes) !struct {
     // do the split
     const left_db_num: Db.Num = split.right.block.meta.prev.unwrap().?;
     const right_db_num: Db.Num = split.left.block.meta.next.unwrap().?;
-    path.slice()[path.len - 1].key_idx = .coerce(split.right.key_idx);
+    path.items[path.items.len - 1].key_idx = .coerce(split.right.key_idx);
     log.debug(@src(), "pre-insert_dbs parent", .{
-        .parent = path.slice()[path.len - 1].parent_ib,
+        .parent = path.items[path.items.len - 1].parent_ib,
     });
     log.debug(@src(), "left", .{ .left = split.left.block });
     log.debug(@src(), "right", .{ .right = split.right.block });
     const actual_new_dbs = try r.insert_dbs(&path, split_lens.new_bs);
     log.debug(@src(), "post-insert_dbs parent", .{
-        .parent = path.slice()[path.len - 1].parent_ib,
+        .parent = path.items[path.items.len - 1].parent_ib,
     });
     log.debug(@src(), "left", .{ .left = split.left.block });
     log.debug(@src(), "right", .{ .right = split.right.block });
@@ -460,11 +455,8 @@ fn alloc_at(r: *Rope, ofs: RopeBytes, alloc_len: RopeBytes) !struct {
     assert(!Db.Num.eql(left_db_num, split.right.block.meta.prev.unwrap().?));
 
     // fixup the prefix/postfix data
-    var buf: std.BoundedArrayAligned(
-        u8,
-        config.dcache_line_bytes,
-        2 * config.data_block_bytes_max,
-    ) = .{};
+    var buf_store: [2 * config.data_block_bytes_max]u8 = undefined;
+    var buf: std.ArrayList(u8) = .initBuffer(&buf_store);
     buf.appendSliceAssumeCapacity(
         split.left.block.slice(null, split.left.len).bytes(),
     );
@@ -477,8 +469,9 @@ fn alloc_at(r: *Rope, ofs: RopeBytes, alloc_len: RopeBytes) !struct {
             .db = split.left.block,
             .ofs = .coerce(0),
         };
-        cursor.writer(r).writeAll(
-            buf.slice()[0..split_lens.prefix.to_int()],
+        var cursor_writer = cursor.writer(r, &.{});
+        cursor_writer.writer.writeAll(
+            buf.items[0..split_lens.prefix.to_int()],
         ) catch unreachable;
         break :x cursor;
     };
@@ -488,12 +481,13 @@ fn alloc_at(r: *Rope, ofs: RopeBytes, alloc_len: RopeBytes) !struct {
             .ofs = split_lens.right_new,
         };
         assert(
-            buf.slice()[split_lens.prefix.to_int()..].len ==
+            buf.items[split_lens.prefix.to_int()..].len ==
                 split_lens.postfix.to_int(),
         );
         cursor.seek_back(r, .coerce(split_lens.postfix));
-        cursor.writer(r).writeAll(
-            buf.slice()[split_lens.prefix.to_int()..],
+        var cursor_writer = cursor.writer(r, &.{});
+        cursor_writer.writer.writeAll(
+            buf.items[split_lens.prefix.to_int()..],
         ) catch unreachable;
     }
 
@@ -517,20 +511,20 @@ fn alloc_at(r: *Rope, ofs: RopeBytes, alloc_len: RopeBytes) !struct {
 
 fn insert_dbs(
     r: *Rope,
-    path: *BlockPath,
+    path: *std.ArrayList(BPathEntry),
     new_dbs: Db.Num,
 ) !Db.Num {
     log.info(@src(), "insert_dbs()", .{
-        .path = path.slice(),
+        .path = path.items,
         .new_dbs = new_dbs,
     });
 
     // null if targ is root ib
     var path_cursor: ?PathLen =
-        if (path.len >= 2) .cast(path.len - 2) else null;
+        if (path.items.len >= 2) .cast(path.items.len - 2) else null;
 
-    const next_db: Db.Num = path.slice()[path.len - 1].parent_ib
-        .child_at(.cast(path.slice()[path.len - 1].key_idx))
+    const next_db: Db.Num = path.items[path.items.len - 1].parent_ib
+        .child_at(.cast(path.items[path.items.len - 1].key_idx))
         .as(Db.Num);
     var new_dbs_iter_: InsertDbIter = .init(r, .{
         .len = new_dbs.retag(.db_num, .ib_keys),
@@ -554,7 +548,7 @@ fn insert_dbs(
         Db.Num.min_val.to_int(),
         Db.Num.max_val.to_int(),
     );
-    const ofs_in_targ_ib = path.slice()[path.len - 1].key_idx;
+    const ofs_in_targ_ib = path.items[path.items.len - 1].key_idx;
 
     const targ_pre_reroot = vty_targ_ib(path, path_cursor);
     if (Ib.Len.max_val.sub(targ_pre_reroot.len).to_int() >= new_dbs.to_int()) {
@@ -581,12 +575,12 @@ fn insert_dbs(
             e.parent_ib.key_at(.cast(e.key_idx)).* =
                 .some(.cast(targ.block.sum_subtree_bytes()));
             update_parent_keys(
-                path.slice()[0..path_cursor.?.to_int()],
+                path.items[0..path_cursor.?.to_int()],
                 .cast(e.parent_ib.sum_subtree_bytes()),
             );
         } else {
             assert(path_cursor == null);
-            assert(path.len == 1);
+            assert(path.items.len == 1);
         }
         return new_dbs;
     }
@@ -598,9 +592,9 @@ fn insert_dbs(
     };
     ibs.targ = if (path_cursor == null) targ: {
         log.info(@src(), "root is full; rerooting", .{});
-        const old_len = path.len;
+        const old_len = path.items.len;
         const targ = try r.reroot(path, targ_pre_reroot);
-        assert(path.len == old_len + 1);
+        assert(path.items.len == old_len + 1);
         path_cursor = .coerce(0);
 
         break :targ targ;
@@ -644,12 +638,12 @@ fn insert_dbs(
 
         if (ibs.targ.path_entry) |e| {
             update_parent_keys(
-                path.slice()[0..path_cursor.?.to_int()],
+                path.items[0..path_cursor.?.to_int()],
                 .cast(e.parent_ib.sum_subtree_bytes()),
             );
         } else {
             assert(path_cursor == null);
-            assert(path.len == 1);
+            assert(path.items.len == 1);
         }
         return new_dbs;
     }
@@ -707,8 +701,15 @@ fn insert_dbs(
     assert(actual_new_dbs.to_int() > 0);
     assert(actual_new_dbs.to_int() <= new_dbs.to_int());
 
-    var pending_ib_childs: PendingIbChilds = .{};
-    var pending_ib_keys: PendingIbKeys = .{};
+    var pending_ib_clds: std.ArrayList(Ib.RawChild), //
+    var pending_ib_keys: std.ArrayList(Ib.RawKey) = x: {
+        var clds_store: [pending_bs_store_len.to_int()]Ib.RawChild = undefined;
+        var keys_store: [pending_bs_store_len.to_int()]Ib.RawKey = undefined;
+        break :x .{
+            .initBuffer(&clds_store),
+            .initBuffer(&keys_store),
+        };
+    };
 
     new_dbs_iter_ = .init(r, .{
         .len = actual_new_dbs.retag(.db_num, .ib_keys),
@@ -777,10 +778,10 @@ fn insert_dbs(
         pending_ib_keys.appendAssumeCapacity(.some(.cast(
             new_leaf.ptr.sum_subtree_bytes(),
         )));
-        pending_ib_childs.appendAssumeCapacity(.wrap_ib_num(new_leaf.num));
+        pending_ib_clds.appendAssumeCapacity(.wrap_ib_num(new_leaf.num));
     }
-    assert(pending_ib_keys.len == actual_new_ibs.to_int());
-    assert(pending_ib_childs.len == actual_new_ibs.to_int());
+    assert(pending_ib_keys.items.len == actual_new_ibs.to_int());
+    assert(pending_ib_clds.items.len == actual_new_ibs.to_int());
     assert(actual_new_ibs.to_int() <= new_leaf_blocks_max.to_int());
 
     split.right.block.* = .empty;
@@ -804,8 +805,8 @@ fn insert_dbs(
         .key_at(split.right.key_idx).* = .some(.cast(new_right_key));
 
     // set insert target
-    path.slice()[path.len - 2].key_idx = .coerce(split.right.key_idx);
-    try r.insert_ibs(path, &pending_ib_keys, &pending_ib_childs);
+    path.items[path.items.len - 2].key_idx = .coerce(split.right.key_idx);
+    try r.insert_ibs(path, &pending_ib_keys, &pending_ib_clds);
 
     return actual_new_dbs;
 }
@@ -817,10 +818,6 @@ fn insert_dbs(
 const new_leaf_blocks_max: Ib.Num = .coerce(64);
 const pending_bs_store_len =
     new_leaf_blocks_max.add(.cast(2 * bounds.indx_block_keys_max));
-const PendingIbChilds =
-    std.BoundedArray(Ib.RawChild, pending_bs_store_len.to_int());
-const PendingIbKeys =
-    std.BoundedArray(Ib.RawKey, pending_bs_store_len.to_int());
 
 const PendingIbSlice = struct {
     keys: []Ib.RawKey,
@@ -914,29 +911,29 @@ const PendingIbSlice = struct {
 /// Invalidates the contents of the keys slice. (used as a workarea)
 fn insert_ibs(
     r: *Rope,
-    path: *BlockPath,
-    pending_ib_keys: *PendingIbKeys,
-    pending_ib_childs: *PendingIbChilds,
+    path: *std.ArrayList(BPathEntry),
+    pending_ib_keys: *std.ArrayList(Ib.RawKey),
+    pending_ib_clds: *std.ArrayList(Ib.RawChild),
 ) !void {
     log.info(@src(), "insert_ibs()", .{
-        .path = path.slice(),
-        .pending_ib_keys = pending_ib_keys.slice(),
-        .pending_ib_childs = pending_ib_childs.slice(),
+        .path = path.items,
+        .pending_ib_keys = pending_ib_keys.items,
+        .pending_ib_clds = pending_ib_clds.items,
     });
     // null if targ is root ib
     var path_cursor: ?PathLen =
-        if (path.len >= 3) .cast(path.len - 3) else null;
+        if (path.items.len >= 3) .cast(path.items.len - 3) else null;
 
     // cap iterations because we are paranoid :)
     for (0..bounds.indx_blocks_height_max - 1) |_| {
-        assert(pending_ib_keys.len > 0);
-        assert(pending_ib_childs.len > 0);
-        assert(pending_ib_keys.len == pending_ib_childs.len);
-        const new_ibs: Ib.Num = .cast(pending_ib_keys.len);
+        assert(pending_ib_keys.items.len > 0);
+        assert(pending_ib_clds.items.len > 0);
+        assert(pending_ib_keys.items.len == pending_ib_clds.items.len);
+        const new_ibs: Ib.Num = .cast(pending_ib_keys.items.len);
 
         var new_ibs_iter: PendingIbSlice = .{
-            .keys = pending_ib_keys.slice(),
-            .children = pending_ib_childs.slice(),
+            .keys = pending_ib_keys.items,
+            .children = pending_ib_clds.items,
         };
 
         const IbTotalLen = RangedInt(
@@ -945,7 +942,7 @@ fn insert_ibs(
             Ib.Num.max_val.to_int(),
         );
         const ofs_in_targ_ib =
-            path.slice()[if (path_cursor) |c| c.to_int() + 1 else 0].key_idx;
+            path.items[if (path_cursor) |c| c.to_int() + 1 else 0].key_idx;
 
         const targ_pre_reroot = vty_targ_ib(path, path_cursor);
         if (Ib.Len.max_val.sub(targ_pre_reroot.len).to_int() >=
@@ -973,7 +970,7 @@ fn insert_ibs(
                 e.parent_ib.key_at(.cast(e.key_idx)).* =
                     .some(.cast(targ.block.sum_subtree_bytes()));
                 update_parent_keys(
-                    path.slice()[0..path_cursor.?.to_int()],
+                    path.items[0..path_cursor.?.to_int()],
                     .cast(e.parent_ib.sum_subtree_bytes()),
                 );
             } else {
@@ -989,9 +986,9 @@ fn insert_ibs(
         };
         ibs.targ = if (path_cursor == null) targ: {
             log.info(@src(), "root is full; rerooting", .{});
-            const old_len = path.len;
+            const old_len = path.items.len;
             const targ = try r.reroot(path, targ_pre_reroot);
-            assert(path.len == old_len + 1);
+            assert(path.items.len == old_len + 1);
             path_cursor = .coerce(0);
 
             break :targ targ;
@@ -1033,7 +1030,7 @@ fn insert_ibs(
 
             if (ibs.targ.path_entry) |e| {
                 update_parent_keys(
-                    path.slice()[0..path_cursor.?.to_int()],
+                    path.items[0..path_cursor.?.to_int()],
                     .cast(e.parent_ib.sum_subtree_bytes()),
                 );
             } else {
@@ -1093,47 +1090,40 @@ fn insert_ibs(
             var left_rest = split.left.block.slice(null, split.left.len);
             var right_rest = split.right.block.slice(null, split.right.len);
             const prefix = split_lens.prefix.to_int();
-            pending_ib_childs
-                .resize(pending_ib_childs.len + prefix) catch unreachable;
-            pending_ib_keys
-                .resize(pending_ib_keys.len + prefix) catch unreachable;
             var slice: PendingIbSlice = .{
-                .keys = pending_ib_keys.slice(),
-                .children = pending_ib_childs.slice(),
+                .keys = pending_ib_keys.addManyAtAssumeCapacity(0, prefix),
+                .children = pending_ib_clds.addManyAtAssumeCapacity(0, prefix),
             };
-            slice.shr(prefix);
             var cursor: usize = 0;
             for ([_]*Ib.Slice{ &left_rest, &right_rest }) |part_rest| {
                 cursor += slice.slice(cursor, prefix).write(part_rest);
             }
             assert(cursor == prefix);
 
-            cursor = pending_ib_childs.len;
+            cursor = pending_ib_clds.items.len;
             const postfix = split_lens.postfix.to_int();
-            pending_ib_childs
-                .resize(pending_ib_childs.len + postfix) catch unreachable;
-            pending_ib_keys
-                .resize(pending_ib_keys.len + postfix) catch unreachable;
+            pending_ib_clds.appendNTimesAssumeCapacity(undefined, postfix);
+            pending_ib_keys.appendNTimesAssumeCapacity(undefined, postfix);
             slice = .{
-                .keys = pending_ib_keys.slice(),
-                .children = pending_ib_childs.slice(),
+                .keys = pending_ib_keys.items,
+                .children = pending_ib_clds.items,
             };
             for ([_]*Ib.Slice{ &left_rest, &right_rest }) |part_rest| {
                 cursor += slice.slice(cursor, null).write(part_rest);
             }
-            assert(cursor == pending_ib_childs.len);
+            assert(cursor == pending_ib_clds.items.len);
             assert(left_rest.len.eql(.min_val));
             assert(right_rest.len.eql(.min_val));
         }
 
         log.debug(@src(), "pre-bundle pending ibs", .{
-            .pending_ib_childs = pending_ib_childs.slice(),
-            .pending_ib_keys = pending_ib_keys.slice(),
+            .pending_ib_childs = pending_ib_clds.items,
+            .pending_ib_keys = pending_ib_keys.items,
         });
 
         var pending_ibs: PendingIbSlice = .{
-            .keys = pending_ib_keys.slice(),
-            .children = pending_ib_childs.slice(),
+            .keys = pending_ib_keys.items,
+            .children = pending_ib_clds.items,
         };
 
         // bundle pending blocks into new parents (back into left/pending/right)
@@ -1156,15 +1146,15 @@ fn insert_ibs(
             // we share the same buffer but always write slower than we
             // read. So no clobbering.
             {
-                const write_ptr = &pending_ib_childs.slice()[cursor];
+                const write_ptr = &pending_ib_clds.items[cursor];
                 const read_ptr = pending_ibs.children.ptr;
                 assert(@intFromPtr(write_ptr) < @intFromPtr(read_ptr));
             }
 
             log.debug(@src(), "new_child", .{ .new_child = new_child });
 
-            pending_ib_keys.slice()[cursor] = .some(.cast(new_child_key));
-            pending_ib_childs.slice()[cursor] = .wrap_ib_num(new_child.num);
+            pending_ib_keys.items[cursor] = .some(.cast(new_child_key));
+            pending_ib_clds.items[cursor] = .wrap_ib_num(new_child.num);
         }
         assert(pending_ibs.rest_len() == split_lens.right_new.to_int());
 
@@ -1176,11 +1166,11 @@ fn insert_ibs(
         assert(pending_ibs.rest_len() == 0);
         const new_right_key = split.right.block.sum_subtree_bytes();
 
-        pending_ib_childs.resize(split_lens.new_bs.to_int()) catch unreachable;
-        pending_ib_keys.resize(split_lens.new_bs.to_int()) catch unreachable;
+        pending_ib_clds.shrinkRetainingCapacity(split_lens.new_bs.to_int());
+        pending_ib_keys.shrinkRetainingCapacity(split_lens.new_bs.to_int());
         log.debug(@src(), "post-bundle pending ibs", .{
-            .pending_ib_childs = pending_ib_childs.slice(),
-            .pending_ib_keys = pending_ib_keys.slice(),
+            .pending_ib_childs = pending_ib_clds.items,
+            .pending_ib_keys = pending_ib_keys.items,
         });
 
         // the split will call update_parent_keys so we set up the new right/left
@@ -1192,7 +1182,7 @@ fn insert_ibs(
 
         // set next insert target
         if (split.left.block == ibs.targ.block) {
-            const path_entry = &path.slice()[path_cursor.?.to_int()];
+            const path_entry = &path.items[path_cursor.?.to_int()];
             assert(r.ib_at(
                 path_entry.parent_ib
                     .child_at(.cast(path_entry.key_idx))
@@ -1201,7 +1191,7 @@ fn insert_ibs(
             path_entry.key_idx = path_entry.key_idx.add(.coerce(1));
         } else {
             assert(split.right.block == ibs.targ.block);
-            const path_entry = &path.slice()[path_cursor.?.to_int()];
+            const path_entry = &path.items[path_cursor.?.to_int()];
             assert(std.meta.eql(path_entry.*, ibs.targ.path_entry.?));
             assert(r.ib_at(
                 path_entry.parent_ib
@@ -1220,7 +1210,7 @@ fn insert_ibs(
 ///       split.
 fn reroot(
     r: *Rope,
-    path: *BlockPath,
+    path: *std.ArrayList(BPathEntry),
     // new_bs: RangedInt(Ib.Idx.tag, 0, @max(
     //     bounds.data_blocks_max,
     //     bounds.indx_blocks_max,
@@ -1250,11 +1240,11 @@ fn reroot(
     new_root.ptr.key_at(.coerce(1)).* = .some(.coerce(0));
     new_root.ptr.child_at(.coerce(1)).* = .wrap_ib_num(new_sibling.num);
 
-    const path_entry: BlockPathEntry = .{
+    const path_entry: BPathEntry = .{
         .key_idx = .coerce(0),
         .parent_ib = new_root.ptr,
     };
-    path.insert(0, path_entry) catch unreachable;
+    path.insertAssumeCapacity(0, path_entry);
     r.indx_height = r.indx_height.add(.coerce(1));
 
     return .{
@@ -1542,8 +1532,8 @@ fn TargBInfo(comptime B: type) type {
         block: *B,
         len: B.Len,
         path_entry: switch (B) {
-            Db => BlockPathEntry, // Db can't be root
-            Ib => ?BlockPathEntry,
+            Db => BPathEntry, // Db can't be root
+            Ib => ?BPathEntry,
             else => unreachable,
         },
     };
@@ -1560,14 +1550,14 @@ fn Vicinity(comptime B: type) type {
 const PathLen = RangedInt(.path_entries, 0, bounds.indx_blocks_height_max);
 
 fn vty_targ_ib(
-    path: *const BlockPath,
+    path: *const std.ArrayList(BPathEntry),
     path_cursor: ?PathLen,
 ) TargBInfo(Ib) {
-    const path_entry: ?BlockPathEntry =
-        if (path_cursor) |c| path.slice()[c.to_int()] else null;
+    const path_entry: ?BPathEntry =
+        if (path_cursor) |c| path.items[c.to_int()] else null;
     // Ib guaranteed to be parent of *something*
     const block =
-        path.slice()[if (path_cursor) |c| c.to_int() + 1 else 0].parent_ib;
+        path.items[if (path_cursor) |c| c.to_int() + 1 else 0].parent_ib;
     return .{
         .len = .cast(block.count_keys()),
         .block = block,
@@ -1577,9 +1567,9 @@ fn vty_targ_ib(
 
 fn vty_targ_db(
     r: *Rope,
-    path: *const BlockPath,
+    path: *const std.ArrayList(BPathEntry),
 ) TargBInfo(Db) {
-    const path_entry: BlockPathEntry = path.slice()[path.len - 1];
+    const path_entry: BPathEntry = path.items[path.items.len - 1];
     const block = r.db_at(path_entry.parent_ib.child_at(.cast(path_entry.key_idx))
         .as(Db.Num));
     return .{
@@ -1597,7 +1587,7 @@ fn vty_sibling(
     r: *Rope,
     comptime B: type,
     comptime side: enum { left, right },
-    targ_entry: BlockPathEntry,
+    targ_entry: BPathEntry,
 ) ?BInfo(B) {
     const targ_key_idx: Ib.Idx = Ib.Idx.cast(targ_entry.key_idx);
     const key_idx: Ib.Idx = switch (side) {
@@ -1640,7 +1630,7 @@ fn insert_with_siblings(
     comptime BTotalLen: type,
     items: anytype,
     args: struct {
-        path: *const BlockPath,
+        path: *const std.ArrayList(BPathEntry),
         /// index of the entry in path pointing to targ. -1 == null == root
         path_cursor: ?PathLen,
         vty: *Vicinity(B),
@@ -1657,8 +1647,8 @@ fn insert_with_siblings(
 
     // path_cursor = null means we are at the root.
     // i.e. no path entry corresponds to targ.
-    assert(path.len >= if (path_cursor) |c| c.add(.coerce(1)).to_int() else 0);
-    assert(path.len == r.indx_height.to_int());
+    assert(path.items.len >= if (path_cursor) |c| c.add(.coerce(1)).to_int() else 0);
+    assert(path.items.len == r.indx_height.to_int());
 
     var direct_space: BTotalLen = .cast(B.Len.max_val.sub(vty.targ.len));
     inline for (.{ .right, .left }) |side| {
@@ -1941,10 +1931,14 @@ fn join_blocks(
 /// Find the nearest neighbour of the parent_ib at the tip of the left path.
 fn delete__find_nearest_neighbour(
     r: *Rope,
-    left: []const BlockPathEntry,
-    right: []const BlockPathEntry,
-) BlockPath {
+    left: []const BPathEntry,
+    right: []const BPathEntry,
+) std.ArrayList(BPathEntry) {
     // search both left and right sides concurrently so we can find the nearest
+    _ = r;
+    _ = left;
+    _ = right;
+    @panic("unimplemented");
 }
 
 test alloc_at {
@@ -1955,19 +1949,19 @@ test alloc_at {
 
     try r.expect_valid();
 
-    for ([_]struct { usize, u8 }{
-        .{ 0, 'a' },
-        .{ 10, 'b' },
-        .{ 100, 'c' },
-        .{ 100, 'd' },
-        .{ 200, 'e' },
-        .{ 300, 'f' },
-        .{ 1000, 'g' },
-        .{ 10000, 'h' },
+    for ([_]struct { RopeBytes, u8 }{
+        .{ .coerce(0), 'a' },
+        .{ .coerce(10), 'b' },
+        .{ .coerce(100), 'c' },
+        .{ .coerce(100), 'd' },
+        .{ .coerce(200), 'e' },
+        .{ .coerce(300), 'f' },
+        .{ .coerce(1000), 'g' },
+        .{ .coerce(10000), 'h' },
     }) |e| {
         const len, const char = e;
 
-        tlog.info("======== alloc_at ========", .{ .len = len });
+        tlog.info(@src(), "======== alloc_at ========", .{ .len = len });
         tlog.debug(@src(), "rope.indx_root", .{ .indx_root = r.indx_root });
         tlog.debug(@src(), "rope.indx_root", .{ .indx_root = r.ib_at(r.indx_root) });
         var rest = len;
@@ -1978,7 +1972,8 @@ test alloc_at {
             rest = rest.sub(res.alloc_len);
             cur = res.cursor;
         }
-        try cur.writer(&r).writeByteNTimes(char, len);
+        var cur_writer = cur.writer(&r, &.{});
+        try cur_writer.writer.splatByteAll(char, len.to_int());
     }
 }
 
@@ -2004,21 +1999,23 @@ pub fn insert(r: *Rope, pos: RopeBytes, text: []const u8) !void {
         rest = rest.sub(res.alloc_len);
         pos_cursor = res.cursor;
     }
-    pos_cursor.writer(r).writeAll(text) catch unreachable;
+    var writer = pos_cursor.writer(r, &.{});
+    writer.writer.writeAll(text) catch unreachable;
 }
 
 test "insert-fuzz" {
     std.testing.log_level = .debug;
     // makes for easier print debugging
     const gen_ascii = false;
+    const gpa = std.testing.allocator;
 
-    var rope = Rope.init(std.testing.allocator);
+    var rope = Rope.init(gpa);
     defer rope.deinit();
 
     try rope.expect_valid();
 
-    var str = std.ArrayList(u8).init(std.testing.allocator);
-    defer str.deinit();
+    var str: std.ArrayList(u8) = .empty;
+    defer str.deinit(gpa);
 
     var prng = std.Random.DefaultPrng.init(std.testing.random_seed);
     // var prng = std.Random.DefaultPrng.init(0xd946e30);
@@ -2051,7 +2048,7 @@ test "insert-fuzz" {
             var timer = std.time.Timer.start() catch unreachable;
             try rope.insert(pos, text);
             total_rope_ns += timer.lap();
-            try str.insertSlice(pos.to_int(), text);
+            try str.insertSlice(gpa, pos.to_int(), text);
             total_str_ns += timer.lap();
             // try rope.expect_valid();
             // try std.testing.expectFmt(str.items, "{s}", .{&rope});
@@ -2059,9 +2056,11 @@ test "insert-fuzz" {
     }
 
     try rope.expect_valid();
-    try std.testing.expectFmt(str.items, "{s}", .{&rope});
+    try std.testing.expectFmt(str.items, "{f}", .{rope.fmtString()});
 
-    const block_counts = rope.count_blocks();
+    var block_counts_store: [bounds.indx_blocks_height_max]u32 = undefined;
+    var block_counts: std.ArrayList(u32) = .initBuffer(&block_counts_store);
+    rope.count_blocks(&block_counts);
 
     const total_rope_s = @as(f64, @floatFromInt(total_rope_ns)) /
         @as(f64, @floatFromInt(std.time.ns_per_s));
@@ -2074,7 +2073,7 @@ test "insert-fuzz" {
         .str_s = total_str_s,
         .ib_count = rope.indx_blocks.segm_list.len,
         .db_count = rope.data_blocks.segm_list.len,
-        .block_counts = block_counts.slice(),
+        .block_counts = block_counts.items,
     });
 }
 
@@ -2084,18 +2083,22 @@ pub fn delete(r: *Rope, start: RopeBytes, end: RopeBytes) void {
 
     // The left and right paths are like beams cutting through the tree, and
     // together they form the CONE OF DESTRUCTION.
-    const dbq_l = r.find_data_block(start);
-    const dbq_r = r.find_data_block(end);
-    assert(dbq_l.path.len == dbq_r.path.len);
-    assert(dbq_l.path.len == r.indx_height.to_int());
+    var dbq_l_path_buf: BPathBuf = undefined;
+    var dbq_r_path_buf: BPathBuf = undefined;
+    var dbq_l_path: std.ArrayList(BPathEntry) = .initBuffer(&dbq_l_path_buf);
+    var dbq_r_path: std.ArrayList(BPathEntry) = .initBuffer(&dbq_r_path_buf);
+    const dbq_l_ofs_in_db = r.find_data_block(start, &dbq_l_path);
+    const dbq_r_ofs_in_db = r.find_data_block(end, &dbq_r_path);
+    assert(dbq_l_path.items.len == dbq_r_path.items.len);
+    assert(dbq_l_path.items.len == r.indx_height.to_int());
     assert(r.indx_height.to_int() > 0);
 
     // TODO: handle here the bytes layer in the same way as the below db and ib
     // layers
     {
-        const i = dbq_l.path.len - 1;
-        const entry_l: BlockPathEntry = dbq_l.path.slice()[i];
-        const entry_r: BlockPathEntry = dbq_r.path.slice()[i];
+        const i = dbq_l_path.items.len - 1;
+        const entry_l: BPathEntry = dbq_l_path.items[i];
+        const entry_r: BPathEntry = dbq_r_path.items[i];
 
         // Special Case: delete slice within same parent
         if (std.meta.eql(entry_l, entry_r)) {
@@ -2118,7 +2121,7 @@ pub fn delete(r: *Rope, start: RopeBytes, end: RopeBytes) void {
 
             db.meta.bytes = db.meta.bytes.sub(.cast(end.sub(start)));
 
-            update_parent_keys(dbq_l.path.slice(), .coerce(db.meta.bytes));
+            update_parent_keys(dbq_l_path.items, .coerce(db.meta.bytes));
         } else {
             const db_l_num = entry_l.parent_ib
                 .child_at(.cast(entry_l.key_idx)).as(Db.Num);
@@ -2128,9 +2131,9 @@ pub fn delete(r: *Rope, start: RopeBytes, end: RopeBytes) void {
             const db_r = r.db_at(db_r_num);
 
             const res = r.join_blocks(Db, .{
-                .left = entry_l.parent_ib.slice(null, dbq_l.ofs_in_db),
+                .left = entry_l.parent_ib.slice(null, dbq_l_ofs_in_db),
                 .right = entry_r.parent_ib
-                    .slice(dbq_r.ofs_in_db, db_r.meta.bytes),
+                    .slice(dbq_r_ofs_in_db, db_r.meta.bytes),
             });
 
             db_l.meta.bytes = res.right_len_new;
@@ -2145,19 +2148,19 @@ pub fn delete(r: *Rope, start: RopeBytes, end: RopeBytes) void {
             db_l.meta.next = db_r_num;
             db_r.meta.prev = db_l_num;
 
-            update_parent_keys(dbq_l.path.slice(), .coerce(db_l.meta.bytes));
-            update_parent_keys(dbq_r.path.slice(), .coerce(db_r.meta.bytes));
+            update_parent_keys(dbq_l_path.items, .coerce(db_l.meta.bytes));
+            update_parent_keys(dbq_r_path.items, .coerce(db_r.meta.bytes));
         }
     }
 
     // delete all full blocks within the CONE OF DESTRUCTION.
-    for (0..dbq_l.path.len) |i_rev| {
-        const i = dbq_l.path.len - i_rev - 1;
-        if (i_rev == 0) assert(i == dbq_l.path.len - 1);
-        if (i == 0) assert(i_rev == dbq_l.path.len - 1);
+    for (0..dbq_l_path.items.len) |i_rev| {
+        const i = dbq_l_path.items.len - i_rev - 1;
+        if (i_rev == 0) assert(i == dbq_l_path.items.len - 1);
+        if (i == 0) assert(i_rev == dbq_l_path.items.len - 1);
 
-        const entry_l: BlockPathEntry = dbq_l.path.slice()[i];
-        const entry_r: BlockPathEntry = dbq_r.path.slice()[i];
+        const entry_l: BPathEntry = dbq_l_path.items[i];
+        const entry_r: BPathEntry = dbq_r_path.items[i];
 
         if (std.meta.eql(entry_l, entry_r)) {
             break;
@@ -2211,7 +2214,7 @@ pub fn delete(r: *Rope, start: RopeBytes, end: RopeBytes) void {
             assert(entry_l.parent_ib.count_keys().eql(len_new));
 
             update_parent_keys(
-                dbq_l.path.slice()[0..i],
+                dbq_l_path.items[0..i],
                 .cast(entry_l.parent_ib.sum_subtree_bytes()),
             );
         } else {
@@ -2269,11 +2272,11 @@ pub fn delete(r: *Rope, start: RopeBytes, end: RopeBytes) void {
             }
 
             update_parent_keys(
-                dbq_l.path.slice()[0..i],
+                dbq_l_path.items[0..i],
                 .cast(entry_l.parent_ib.sum_subtree_bytes()),
             );
             update_parent_keys(
-                dbq_r.path.slice()[0..i],
+                dbq_r_path.items[0..i],
                 .cast(entry_r.parent_ib.sum_subtree_bytes()),
             );
         }
@@ -2281,7 +2284,7 @@ pub fn delete(r: *Rope, start: RopeBytes, end: RopeBytes) void {
 
     // Reroot top layers if they are not necessary
     // TODO
-    // for (0..dbq_l.path
+    // for (0..dbq_l_path
 
     // 78
     // 25 26 27
@@ -2321,7 +2324,7 @@ pub fn delete__destroy_subtree(r: *Rope, num: Ib.Num) void {
             @panic("reached max iterations. probably a bug.");
         i += 1;
 
-        const frame = &stack.slice()[stack.len - 1];
+        const frame = &stack.items[stack.len - 1];
         assert(frame.key_idx.to_int() <= frame.len.to_int());
 
         if (frame.key_idx.to_int() < frame.len.to_int()) {
@@ -2350,35 +2353,32 @@ pub fn get_len(r: *const Rope) RopeBytes {
     return r.ib_at_const(r.indx_root).sum_subtree_bytes();
 }
 
+pub fn fmtString(r: *Rope) std.fmt.Alt(*Rope, formatString) {
+    return .{ .data = r };
+}
+
+/// use via `Rope.fmtString()`
+pub fn formatString(
+    r: *Rope,
+    w: *std.Io.Writer,
+) std.Io.Writer.Error!void {
+    var cursor = r.abs_cursor_at(.coerce(0));
+    var reader = cursor.cursor.reader(r, &.{});
+    _ = try (reader.reader.streamRemaining(w) catch |e| switch (e) {
+        std.io.Reader.StreamRemainingError.ReadFailed => unreachable,
+        std.io.Reader.StreamRemainingError.WriteFailed => |x| x,
+    });
+}
+
 pub fn format(
     r: *Rope,
-    comptime fmt: []const u8,
-    options: std.fmt.FormatOptions,
-    writer: anytype,
-) !void {
-    _ = options;
-
-    if (std.mem.eql(u8, fmt, "s")) {
-        var s = r.abs_cursor_at(.coerce(0));
-        var i: usize = 0;
-        while (true) : (i += 1) {
-            const buf_len = 100;
-            var buf: [buf_len]u8 = undefined;
-
-            if (i >= div_ceil(usize, config.rope_bytes_max, buf_len))
-                @panic("reached max iterations. probably a bug.");
-
-            const read_len = try s.reader(r).readAll(&buf);
-            try std.fmt.format(writer, "{s}", .{buf[0..read_len]});
-            if (read_len < buf.len) break;
-        }
-    } else {
-        try std.fmt.format(writer, "Rope{{ ", .{});
-        try std.fmt.format(writer, ".ib_root = {}, ", .{r.indx_root});
-        try std.fmt.format(writer, ".ib_height = {}, ", .{r.indx_height});
-        try std.fmt.format(writer, ".len = {}, ", .{r.get_len()});
-        try std.fmt.format(writer, "}}", .{});
-    }
+    w: *std.Io.Writer,
+) std.Io.Writer.Error!void {
+    try w.print("Rope{{ ", .{});
+    try w.print(".ib_root = {d}, ", .{r.indx_root});
+    try w.print(".ib_height = {d}, ", .{r.indx_height});
+    try w.print(".len = {d}, ", .{r.get_len()});
+    try w.print("}}", .{});
 }
 
 pub fn jsonStringify(r: *const Rope, jw: anytype) !void {
@@ -2395,55 +2395,25 @@ pub fn abs_cursor_at(r: *Rope, pos: RopeBytes) AbsCursor {
     return c;
 }
 
+// We can probably dumb down this abstraction. Used to have it's own
+// writer/reader wrappers to track the abs pos but don't think that'll
+// actually ever be useful.
 pub const AbsCursor = struct {
     cursor: Cursor,
     pos: RopeBytes,
 
-    pub const ReadError = Cursor.ReadError;
-    pub const WriteError = Cursor.WriteError;
-
-    const Ctx = struct {
-        r: *Rope,
-        cursor: *AbsCursor,
-        pub fn read(ctx: Ctx, dst: []u8) ReadError!usize {
-            return ctx.cursor.read(ctx.r, dst);
-        }
-        pub fn write(ctx: Ctx, src: []const u8) WriteError!usize {
-            return ctx.cursor.write(ctx.r, src);
-        }
-    };
-    pub const Reader = std.io.Reader(Ctx, ReadError, Ctx.read);
-    pub const Writer = std.io.Writer(Ctx, WriteError, Ctx.write);
-
-    fn reader(c: *AbsCursor, r: *Rope) Reader {
-        return .{ .context = .{ .r = r, .cursor = c } };
-    }
-    fn writer(c: *AbsCursor, r: *Rope) Writer {
-        return .{ .context = .{ .r = r, .cursor = c } };
-    }
-
-    pub fn read(c: *AbsCursor, r: *Rope, dst: []u8) ReadError!usize {
-        const res = try c.cursor.read(r, dst);
-        c.pos = c.pos.add(.cast(res));
-        return res;
-    }
-
-    pub fn write(c: *AbsCursor, r: *Rope, src: []const u8) WriteError!usize {
-        const res = try c.cursor.write(r, src);
-        c.pos = c.pos.add(.cast(res));
-        return res;
-    }
-
     pub fn seek_to(c: *AbsCursor, r: *Rope, pos: RopeBytes) void {
-        const q = r.find_data_block(pos);
-        const entry = q.path.slice()[q.path.len - 1];
+        var path_buf: BPathBuf = undefined;
+        var path = std.ArrayList(BPathEntry).initBuffer(&path_buf);
+        const ofs_in_db = r.find_data_block(pos, &path);
+        const entry = path.items[path.items.len - 1];
         const db_num = entry.parent_ib
             .child_at(.cast(entry.key_idx)).as(Db.Num);
         c.* = .{
             .pos = pos,
             .cursor = .{
                 .db = r.db_at(db_num),
-                .ofs = q.ofs_in_db,
+                .ofs = ofs_in_db,
             },
         };
     }
@@ -2463,60 +2433,101 @@ pub const Cursor = struct {
     db: *Db,
     ofs: Db.Len,
 
-    pub const ReadError = error{};
-    pub const WriteError = error{NoSpaceLeft};
-
-    const Ctx = struct {
+    pub const Reader = struct {
         r: *Rope,
         cursor: *Cursor,
-        pub fn read(ctx: Ctx, dst: []u8) ReadError!usize {
-            return ctx.cursor.read(ctx.r, dst);
-        }
-        pub fn write(ctx: Ctx, src: []const u8) WriteError!usize {
-            return ctx.cursor.write(ctx.r, src);
-        }
+        reader: std.io.Reader,
     };
-    pub const Writer = std.io.Writer(Ctx, WriteError, Ctx.write);
-    pub const Reader = std.io.Reader(Ctx, ReadError, Ctx.read);
 
-    pub fn reader(c: *Cursor, r: *Rope) Reader {
-        return .{ .context = .{ .r = r, .cursor = c } };
+    pub fn reader(c: *Cursor, r: *Rope, buffer: []u8) Reader {
+        // TODO: more clever optimized rebase and readvec impls so that we can
+        // copy full data blocks to the buffer when possible to avoid acessing
+        // the same db multiple times. Or tbh it might just not make sense to
+        // ever use this reader with a buffer. we need to measure...
+        return .{
+            .r = r,
+            .cursor = c,
+            .reader = .{
+                .vtable = &.{
+                    .stream = stream,
+                },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
     }
-    pub fn writer(c: *Cursor, r: *Rope) Writer {
-        return .{ .context = .{ .r = r, .cursor = c } };
+
+    pub const Writer = struct {
+        r: *Rope,
+        cursor: *Cursor,
+        writer: std.io.Writer,
+    };
+    pub fn writer(c: *Cursor, r: *Rope, buffer: []u8) Writer {
+        return .{
+            .r = r,
+            .cursor = c,
+            .writer = .{
+                .vtable = &.{
+                    .drain = drain,
+                },
+                .buffer = buffer,
+                .end = 0,
+            },
+        };
     }
 
-    pub fn read(this: *Cursor, r: *Rope, dst_: []u8) ReadError!usize {
-        assert(this.ofs.to_int() <= this.db.meta.bytes.to_int());
-        _ = RopeBytes.cast(dst_.len);
-
-        var dst = dst_;
-        var i: usize = 0;
-        while (dst.len > 0) : (i += 1) {
-            if (i >= bounds.data_blocks_max)
-                @panic("reached max iterations. probably a bug.");
-
-            const cpy_len: Db.Len = .cast(RopeBytes.min(
-                .cast(dst.len),
-                .coerce(this.db.meta.bytes.sub(this.ofs)),
-            ));
-            @memcpy(
-                dst[0..cpy_len.to_int()],
-                this.db.bytes[this.ofs.to_int()..][0..cpy_len.to_int()],
-            );
-            dst = dst[cpy_len.to_int()..];
-            this.ofs = this.ofs.add(cpy_len);
-
-            assert(this.ofs.to_int() <= this.db.meta.bytes.to_int());
-            if (this.ofs.eql(this.db.meta.bytes)) {
-                this.db = r.db_at(
-                    this.db.meta.next.unwrap() orelse break,
-                );
-                this.ofs = .coerce(0);
-            }
+    fn stream(
+        r_: *std.io.Reader,
+        w: *std.io.Writer,
+        limit: std.io.Limit,
+    ) std.io.Reader.StreamError!usize {
+        const r: *Reader = @fieldParentPtr("reader", r_);
+        const c = r.cursor;
+        assert(c.ofs.to_int() <= c.db.meta.bytes.to_int());
+        if (c.ofs.eql(c.db.meta.bytes)) {
+            c.db = r.r.db_at(c.db.meta.next.unwrap() orelse
+                return std.io.Reader.StreamError.EndOfStream);
+            c.ofs = .coerce(0);
         }
-        const bytes_read: RopeBytes = .cast(dst_.len - dst.len);
-        return bytes_read.to_int();
+
+        const n = try w.write(limit.slice(
+            c.db.bytes[c.ofs.to_int()..c.db.meta.bytes.to_int()],
+        ));
+        c.ofs = c.ofs.add(.cast(n));
+
+        assert(c.ofs.to_int() <= c.db.meta.bytes.to_int());
+        return n;
+    }
+
+    fn drain(
+        w_: *std.io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.io.Writer.Error!usize {
+        const w: *Writer = @fieldParentPtr("writer", w_);
+
+        if (w.writer.end > 0) {
+            var seek: usize = 0;
+            while (seek < w.writer.end) {
+                // NOTE: buffer is not fully consumed on WriteFailed due to
+                //       rope being full.
+                //       You should be confident that there is enough space
+                //       in the rope before writing.
+                const n = try w.cursor.write(w.r, w.writer.buffer[seek..w.writer.end]);
+                seek += n;
+            }
+            assert(seek == w.writer.end);
+            return 0;
+        }
+
+        if (data.len > 1) {
+            return w.cursor.write(w.r, data[0]);
+        }
+        assert(data.len == 1);
+        if (splat == 0) return 0;
+
+        return w.cursor.write(w.r, data[0]);
     }
 
     const ByteIter = struct {
@@ -2532,32 +2543,31 @@ pub const Cursor = struct {
         }
     };
 
-    pub fn write(this: *Cursor, r: *Rope, src: []const u8) WriteError!usize {
+    pub fn write(
+        this: *Cursor,
+        r: *Rope,
+        src: []const u8,
+    ) std.io.Writer.Error!usize {
         assert(this.ofs.to_int() <= this.db.meta.bytes.to_int());
-        var iter: ByteIter = .{ .bytes = src };
-        var i: usize = 0;
-        while (iter.bytes.len > 0) : (i += 1) {
-            if (i >= bounds.data_blocks_max)
-                @panic("reached max iterations. probably a bug.");
 
-            const cpy_len: Db.Len = Db.write(
-                this.db.slice(this.ofs, this.db.meta.bytes),
-                &iter,
+        if (this.ofs.eql(this.db.meta.bytes)) {
+            this.db = r.db_at(
+                this.db.meta.next.unwrap() orelse
+                    return std.io.Writer.Error.WriteFailed,
             );
-            this.ofs = this.ofs.add(cpy_len);
-
-            assert(this.ofs.to_int() <= this.db.meta.bytes.to_int());
-            if (this.ofs.eql(this.db.meta.bytes)) {
-                this.db = r.db_at(
-                    this.db.meta.next.unwrap() orelse break,
-                );
-                this.ofs = .coerce(0);
-            }
+            this.ofs = .coerce(0);
         }
-        const written: RopeBytes = .cast(src.len - iter.bytes.len);
-        assert(written.to_int() > 0);
-        if (written.to_int() != src.len) return WriteError.NoSpaceLeft;
-        return written.to_int();
+
+        var iter: ByteIter = .{ .bytes = src };
+
+        const cpy_len: Db.Len = Db.write(
+            this.db.slice(this.ofs, this.db.meta.bytes),
+            &iter,
+        );
+        this.ofs = this.ofs.add(cpy_len);
+
+        assert(this.ofs.to_int() <= this.db.meta.bytes.to_int());
+        return cpy_len.to_int();
     }
 
     pub fn seek_by(this: *Cursor, r: *Rope, amt: RopeBytesSigned) void {
@@ -2621,9 +2631,13 @@ pub const Cursor = struct {
 fn expect_valid(r: *Rope) !void {
     try std.testing.expect(r.indx_height.to_int() > 0);
     const res = try r.expect_valid_ib(r.ib_at(r.indx_root), .min_val, null);
-    const head = r.find_data_block(.coerce(0));
-    try std.testing.expectEqual(Db.Len.coerce(0), head.ofs_in_db);
-    const head_entry: BlockPathEntry = head.path.slice()[head.path.len - 1];
+
+    var head_path_buf: BPathBuf = undefined;
+    var head_path = std.ArrayList(BPathEntry).initBuffer(&head_path_buf);
+    const head_ofs_in_db = r.find_data_block(.coerce(0), &head_path);
+
+    try std.testing.expectEqual(Db.Len.coerce(0), head_ofs_in_db);
+    const head_entry: BPathEntry = head_path.items[head_path.items.len - 1];
     try std.testing.expectEqual(Ib.Len.coerce(0), head_entry.key_idx);
     const head_db_num = head_entry.parent_ib.child_at(.coerce(0)).as(Db.Num);
 
@@ -2739,11 +2753,10 @@ fn expect_valid_db(
 
 const count_blocks = struct {
     const Counts = std.BoundedArray(u32, bounds.indx_blocks_height_max);
-    fn count_blocks(r: *Rope) Counts {
-        var counts: Counts = .{
-            .buffer = @splat(0),
-            .len = r.indx_height.to_int(),
-        };
+    /// Count number of blocks on each height level of the tree.
+    fn count_blocks(r: *Rope, out: *std.ArrayList(u32)) void {
+        out.clearRetainingCapacity();
+        out.appendNTimesAssumeCapacity(0, r.indx_height.to_int() + 1);
 
         // root ib should give min height of 1
         assert(r.indx_height.to_int() > 0);
@@ -2751,27 +2764,26 @@ const count_blocks = struct {
             r,
             r.ib_at(r.indx_root),
             r.indx_height.sub(.coerce(1)),
-            &counts,
+            out,
         );
-
-        return counts;
     }
 
-    fn visit_ib(r: *Rope, ib: *Ib, height: IbHeight, counts: *Counts) void {
-        counts.slice()[height.add(.coerce(1)).to_int()] += 1;
+    fn visit_ib(r: *Rope, ib: *Ib, height: IbHeight, out: *std.ArrayList(u32)) void {
+        out.items[height.add(.coerce(1)).to_int()] += 1;
 
         for (ib.keys, ib.children) |keyp, child| {
             const key: TreeSize = keyp.unwrap() orelse break;
             _ = key;
 
             if (height.eql(.min_val)) {
-                counts.slice()[0] += 1;
+                // count the leaf data block
+                out.items[0] += 1;
             } else {
                 visit_ib(
                     r,
                     r.ib_at(child.as(Ib.Num)),
                     height.sub(.coerce(1)),
-                    counts,
+                    out,
                 );
             }
         }

@@ -50,13 +50,9 @@ pub const Meta = struct {
 
     pub fn format(
         this: *const Meta,
-        comptime fmt: []const u8,
-        options: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = fmt;
-        _ = options;
-        try writer.print(
+        w: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try w.print(
             "Meta{{ .bytes = {d}, .newlines = {b}, " ++
                 ".next = {?d}, .prev = {?d} }}",
             .{
@@ -161,13 +157,9 @@ pub fn shr(this: *Db, ofs: Idx, amt_: Len) void {
 
 pub fn format(
     this: *const Db,
-    comptime fmt: []const u8,
-    options: std.fmt.FormatOptions,
-    writer: anytype,
-) !void {
-    _ = fmt;
-    _ = options;
-    try writer.print("Db{{ .meta = {any}, .bytes = \"{s}\" }}", .{
+    w: *std.Io.Writer,
+) std.Io.Writer.Error!void {
+    try w.print("Db{{ .meta = {any}, .bytes = \"{s}\" }}", .{
         this.meta,
         std.fmt.fmtSliceEscapeUpper(this.bytes[0..this.meta.bytes.to_int()]),
     });

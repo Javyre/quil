@@ -103,11 +103,11 @@ pub fn teardown(wm: *WindowManager) !void {
     _ = wm;
 }
 
-const LayoutStack = std.BoundedArray(struct {
+const LayoutStackFrame = struct {
     node: *Node,
     new_dims: Render.Dimensions,
     new_grid_pos: Render.Position,
-}, 24);
+};
 
 pub fn tree_layout(
     wm: *WindowManager,
@@ -123,7 +123,8 @@ pub fn tree_layout(
     // screen_pos = grid_pos + screen_pos_ofs
     const screen_pos_ofs = new_pos;
 
-    var stack: LayoutStack = try .init(0);
+    var stack_buf: [24]LayoutStackFrame = undefined;
+    var stack: std.ArrayList(LayoutStackFrame) = .initBuffer(&stack_buf);
 
     stack.appendAssumeCapacity(.{
         .node = root,
@@ -158,7 +159,7 @@ pub fn tree_layout(
 
 fn layout_tiled_ctnr(
     wm: *WindowManager,
-    stack: *LayoutStack,
+    stack: *std.ArrayList(LayoutStackFrame),
     node: *Node,
     ctnr: *Node.Container,
     new_dims: Render.Dimensions,
@@ -174,15 +175,15 @@ fn layout_tiled_ctnr(
     const main_dim_new, const other_dim_new, //
     const main_coord_new, const other_coord_new =
         switch (ctnr.dir) {
-        .horizontal => .{
-            new_dims.w,     new_dims.h,
-            new_grid_pos.x, new_grid_pos.y,
-        },
-        .vertical => .{
-            new_dims.h,     new_dims.w,
-            new_grid_pos.y, new_grid_pos.x,
-        },
-    };
+            .horizontal => .{
+                new_dims.w,     new_dims.h,
+                new_grid_pos.x, new_grid_pos.y,
+            },
+            .vertical => .{
+                new_dims.h,     new_dims.w,
+                new_grid_pos.y, new_grid_pos.x,
+            },
+        };
 
     var main_dim_remainder = main_dim_new;
     var next_main_coord = main_coord_new;
@@ -193,15 +194,15 @@ fn layout_tiled_ctnr(
         const child_main_dim, const child_other_dim, //
         const child_main_coord, const child_other_coord =
             switch (ctnr.dir) {
-            .horizontal => .{
-                &child_dims.w, &child_dims.h,
-                &child_pos.x,  &child_pos.y,
-            },
-            .vertical => .{
-                &child_dims.h, &child_dims.w,
-                &child_pos.y,  &child_pos.x,
-            },
-        };
+                .horizontal => .{
+                    &child_dims.w, &child_dims.h,
+                    &child_pos.x,  &child_pos.y,
+                },
+                .vertical => .{
+                    &child_dims.h, &child_dims.w,
+                    &child_pos.y,  &child_pos.x,
+                },
+            };
 
         const child_main_dim_new = if (child.next_sibling == null)
             // use remainder for last element;
