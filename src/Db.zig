@@ -90,6 +90,53 @@ comptime {
     );
 }
 
+// == Generic Block API ==
+pub fn get_len(this: *const Db) Len {
+    return this.meta.bytes;
+}
+pub fn set_len(this: *Db, len: Len) void {
+    this.meta.bytes = len;
+}
+pub fn get_subtree_bytes(this: *const Db) RopeBytes {
+    return .coerce(this.meta.bytes);
+}
+pub fn pop(this: *Db) u8 {
+    assert(this.meta.bytes.to_int() > 0);
+    this.meta.bytes = this.meta.bytes.sub(.coerce(1));
+
+    const byte = &this.bytes[this.meta.bytes.to_int()];
+    const ret = byte.*;
+    byte.* = undefined;
+    return ret;
+}
+pub fn pop_front(this: *Db) u8 {
+    assert(this.meta.bytes.to_int() > 0);
+    this.meta.bytes = this.meta.bytes.sub(.coerce(1));
+
+    const ret = this.bytes[0];
+    std.mem.copyForwards(u8, &this.bytes, this.bytes[1..]);
+    this.bytes[this.meta.bytes.to_int()] = undefined;
+    this.meta.newlines >>= 1;
+    return ret;
+}
+pub fn push(this: *Db, byte: u8) void {
+    assert(this.meta.bytes.to_int() < Len.max_val.to_int());
+    const s = this.slice(this.meta.bytes, .max_val).slice(null, .coerce(1));
+    assert(s.len.eql(.coerce(1)));
+    s.bytes()[0] = byte;
+    recalc_newlines(s);
+    this.meta.bytes = this.meta.bytes.add(.coerce(1));
+}
+pub fn push_front(this: *Db, byte: u8) void {
+    assert(this.meta.bytes.to_int() < Len.max_val.to_int());
+    std.mem.copyBackwards(u8, this.bytes[0..], this.bytes[1..]);
+    const s = this.slice(null, .coerce(1));
+    s.bytes()[0] = byte;
+    recalc_newlines(s);
+    this.meta.bytes = this.meta.bytes.add(.coerce(1));
+}
+// == END Generic Block API ==
+
 /// Shift the bytes in the db by amt bytes, starting at ofs.
 /// Does not lose any bytes.
 pub fn shr_exact(this: *Db, ofs: Idx, amt: Idx) void {

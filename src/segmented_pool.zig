@@ -87,22 +87,22 @@ pub fn SegmentedPool(
 }
 
 test "basic" {
-    var pool: SegmentedPool(u32, RangedInt(.foo, 0, 4), .coerce(3)) =
-        .init(std.testing.allocator);
-    defer pool.deinit();
+    const gpa = std.testing.allocator;
+    var pool: SegmentedPool(u64, RangedInt(.foo, 0, 4), .coerce(4)) = .{};
+    defer pool.deinit(gpa);
 
-    const p1 = try pool.create();
-    const p2 = try pool.create();
-    const p3 = try pool.create();
+    const p1 = try pool.create(gpa);
+    const p2 = try pool.create(gpa);
+    const p3 = try pool.create(gpa);
 
     // Assert uniqueness
-    try std.testing.expect(p1 != p2);
-    try std.testing.expect(p1 != p3);
-    try std.testing.expect(p2 != p3);
+    try std.testing.expect(!std.meta.eql(p1, p2));
+    try std.testing.expect(!std.meta.eql(p1, p3));
+    try std.testing.expect(!std.meta.eql(p2, p3));
 
-    pool.destroy(p2);
-    const p4 = try pool.create();
+    pool.destroy(p2.num);
+    const p4 = try pool.create(gpa);
 
     // Assert memory reuse
-    try std.testing.expect(p2 == p4);
+    try std.testing.expect(std.meta.eql(p2, p4));
 }

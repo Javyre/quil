@@ -17,6 +17,10 @@ const Ib = @import("./Ib.zig");
 const IbHeight =
     ranged_int.RangedInt(.ib_num, 0, bounds.indx_blocks_height_max);
 
+fn NumAndPtr(comptime B: type) type {
+    return struct { ptr: *B, num: B.Num };
+}
+
 gpa: std.mem.Allocator,
 indx_root: Ib.Num,
 indx_height: IbHeight,
@@ -1874,20 +1878,22 @@ fn insert_in_blocks(
     };
 }
 
+/// Write args.right content directly after args.left. Filling args.left.block
+/// first and then possibly overflowing into the beginning of args.right.block.
 fn join_blocks(
-    comptime T: type,
+    comptime B: type,
     args: struct {
-        left: T.Slice,
-        right: T.Slice,
+        left: B.Slice,
+        right: B.Slice,
     },
 ) struct {
-    left_len_new: T.Len,
-    right_len_new: T.Len,
+    left_len_new: B.Len,
+    right_len_new: B.Len,
 } {
     const TTotalLen = RangedInt(
-        T.Len.tag,
-        T.Len.min_val.to_int(),
-        T.Len.max_val.to_int() * 2,
+        B.Len.tag,
+        B.Len.min_val.to_int(),
+        @as(comptime_int, B.Len.max_val.to_int()) * 2,
     );
 
     assert(args.left.ofs.eql(.coerce(0)));
@@ -1897,12 +1903,12 @@ fn join_blocks(
         TTotalLen.coerce(args.left.len).add(.coerce(args.right.len));
     const len_l_new, //
     const len_r_new = x: {
-        var len_l_new: T.Len = .trunc(len_total);
-        var len_r_new: T.Len = .cast(len_total.sub(len_l_new));
-        if (T == Ib) {
+        var len_l_new: B.Len = .trunc(len_total);
+        var len_r_new: B.Len = .cast(len_total.sub(.coerce(len_l_new)));
+        if (B == Ib) {
             // We need a min of 2 blocks in Ibs for eventual splitting
             if (0 < len_r_new.to_int() and len_r_new.to_int() < 2) {
-                const diff: T.Len = .cast(2).sub(len_r_new);
+                const diff: B.Len = B.Len.cast(2).sub(len_r_new);
                 len_l_new = len_l_new.sub(diff);
                 len_r_new = len_r_new.add(diff);
                 assert(len_l_new.to_int() >= 2);
@@ -1915,12 +1921,12 @@ fn join_blocks(
     var wslice = args.right;
     assert(args.left.ofs.eql(.coerce(0)));
     const dst_l = args.left.block.slice(args.left.len, len_l_new);
-    T.write(dst_l, &wslice);
+    _ = B.write(dst_l, &wslice);
     assert(wslice.len.eql(len_r_new));
     const dst_r = args.right.block.slice(null, len_r_new);
     // NOTE: we are relying on T.copy detecting the overlapping write and using
     //       `std.mem.copyForwards`
-    T.copy(dst_r, wslice);
+    B.copy(dst_r, wslice);
 
     return .{
         .left_len_new = len_l_new,
@@ -1928,17 +1934,56 @@ fn join_blocks(
     };
 }
 
-/// Find the nearest neighbour of the parent_ib at the tip of the left path.
+const Side = enum { left, right };
+
+/// Find the nearest outward neighbour of the parent_ibs at the tips of the
+/// paths.
 fn delete__find_nearest_neighbour(
-    r: *Rope,
     left: []const BPathEntry,
     right: []const BPathEntry,
-) std.ArrayList(BPathEntry) {
+    out: []BPathEntry,
+) ?Side {
+    assert(left.len == right.len);
+    assert(left.len == out.len);
+
     // search both left and right sides concurrently so we can find the nearest
-    _ = r;
-    _ = left;
-    _ = right;
-    @panic("unimplemented");
+    for (0..left.len) |i_rev| {
+        const i = left.len - 1 - i_rev;
+        // Find the first parent layer with a outer sibling branch
+        if (left[i].key_idx.to_int() > 0) {
+            @memcpy(out[i + 1 ..], left[i + 1 ..]);
+            out[i] = .{
+                .parent_ib = left[i].parent_ib,
+                .key_idx = left[i].key_idx.sub(.coerce(1)),
+            };
+            for (out[0..i], left[0..i]) |*o, l| {
+                o.* = .{
+                    .parent_ib = l.parent_ib,
+                    .key_idx = l.parent_ib.count_keys().sub(.coerce(1)),
+                };
+            }
+            return .left;
+        }
+        if (right[i].key_idx.to_int() < Ib.Idx.max_val.to_int() and
+            right[i].key_idx.to_int() < right[i].parent_ib.count_keys().to_int())
+        {
+            @memcpy(out[i + 1 ..], right[i + 1 ..]);
+            out[i] = .{
+                .parent_ib = right[i].parent_ib,
+                .key_idx = right[i].key_idx.add(.coerce(1)),
+            };
+            for (out[0..i], right[0..i]) |*o, l| {
+                o.* = .{
+                    .parent_ib = l.parent_ib,
+                    .key_idx = .coerce(0),
+                };
+            }
+            return .right;
+        }
+    }
+    // This means there's NOTHING on the same layer as left+right outside of
+    // the [left,right] cone
+    return null;
 }
 
 test alloc_at {
@@ -2077,239 +2122,378 @@ test "insert-fuzz" {
     });
 }
 
-pub fn delete(r: *Rope, start: RopeBytes, end: RopeBytes) void {
-    assert(start.to_int() <= end.to_int());
-    if (start.eql(end)) return;
+pub fn delete(r: *Rope, beg: RopeBytes, end: RopeBytes) void {
+    assert(beg.to_int() <= end.to_int());
+    if (beg.eql(end)) return;
 
     // The left and right paths are like beams cutting through the tree, and
     // together they form the CONE OF DESTRUCTION.
-    var dbq_l_path_buf: BPathBuf = undefined;
-    var dbq_r_path_buf: BPathBuf = undefined;
-    var dbq_l_path: std.ArrayList(BPathEntry) = .initBuffer(&dbq_l_path_buf);
-    var dbq_r_path: std.ArrayList(BPathEntry) = .initBuffer(&dbq_r_path_buf);
-    const dbq_l_ofs_in_db = r.find_data_block(start, &dbq_l_path);
-    const dbq_r_ofs_in_db = r.find_data_block(end, &dbq_r_path);
-    assert(dbq_l_path.items.len == dbq_r_path.items.len);
-    assert(dbq_l_path.items.len == r.indx_height.to_int());
+    var beg_path_buf: BPathBuf = undefined;
+    var eng_path_buf: BPathBuf = undefined;
+    var beg_path: std.ArrayList(BPathEntry) = .initBuffer(&beg_path_buf);
+    var end_path: std.ArrayList(BPathEntry) = .initBuffer(&eng_path_buf);
+    const beg_ofs_in_db = r.find_data_block(beg, &beg_path);
+    const end_ofs_in_db = r.find_data_block(end, &end_path);
+    assert(beg_path.items.len == end_path.items.len);
+    assert(beg_path.items.len == r.indx_height.to_int());
     assert(r.indx_height.to_int() > 0);
 
-    // TODO: handle here the bytes layer in the same way as the below db and ib
-    // layers
     {
-        const i = dbq_l_path.items.len - 1;
-        const entry_l: BPathEntry = dbq_l_path.items[i];
-        const entry_r: BPathEntry = dbq_r_path.items[i];
-
-        // Special Case: delete slice within same parent
-        if (std.meta.eql(entry_l, entry_r)) {
+        const i = beg_path.items.len - 1;
+        const beg_entry: BPathEntry = beg_path.items[i];
+        const end_entry: BPathEntry = end_path.items[i];
+        const beg_db: NumAndPtr(Db) = x: {
+            const num = beg_entry.parent_ib
+                .child_at(.cast(beg_entry.key_idx)).as(Db.Num);
+            break :x .{ .num = num, .ptr = r.db_at(num) };
+        };
+        const end_db: NumAndPtr(Db) = if (std.meta.eql(beg_entry, end_entry)) x: {
             // Most interactive deletions are local to a single data block.
             @branchHint(.likely);
+            break :x beg_db;
+        } else x: {
+            const num = end_entry.parent_ib
+                .child_at(.cast(end_entry.key_idx)).as(Db.Num);
+            break :x .{ .num = num, .ptr = r.db_at(num) };
+        };
 
-            // The delete operation is within a single data block.
-            _ = Db.Len.try_cast(end.sub(start)) catch unreachable;
-
-            const db = r.db_at(entry_l.parent_ib
-                .child_at(.cast(entry_l.key_idx)).as(Db.Num));
-            // copy to avoid aliasing in the below write
-            const db_copy = db.*;
-
-            // TODO: write Db.shl and use it here
-            const slice_to = db.slice(.cast(start), db.meta.bytes);
-            var slice_from = db_copy.slice(.cast(end), db.meta.bytes);
-            Db.write(slice_to, &slice_from);
-            assert(slice_from.len.eql(.coerce(0)));
-
-            db.meta.bytes = db.meta.bytes.sub(.cast(end.sub(start)));
-
-            update_parent_keys(dbq_l_path.items, .coerce(db.meta.bytes));
-        } else {
-            const db_l_num = entry_l.parent_ib
-                .child_at(.cast(entry_l.key_idx)).as(Db.Num);
-            const db_r_num = entry_r.parent_ib
-                .child_at(.cast(entry_r.key_idx)).as(Db.Num);
-            const db_l = r.db_at(db_l_num);
-            const db_r = r.db_at(db_r_num);
-
-            const res = r.join_blocks(Db, .{
-                .left = entry_l.parent_ib.slice(null, dbq_l_ofs_in_db),
-                .right = entry_r.parent_ib
-                    .slice(dbq_r_ofs_in_db, db_r.meta.bytes),
-            });
-
-            db_l.meta.bytes = res.right_len_new;
-            db_r.meta.bytes = res.left_len_new;
-
-            // Skip over deleted data block range in linked list
-            //
-            // (the data blocks themselves will be deleted as part of cone of
-            // destruction subtree deletion below without needing to worry
-            // anymore about the linked list fixup)
-            //
-            db_l.meta.next = db_r_num;
-            db_r.meta.prev = db_l_num;
-
-            update_parent_keys(dbq_l_path.items, .coerce(db_l.meta.bytes));
-            update_parent_keys(dbq_r_path.items, .coerce(db_r.meta.bytes));
-        }
+        r.delete__delete_layer(Db, .{
+            .beg = .{ .b = beg_db.ptr, .ofs = beg_ofs_in_db },
+            .end = .{ .b = end_db.ptr, .ofs = end_ofs_in_db },
+            .beg_parent_path = beg_path.items,
+            .end_parent_path = end_path.items,
+            .extra = .{
+                .beg_num = beg_db.num,
+                .end_num = end_db.num,
+            },
+        });
     }
 
     // delete all full blocks within the CONE OF DESTRUCTION.
-    for (0..dbq_l_path.items.len) |i_rev| {
-        const i = dbq_l_path.items.len - i_rev - 1;
-        if (i_rev == 0) assert(i == dbq_l_path.items.len - 1);
-        if (i == 0) assert(i_rev == dbq_l_path.items.len - 1);
+    // and stitch together partial block ends
+    for (0..beg_path.items.len) |i_rev| {
+        const i = beg_path.items.len - i_rev - 1;
+        if (i_rev == 0) assert(i == beg_path.items.len - 1);
+        if (i == 0) assert(i_rev == beg_path.items.len - 1);
 
-        const entry_l: BPathEntry = dbq_l_path.items[i];
-        const entry_r: BPathEntry = dbq_r_path.items[i];
+        const beg_entry: BPathEntry = beg_path.items[i];
+        const end_entry: BPathEntry = end_path.items[i];
 
-        if (std.meta.eql(entry_l, entry_r)) {
+        if (std.meta.eql(beg_entry, end_entry)) {
             break;
         }
-
-        const key_l = entry_l.parent_ib.key_at(entry_l.key_idx).unwrap().?;
-        const key_r = entry_r.parent_ib.key_at(entry_r.key_idx).unwrap().?;
 
         // include 0-len start/end blocks in rm range
         // these ends are 0 if the cone-of-destr. perfectly lines up with
         // the edge of the ib subtree and so the lower-layer deletion makes
         // the parent end up empty.
-        const rm_l_start = if (key_l.eql(.coerce(0)))
-            entry_l.key_idx
-        else
-            entry_l.key_idx.add(.coerce(1));
-        const rm_r_end = if (key_r.eql(.coerce(0)))
-            entry_r.key_idx.add(.coerce(1))
-        else
-            entry_r.key_idx;
-        assert(rm_l_start.to_int() <= rm_r_end.to_int());
+        const beg_key, //
+        const end_key = .{
+            beg_entry.parent_ib.key_at(.cast(beg_entry.key_idx)).unwrap().?,
+            end_entry.parent_ib.key_at(.cast(end_entry.key_idx)).unwrap().?,
+        };
+        const beg_ofs, //
+        const end_ofs = .{
+            if (beg_key.eql(.coerce(0)))
+                beg_entry.key_idx
+            else
+                beg_entry.key_idx.add(.coerce(1)),
+            if (end_key.eql(.coerce(0)))
+                end_entry.key_idx.add(.coerce(1))
+            else
+                end_entry.key_idx,
+        };
 
-        // Special Case: delete slice within same parent
-        if (entry_l.parent_ib == entry_r.parent_ib) {
-            // Less likely as most of the time we are on a layer that isn't the
-            // root of the cone of destruction.
-            @branchHint(.unlikely);
-
-            {
-                const rm = entry_l.parent_ib.slice(rm_l_start, rm_r_end);
-                if (i_rev == 0) {
-                    for (rm.children()) |c|
-                        r.data_blocks.destroy(c.as(Db.Num));
-                } else {
-                    for (rm.children()) |c|
-                        r.delete__destroy_subtree(c.as(Ib.Num));
-                }
-            }
-
-            // Shift the right content to be adjacent to the left
-            const len_old = entry_l.parent_ib.count_keys();
-            const len_new = len_old.sub(rm_r_end.sub(rm_l_start));
-
-            var slice_from = entry_l.parent_ib.slice(rm_r_end, len_old);
-            const slice_to = entry_l.parent_ib.slice(rm_l_start, len_old);
-            Ib.write(slice_to, &slice_from);
-            assert(slice_from.len.eql(.coerce(0)));
-
-            if (!len_new.eql(Ib.Len.max_val))
-                entry_l.parent_ib.key_at(.cast(len_new)).* = .null;
-            assert(entry_l.parent_ib.count_keys().eql(len_new));
-
-            update_parent_keys(
-                dbq_l_path.items[0..i],
-                .cast(entry_l.parent_ib.sum_subtree_bytes()),
-            );
-        } else {
-            const len_l_old = entry_l.parent_ib.count_keys();
-            const len_r_old = entry_r.parent_ib.count_keys();
-            const rm_ls = entry_l.parent_ib.slice(rm_l_start, len_l_old);
-            const rm_rs = entry_r.parent_ib.slice(null, rm_r_end);
-
-            if (i_rev == 0) {
-                for (rm_ls.children()) |rm_l|
-                    r.data_blocks.destroy(rm_l.as(Db.Num));
-                for (rm_rs.children()) |rm_r|
-                    r.data_blocks.destroy(rm_r.as(Db.Num));
-            } else {
-                for (rm_ls.children()) |rm_l|
-                    r.delete__destroy_subtree(rm_l.as(Ib.Num));
-                for (rm_rs.children()) |rm_r|
-                    r.delete__destroy_subtree(rm_r.as(Ib.Num));
-            }
-
-            // Now join this layer's left and right and update the immediate
-            // parents
-
-            const res = r.join_blocks(Ib, .{
-                .left = entry_l.parent_ib.slice(null, rm_l_start),
-                .right = entry_r.parent_ib.slice(rm_r_end, len_r_old),
-            });
-
-            if (!res.left_len_new.eql(.max_value))
-                entry_l.parent_ib.key_at(.cast(res.left_len_new)).* = .null;
-
-            if (!res.right_len_new.eql(.max_value))
-                entry_r.parent_ib.key_at(.cast(res.right_len_new)).* = .null;
-
-            assert(res.right_len_new.eql(.coerce(0)) or
-                res.right_len_new.to_int() >= 2);
-
-            if (res.left_len_new.eql(.coerce(1))) {
-                assert(res.right_len_new.eql(.coerce(0)));
-
-                // Either fit this into a neighbour block or take one away from
-                // a neighbour block.
-                //
-                // neighbour candidates:
-                // 1. just left of entry_l.parent_ib
-                // 2. just right of entry_r.parent_ib
-                //    this works because if left_len_new == 1 then right_len_new
-                //    must be 0.
-                // 3. NO NEIGHBOURS, this means we need to reroot
-
-                // const left_neighbour =
-                //
-                // need the path of the neighbour block so we can update the
-                // parent keys
-            }
-
-            update_parent_keys(
-                dbq_l_path.items[0..i],
-                .cast(entry_l.parent_ib.sum_subtree_bytes()),
-            );
-            update_parent_keys(
-                dbq_r_path.items[0..i],
-                .cast(entry_r.parent_ib.sum_subtree_bytes()),
-            );
-        }
+        r.delete__delete_layer(Ib, .{
+            .beg = .{ .b = beg_entry.parent_ib, .ofs = beg_ofs },
+            .end = .{ .b = end_entry.parent_ib, .ofs = end_ofs },
+            .beg_parent_path = beg_path.items[0..i],
+            .end_parent_path = end_path.items[0..i],
+            .extra = .{
+                .height = if (i_rev == 0) .db_parent else .ib_parent,
+            },
+        });
     }
 
-    // Reroot top layers if they are not necessary
-    // TODO
-    // for (0..dbq_l_path
+    // Reroot/squash left-behind invalid single-child top layers
+    const root = r.ib_at(r.indx_root);
+    for (0..r.indx_height.sub(.coerce(1)).to_int()) |_| {
+        if (!root.count_keys().eql(.coerce(1)))
+            break;
 
-    // 78
-    // 25 26 27
-    // 7 7 7 4  7 8 7 4  8 8 3 8
-    // 2221 2122 2122  22  2221 2222 2122 22  2222 ...
-    //
-    // [78]
-    // [25 26] 27
-    // 7 7 7 [4  7 8] 7 4  8 8 3 8
-    // 2221 2122 2122  2[2  2221 22]22 2122 22  2222 ...
-    //
-    // [78]
-    // [25 26] 27
-    // 7 7 7 [4  _ 8] 7 4  8 8 3 8
-    // 2221 2122 2122  2[2  ____ _2]22 2122 22  2222 ...
-
+        const child_num = root.child_at(.coerce(0)).as(Ib.Num);
+        const child = r.ib_at(child_num);
+        assert(child.sum_subtree_bytes()
+            .eql(.coerce(root.key_at(.coerce(0)).unwrap().?)));
+        root.* = child.*;
+        r.indx_blocks.destroy(child_num);
+    }
+    assert(!root.count_keys().eql(.coerce(1)));
 }
 
-pub fn delete__destroy_subtree(r: *Rope, num: Ib.Num) void {
-    var stack: std.BoundedArray(struct {
+fn BCursor(comptime B: type) type {
+    return struct {
+        b: *B,
+        ofs: B.Len,
+    };
+}
+fn delete__delete_layer(
+    r: *Rope,
+    comptime B: type,
+    args: struct {
+        // we can for the ib layers just pass in the path
+        // but for the db layer we don't have a pathentry
+        //
+        /// rm beg inclusive
+        beg: BCursor(B),
+        /// rm end exclusive
+        end: BCursor(B),
+        beg_parent_path: []const BPathEntry,
+        end_parent_path: []const BPathEntry,
+        extra: switch (B) {
+            Ib => struct {
+                height: enum {
+                    ib_parent,
+                    db_parent,
+                },
+            },
+            Db => struct {
+                beg_num: Db.Num,
+                end_num: Db.Num,
+            },
+            else => unreachable,
+        },
+    },
+) void {
+    // Special Case: delete slice within same parent
+    if (args.beg.b == args.end.b) {
+        @branchHint(switch (B) {
+            // Most interactive deletions are local to a single data block.
+            Db => .likely,
+            // Less likely as most of the time we are on a layer that isn't the
+            // root of the cone of destruction.
+            Ib => .unlikely,
+            else => unreachable,
+        });
+
+        assert(args.beg.ofs.to_int() <= args.end.ofs.to_int());
+
+        {
+            const rm = args.beg.b.slice(args.beg.ofs, args.end.ofs);
+            switch (B) {
+                Db => {},
+                Ib => switch (args.extra.height) {
+                    .db_parent => for (rm.children()) |c|
+                        r.data_blocks.destroy(c.as(Db.Num)),
+                    .ib_parent => for (rm.children()) |c|
+                        r.delete__destroy_subtree(c.as(Ib.Num)),
+                },
+                else => unreachable,
+            }
+        }
+
+        // Shift the right content to be adjacent to the left
+        const len_old = args.beg.b.get_len();
+        const len_new = len_old.sub(args.end.ofs.sub(args.beg.ofs));
+
+        var slice_from = args.beg.b.slice(args.end.ofs, len_old);
+        const slice_to = args.beg.b.slice(args.beg.ofs, len_old);
+        _ = B.write(slice_to, &slice_from);
+        assert(slice_from.len.eql(.coerce(0)));
+
+        args.beg.b.set_len(len_new);
+
+        // unlucky case :( see equivalent below
+        if (len_new.eql(.coerce(1))) {
+            const side = r.delete__single_child_to_neigh(B, .{
+                .beg_parent_path = args.beg_parent_path,
+                .end_parent_path = args.end_parent_path,
+                .beg_b = args.beg.b,
+                .end_b = args.end.b,
+            });
+            assert(args.beg.b.get_len().eql(.coerce(
+                @as(u1, if (side) |_| 0 else
+                // [CASE. no neighbour found]:
+                // Do nothing. leave a trail up to the root of 1-length
+                // blocks. We will have a reroot pass to clean this up
+                // later.
+                //
+                // If no neighbours to this block were found then this must be
+                // either root or only-child of string of only-childs up to
+                // root.
+                1),
+            )));
+        }
+
+        const subtree_size = args.beg.b.get_subtree_bytes();
+        update_parent_keys(args.beg_parent_path, .cast(subtree_size));
+        return;
+    }
+
+    const len_old = .{
+        .l = args.beg.b.get_len(),
+        .r = args.end.b.get_len(),
+    };
+
+    switch (B) {
+        Ib => {
+            const rm_ls = args.beg.b.slice(args.beg.ofs, len_old.l);
+            const rm_rs = args.end.b.slice(null, args.end.ofs);
+            switch (args.extra.height) {
+                .db_parent => {
+                    for (rm_ls.children()) |rm_l|
+                        r.data_blocks.destroy(rm_l.as(Db.Num));
+                    for (rm_rs.children()) |rm_r|
+                        r.data_blocks.destroy(rm_r.as(Db.Num));
+                },
+                .ib_parent => {
+                    for (rm_ls.children()) |rm_l|
+                        r.delete__destroy_subtree(rm_l.as(Ib.Num));
+                    for (rm_rs.children()) |rm_r|
+                        r.delete__destroy_subtree(rm_r.as(Ib.Num));
+                },
+            }
+        },
+        Db => {},
+        else => unreachable,
+    }
+
+    // Now join this layer's left and right and update the immediate
+    // parents
+
+    const res = join_blocks(B, .{
+        .left = args.beg.b.slice(null, args.beg.ofs),
+        .right = args.end.b.slice(args.end.ofs, len_old.r),
+    });
+
+    assert(res.right_len_new.eql(.coerce(0)) or
+        res.right_len_new.to_int() >= 2);
+
+    args.beg.b.set_len(res.left_len_new);
+    args.end.b.set_len(res.right_len_new);
+
+    // == UNLUCKY CASE :( ==
+    //
+    // We deleted all but one of the children of $l||r$.
+    // So now we are left with an invalid l = [single child].
+    // We have to put this single child somewhere.
+    if (res.left_len_new.eql(.coerce(1))) {
+        assert(res.right_len_new.eql(.coerce(0)));
+        const side = r.delete__single_child_to_neigh(B, .{
+            .beg_parent_path = args.beg_parent_path,
+            .end_parent_path = args.end_parent_path,
+            .beg_b = args.beg.b,
+            .end_b = args.end.b,
+        });
+        assert(args.beg.b.get_len().eql(.coerce(
+            @as(u1, if (side) |_| 0 else
+            // [CASE. no neighbour found]:
+            // Do nothing. leave a trail up to the root of 1-length
+            // blocks. We will have a reroot pass to clean this up
+            // later.
+            1),
+        )));
+        assert(args.end.b.get_len().eql(.coerce(0)));
+    }
+
+    if (B == Db) {
+        // Skip over deleted data block range in linked list
+        //
+        // (the data blocks themselves will be deleted as part of cone of
+        // destruction subtree deletion below without needing to worry
+        // anymore about the linked list fixup)
+        args.end.b.meta.next = .some(args.extra.end_num);
+        args.beg.b.meta.prev = .some(args.extra.beg_num);
+    }
+
+    const left_bytes: TreeSize = .cast(args.beg.b.get_subtree_bytes());
+    const right_bytes: TreeSize = .cast(args.end.b.get_subtree_bytes());
+    update_parent_keys(args.beg_parent_path, left_bytes);
+    update_parent_keys(args.end_parent_path, right_bytes);
+}
+
+fn delete__single_child_to_neigh(
+    r: *Rope,
+    comptime B: type,
+    args: struct {
+        beg_parent_path: []const BPathEntry,
+        end_parent_path: []const BPathEntry,
+        beg_b: *B,
+        end_b: *B,
+    },
+) ?Side {
+    assert(args.beg_b.get_len().eql(.coerce(1)));
+    assert(args.end_b.get_len().eql(.coerce(0)));
+    // Either fit this into a neighbour block or take one away from
+    // a neighbour block.
+    //
+    // neighbour candidates:
+    // 1. just left of args.beg.b
+    // 2. just right of args.end.b
+    //    this works because if left_len_new == 1 then right_len_new
+    //    must be 0.
+    // 3. NO NEIGHBOURS, this means we need to reroot
+
+    // need the path of the neighbour block so we can update the
+    // parent keys
+    var neigh_path_store: [
+        bounds.indx_blocks_height_max
+    ]BPathEntry = undefined;
+    const neigh_path = neigh_path_store[0..args.beg_parent_path.len];
+    const side = delete__find_nearest_neighbour(
+        args.beg_parent_path,
+        args.end_parent_path,
+        neigh_path,
+    ) orelse return null;
+
+    const neigh_parent_entry = neigh_path[neigh_path.len - 1];
+    const neigh_b_num = neigh_parent_entry.parent_ib.child_at(
+        .cast(neigh_parent_entry.key_idx),
+    ).as(B.Num);
+    if (B == Db) assert(neigh_b_num.eql(switch (side) {
+        .left => args.beg_b.meta.prev.unwrap().?,
+        .right => args.end_b.meta.next.unwrap().?,
+    }));
+    const neigh_b = switch (B) {
+        Ib => r.ib_at(neigh_b_num),
+        Db => r.db_at(neigh_b_num),
+        else => unreachable,
+    };
+    const neigh_b_len = neigh_b.get_len();
+    if (neigh_b_len.eql(.max_val)) {
+        // take one from neighbour
+        switch (side) {
+            .left => args.beg_b.push_front(neigh_b.pop()),
+            .right => args.beg_b.push(neigh_b.pop_front()),
+        }
+        assert(neigh_b.get_len()
+            .eql(B.Len.max_val.sub(.coerce(1))));
+        assert(args.beg_b.get_len().eql(.coerce(2)));
+    } else {
+        // add only-child to neighbour
+        switch (side) {
+            .left => neigh_b.push(args.beg_b.pop()),
+            .right => neigh_b.push_front(args.beg_b.pop()),
+        }
+        assert(neigh_b.get_len()
+            .eql(neigh_b_len.sub(.coerce(1))));
+        assert(args.beg_b.get_len().eql(.coerce(0)));
+    }
+
+    const neigh_bytes: TreeSize = .cast(neigh_b.get_subtree_bytes());
+    update_parent_keys(neigh_path, neigh_bytes);
+    return side;
+}
+
+fn delete__destroy_subtree(r: *Rope, num: Ib.Num) void {
+    const Frame = struct {
         ib: *Ib,
         num: Ib.Num,
         len: Ib.Len,
         key_idx: Ib.Len = .coerce(0),
-    }, bounds.indx_blocks_height_max) = .{};
+    };
+    var stack_buf: [bounds.indx_blocks_height_max]Frame = undefined;
+    var stack: std.ArrayList(Frame) = .initBuffer(&stack_buf);
 
     const ib = r.ib_at(num);
     stack.appendAssumeCapacity(.{
@@ -2319,17 +2503,17 @@ pub fn delete__destroy_subtree(r: *Rope, num: Ib.Num) void {
     });
 
     var i: usize = 0;
-    while (stack.len > 0) {
+    while (stack.items.len > 0) {
         if (i >= bounds.indx_blocks_max)
             @panic("reached max iterations. probably a bug.");
         i += 1;
 
-        const frame = &stack.items[stack.len - 1];
+        const frame = &stack.items[stack.items.len - 1];
         assert(frame.key_idx.to_int() <= frame.len.to_int());
 
         if (frame.key_idx.to_int() < frame.len.to_int()) {
-            const child_num = frame.ib.child_at(frame.key_idx);
-            if (stack.len < r.indx_height.to_int()) {
+            const child_num = frame.ib.child_at(.cast(frame.key_idx));
+            if (stack.items.len < r.indx_height.to_int()) {
                 const child_ib = r.ib_at(child_num.as(Ib.Num));
                 stack.appendAssumeCapacity(.{
                     .ib = child_ib,
@@ -2337,14 +2521,14 @@ pub fn delete__destroy_subtree(r: *Rope, num: Ib.Num) void {
                     .len = child_ib.count_keys(),
                 });
             } else {
-                assert(stack.len == r.indx_height.to_int());
+                assert(stack.items.len == r.indx_height.to_int());
                 r.data_blocks.destroy(child_num.as(Db.Num));
             }
             frame.key_idx = frame.key_idx.add(.coerce(1));
         } else {
             assert(frame.key_idx.eql(frame.len));
             r.indx_blocks.destroy(frame.num);
-            stack.pop() orelse unreachable;
+            _ = stack.pop() orelse unreachable;
         }
     }
 }

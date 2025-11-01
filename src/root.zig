@@ -213,6 +213,15 @@ pub fn run(q: *Quil, setup_cb: ?fn (*Quil) Error!void) !void {
 }
 
 fn setup(q: *Quil) !void {
+    {
+        // SPONGE: delete this once we refer to rope outside of just tests
+        const Rope = @import("Rope.zig");
+        var r: Rope = .init(q.alloc);
+        defer r.deinit();
+        try r.insert(.coerce(0), "testing 123");
+        r.delete(.coerce(1), .coerce(3));
+    }
+
     const buf = try q.buf_create("*Scratch*");
     const win = try q.win_create();
     const root = q.get_root_node();

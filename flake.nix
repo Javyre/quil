@@ -11,7 +11,7 @@
     zig.url = "github:mitchellh/zig-overlay";
     zig.inputs.nixpkgs.follows = "nixpkgs";
 
-    zls.url = "github:zigtools/zls?ref=0.15.0";
+    zls.url = "github:zigtools/zls?ref=0.15.1";
     zls.inputs.nixpkgs.follows = "nixpkgs";
     zls.inputs.zig-overlay.follows = "zig";
   };
@@ -36,7 +36,7 @@
           ...
         }:
         let
-          zig = inputs'.zig.packages."0.15.1";
+          zig = inputs'.zig.packages."0.15.2";
           zls = inputs'.zls.packages.zls;
           codelldb-pkgs = inputs'.nixpkgs-codelldb.legacyPackages;
           # zig-llvmPackages = (

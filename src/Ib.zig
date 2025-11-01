@@ -92,6 +92,72 @@ pub fn count_keys(this: *const Ib) Len {
     return .cast(this.keys.len);
 }
 
+// == Generic Block API ==
+pub fn get_len(this: *const Ib) Len {
+    return this.count_keys();
+}
+pub fn set_len(this: *Ib, len: Len) void {
+    for (this.keys[0..len.to_int()]) |k| assert(k != .null);
+    if (!len.eql(.max_val)) this.key_at(.cast(len)).* = .null;
+}
+pub fn get_subtree_bytes(this: *const Ib) RopeBytes {
+    return this.sum_subtree_bytes();
+}
+pub const KeyChild = struct {
+    key: TreeSize,
+    child: RawChild,
+};
+pub fn pop(this: *Ib) KeyChild {
+    const len = this.count_keys();
+    assert(len.to_int() > 0);
+    const last_idx = len.sub(.coerce(1)).to_int();
+    const key = this.keys[last_idx].unwrap().?;
+    const child = this.children[last_idx];
+    this.keys[last_idx] = .null;
+    this.children[last_idx] = undefined;
+    assert(this.get_len().to_int() == last_idx);
+    return .{ .key = key, .child = child };
+}
+pub fn pop_front(this: *Ib) KeyChild {
+    const len = this.count_keys();
+    assert(len.to_int() > 0);
+    const last_idx = len.sub(.coerce(1)).to_int();
+    const key = this.keys[0].unwrap().?;
+    const child = this.children[0];
+    copyForwards(
+        this.slice(.coerce(0), Len.max_val.sub(.coerce(1))),
+        this.slice(.coerce(1), .max_val),
+    );
+    this.keys[last_idx] = .null;
+    this.children[last_idx] = undefined;
+    assert(this.get_len().to_int() == last_idx);
+    return .{ .key = key, .child = child };
+}
+pub fn push(this: *Ib, kc: KeyChild) void {
+    const len = this.count_keys();
+    assert(len.to_int() < Len.max_val.to_int());
+    const s = this.slice(len, .max_val).slice(null, .coerce(1));
+    assert(s.len.eql(.coerce(1)));
+    s.keys()[0] = .some(kc.key);
+    s.children()[0] = kc.child;
+    this.set_len(len.add(.coerce(1)));
+}
+pub fn push_front(this: *Ib, kc: KeyChild) void {
+    const len = this.count_keys();
+    assert(len.to_int() < Len.max_val.to_int());
+    copyBackwards(
+        this.slice(.coerce(1), .max_val),
+        this.slice(.coerce(0), Len.max_val.sub(.coerce(1))),
+    );
+    const s = this.slice(null, .coerce(1));
+    assert(s.len.eql(.coerce(1)));
+    s.keys()[0] = .some(kc.key);
+    s.children()[0] = kc.child;
+    // no need for set_len as we dragged our sentinel in the above copy
+    assert(this.get_len().eql(len.add(.coerce(1))));
+}
+// == END Generic Block API ==
+
 pub fn sum_subtree_bytes(this: *const Ib) RopeBytes {
     var sum: RopeBytes = .coerce(0);
     for (this.keys) |key| {
