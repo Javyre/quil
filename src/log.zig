@@ -3,61 +3,62 @@ const std = @import("std");
 fn log(
     comptime src: std.builtin.SourceLocation,
     comptime level: std.log.Level,
-    comptime scope: @Type(.enum_literal),
+    comptime scope: @EnumLiteral(),
     comptime msg: []const u8,
     fields: anytype,
-) void {
+) !void {
     if (comptime @import("builtin").is_test) {
         if (@intFromEnum(level) > @intFromEnum(std.testing.log_level)) return;
     } else {
         if (comptime !std.log.logEnabled(level, scope)) return;
     }
 
-    const RED = "\x1b[91m";
-    const YELLOW = "\x1b[93m";
-    const GREEN = "\x1b[92m";
-    const MAGENTA = "\x1b[95m";
-    const DIM = "\x1b[2m";
-    const BOLD = "\x1b[1m";
-    const RESET = "\x1b[0m";
+    var buf: [64]u8 = undefined;
+    const term = std.debug.lockStderr(&buf).terminal();
+    defer std.debug.unlockStderr();
 
-    std.debug.print(
-        "{[lvl]s} " ++
-            "{[dim]s}{[scope]s}{[reset]s} " ++
-            "{[bold]s}{[msg]s}{[reset]s}",
-        .{
-            .lvl = switch (level) {
-                .err => BOLD ++ RED ++ "ERRO" ++ RESET,
-                .warn => BOLD ++ YELLOW ++ "WARN" ++ RESET,
-                .info => BOLD ++ GREEN ++ "INFO" ++ RESET,
-                .debug => BOLD ++ MAGENTA ++ "DEBG" ++ RESET,
-            },
-            .scope = @tagName(scope),
-            .msg = msg,
-            .bold = BOLD,
-            .dim = DIM,
-            .reset = RESET,
-        },
-    );
+    try term.setColor(.bold);
+    try term.setColor(switch (level) {
+        .err => .red,
+        .warn => .yellow,
+        .info => .green,
+        .debug => .magenta,
+    });
+    try term.writer.writeAll(switch (level) {
+        .err => "ERRO",
+        .warn => "WARN",
+        .info => "INFO",
+        .debug => "DEBG",
+    });
+    try term.setColor(.reset);
+
+    try term.writer.writeByte(' ');
+    try term.setColor(.dim);
+    try term.writer.writeAll(@tagName(scope));
+    try term.setColor(.reset);
+
+    try term.writer.writeByte(' ');
+    try term.setColor(.bold);
+    try term.writer.writeAll(msg);
+    try term.setColor(.reset);
     inline for (comptime std.meta.fieldNames(@TypeOf(fields))) |field| {
-        std.debug.print(" {[dim]s}{[field]s}={[reset]s}{[val]f}", .{
-            .field = field,
-            .val = std.json.fmt(@field(fields, field), .{}),
-            .dim = DIM,
-            .reset = RESET,
+        try term.setColor(.dim);
+        try term.writer.writeByte(' ');
+        try term.writer.writeAll(field);
+        try term.writer.writeByte('=');
+        try term.setColor(.reset);
+        try term.writer.print("{f}", .{
+            std.json.fmt(@field(fields, field), .{}),
         });
     }
-    std.debug.print(
-        " {[dim]s}src=\"{[file]s}:{[line]d}:{[fn_name]s}\"{[reset]s}",
-        .{
-            .file = src.file,
-            .line = src.line,
-            .fn_name = src.fn_name,
-            .dim = DIM,
-            .reset = RESET,
-        },
-    );
-    std.debug.print("\n", .{});
+    try term.setColor(.dim);
+    try term.writer.print(" src=\"{[file]s}:{[line]d}:{[fn_name]s}\"", .{
+        .file = src.file,
+        .line = src.line,
+        .fn_name = src.fn_name,
+    });
+    try term.setColor(.reset);
+    try term.writer.writeByte('\n');
 }
 
 pub const noop = x: {
@@ -75,7 +76,7 @@ pub const noop = x: {
     break :x .{ .err = f.f, .warn = f.f, .info = f.f, .debug = f.f };
 };
 
-pub fn scoped(comptime scope: @Type(.enum_literal)) type {
+pub fn scoped(comptime scope: @EnumLiteral()) type {
     return struct {
         pub fn err(
             comptime src: std.builtin.SourceLocation,
@@ -83,28 +84,28 @@ pub fn scoped(comptime scope: @Type(.enum_literal)) type {
             fields: anytype,
         ) void {
             @branchHint(.cold);
-            log(src, .err, scope, msg, fields);
+            log(src, .err, scope, msg, fields) catch unreachable;
         }
         pub fn warn(
             comptime src: std.builtin.SourceLocation,
             comptime msg: []const u8,
             fields: anytype,
         ) void {
-            log(src, .warn, scope, msg, fields);
+            log(src, .warn, scope, msg, fields) catch unreachable;
         }
         pub fn info(
             comptime src: std.builtin.SourceLocation,
             comptime msg: []const u8,
             fields: anytype,
         ) void {
-            log(src, .info, scope, msg, fields);
+            log(src, .info, scope, msg, fields) catch unreachable;
         }
         pub fn debug(
             comptime src: std.builtin.SourceLocation,
             comptime msg: []const u8,
             fields: anytype,
         ) void {
-            log(src, .debug, scope, msg, fields);
+            log(src, .debug, scope, msg, fields) catch unreachable;
         }
     };
 }

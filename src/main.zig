@@ -5,9 +5,14 @@ pub const QuilError = error{};
 const Error = QuilError;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa_: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer std.debug.assert(gpa_.deinit() == .ok);
+    const gpa = gpa_.allocator();
+    var rt: std.Io.Threaded = .init(gpa, .{});
+    const io = rt.io();
+
     var q: quil.Quil = undefined;
-    try q.init(gpa.allocator());
+    try q.init(io, gpa);
     defer q.deinit();
 
     try quil.run(&q, setup);

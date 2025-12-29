@@ -12,12 +12,8 @@
 
     .dependencies = .{
         .uucode = .{
-            .url = "git+https://github.com/jacobsandlund/uucode.git#5fde3a6ebf317137068f77a1bd9f7cbd038c2728",
-            .hash = "uucode-0.0.0-ZZjBPt_FPwBRIaIl9_Fe4qy5i2QzTd-L0UouJITObNJs",
-        },
-        .zig_libuv = .{
-            .url = "git+https://github.com/Javyre/zig-libuv.git#34c992d9e22d7062ed77d02b4d8328f93aa9fe0d",
-            .hash = "zig_libuv-0.0.0-yr__lg04FABpwRhLXByuD2UiUjQ1dxUAobu85zrv-p-w",
+            .url = "git+https://github.com/Javyre/uucode.git#074f1df89969465fec0fe2c9a77ca8f37890760b",
+            .hash = "uucode-0.1.0-ZZjBPvxLTQCGyKb4QD2GBHFrtCH2-akwOdQYcym-UFYA",
         },
     },
 }

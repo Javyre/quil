@@ -1,14 +1,14 @@
 const std = @import("std");
-const uv = @import("uv");
 const Render = @import("./Render.zig");
 const BufferManager = @import("./BufferManager.zig");
+const log = @import("./log.zig").scoped(.wm);
 
 const WindowManager = @This();
 
 pub const UCtnrChildIdx = u10;
 pub const ICtnrChildIdx = i11;
 
-alloc: std.mem.Allocator,
+gpa: std.mem.Allocator,
 render: *Render,
 buf_manager: *BufferManager,
 
@@ -72,21 +72,21 @@ pub fn init(
     bm: *BufferManager,
 ) !WindowManager {
     return .{
-        .alloc = alloc,
+        .gpa = alloc,
         .render = r,
         .buf_manager = bm,
-        .node_pool = .init(alloc),
+        .node_pool = .empty,
     };
 }
 
 pub fn deinit(wm: *WindowManager) void {
-    wm.node_pool.deinit();
-    wm.floating_roots.deinit(wm.alloc);
+    wm.node_pool.deinit(wm.gpa);
+    wm.floating_roots.deinit(wm.gpa);
     wm.* = undefined;
 }
 
 pub fn setup(wm: *WindowManager) !void {
-    const root = try wm.node_pool.create();
+    const root = try wm.node_pool.create(wm.gpa);
     wm.main_root = root;
     root.* = .empty_root_ctnr;
 
@@ -189,7 +189,7 @@ fn layout_tiled_ctnr(
     var next_main_coord = main_coord_new;
     var next_child = ctnr.first_child;
     while (next_child) |child| : (next_child = child.next_sibling) {
-        var child_dims: Render.Dimensions = undefined;
+        var child_dims: Render.Dimensions = child.dims;
         var child_pos: Render.Position = undefined;
         const child_main_dim, const child_other_dim, //
         const child_main_coord, const child_other_coord =
@@ -210,8 +210,8 @@ fn layout_tiled_ctnr(
         else
             @divTrunc((child_main_dim.* * main_dim_new), main_dim_old);
 
-        std.debug.assert(child_main_dim.* <= main_dim_new);
-        main_dim_remainder -= child_main_dim.*;
+        std.debug.assert(child_main_dim_new <= main_dim_new);
+        main_dim_remainder -= child_main_dim_new;
 
         const child_main_coord_new = next_main_coord;
         next_main_coord += child_main_dim_new;
@@ -228,7 +228,11 @@ fn layout_tiled_ctnr(
             .new_grid_pos = child_pos,
         });
     }
-    std.debug.assert(main_dim_remainder == 0);
+    log.debug(@src(), "POST ctnr layout", .{
+        .main_dim_remainder = main_dim_remainder,
+    });
+    if (ctnr.first_child) |_|
+        std.debug.assert(main_dim_remainder == 0);
 }
 
 fn layout_tiled_window(
@@ -272,7 +276,7 @@ fn redraw_window(
 }
 
 pub fn win_create(wm: *WindowManager) !*Node {
-    const node = try wm.node_pool.create();
+    const node = try wm.node_pool.create(wm.gpa);
     // at least temporarily it's own tree. until it is inserted
     // somewhere.
     node.* = .empty_root_win;
@@ -280,7 +284,7 @@ pub fn win_create(wm: *WindowManager) !*Node {
 }
 
 pub fn ctnr_create(wm: *WindowManager) !*Node {
-    const node = try wm.node_pool.create();
+    const node = try wm.node_pool.create(wm.gpa);
     // at least temporarily it's own tree. until it is inserted
     // somewhere.
     node.* = .empty_root_ctnr;

@@ -2549,8 +2549,8 @@ pub fn formatString(
     var cursor = r.abs_cursor_at(.coerce(0));
     var reader = cursor.cursor.reader(r, &.{});
     _ = try (reader.reader.streamRemaining(w) catch |e| switch (e) {
-        std.io.Reader.StreamRemainingError.ReadFailed => unreachable,
-        std.io.Reader.StreamRemainingError.WriteFailed => |x| x,
+        std.Io.Reader.StreamRemainingError.ReadFailed => unreachable,
+        std.Io.Reader.StreamRemainingError.WriteFailed => |x| x,
     });
 }
 
@@ -2620,7 +2620,7 @@ pub const Cursor = struct {
     pub const Reader = struct {
         r: *Rope,
         cursor: *Cursor,
-        reader: std.io.Reader,
+        reader: std.Io.Reader,
     };
 
     pub fn reader(c: *Cursor, r: *Rope, buffer: []u8) Reader {
@@ -2645,7 +2645,7 @@ pub const Cursor = struct {
     pub const Writer = struct {
         r: *Rope,
         cursor: *Cursor,
-        writer: std.io.Writer,
+        writer: std.Io.Writer,
     };
     pub fn writer(c: *Cursor, r: *Rope, buffer: []u8) Writer {
         return .{
@@ -2662,16 +2662,16 @@ pub const Cursor = struct {
     }
 
     fn stream(
-        r_: *std.io.Reader,
-        w: *std.io.Writer,
-        limit: std.io.Limit,
-    ) std.io.Reader.StreamError!usize {
+        r_: *std.Io.Reader,
+        w: *std.Io.Writer,
+        limit: std.Io.Limit,
+    ) std.Io.Reader.StreamError!usize {
         const r: *Reader = @fieldParentPtr("reader", r_);
         const c = r.cursor;
         assert(c.ofs.to_int() <= c.db.meta.bytes.to_int());
         if (c.ofs.eql(c.db.meta.bytes)) {
             c.db = r.r.db_at(c.db.meta.next.unwrap() orelse
-                return std.io.Reader.StreamError.EndOfStream);
+                return std.Io.Reader.StreamError.EndOfStream);
             c.ofs = .coerce(0);
         }
 
@@ -2685,10 +2685,10 @@ pub const Cursor = struct {
     }
 
     fn drain(
-        w_: *std.io.Writer,
+        w_: *std.Io.Writer,
         data: []const []const u8,
         splat: usize,
-    ) std.io.Writer.Error!usize {
+    ) std.Io.Writer.Error!usize {
         const w: *Writer = @fieldParentPtr("writer", w_);
 
         if (w.writer.end > 0) {
@@ -2731,13 +2731,13 @@ pub const Cursor = struct {
         this: *Cursor,
         r: *Rope,
         src: []const u8,
-    ) std.io.Writer.Error!usize {
+    ) std.Io.Writer.Error!usize {
         assert(this.ofs.to_int() <= this.db.meta.bytes.to_int());
 
         if (this.ofs.eql(this.db.meta.bytes)) {
             this.db = r.db_at(
                 this.db.meta.next.unwrap() orelse
-                    return std.io.Writer.Error.WriteFailed,
+                    return std.Io.Writer.Error.WriteFailed,
             );
             this.ofs = .coerce(0);
         }

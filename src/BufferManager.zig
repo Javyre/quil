@@ -1,6 +1,4 @@
 const std = @import("std");
-const uv = @import("./uv.zig");
-const c = uv.c;
 const Rope = @import("./Rope.zig");
 
 const MultiArrayPool = @import("./multi_array_pool.zig").MultiArrayPool;
@@ -13,13 +11,13 @@ test {
     _ = Rope;
 }
 
+io: std.Io,
 alloc: std.mem.Allocator,
-loop: *c.uv_loop_t,
 
 buffers: Buffers = .empty,
 
 const Buffer = struct {
-    file: ?std.fs.File = null,
+    file: ?std.Io.File = null,
     lines: Lines = .empty,
     name: []const u8,
 
@@ -28,10 +26,10 @@ const Buffer = struct {
 const Buffers = MultiArrayPool(Buffer);
 pub const BufferNum = Buffers.Idx;
 
-pub fn init(alloc: std.mem.Allocator, loop: *c.uv_loop_t) !BufferManager {
+pub fn init(io: std.Io, alloc: std.mem.Allocator) !BufferManager {
     return .{
+        .io = io,
         .alloc = alloc,
-        .loop = loop,
     };
 }
 

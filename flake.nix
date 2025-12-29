@@ -11,7 +11,10 @@
     zig.url = "github:mitchellh/zig-overlay";
     zig.inputs.nixpkgs.follows = "nixpkgs";
 
-    zls.url = "github:zigtools/zls?ref=0.15.1";
+    zig-src.url = "github:Javyre/nix-zig-build";
+    zig-src.inputs.nixpkgs.follows = "nixpkgs";
+
+    zls.url = "github:zigtools/zls";
     zls.inputs.nixpkgs.follows = "nixpkgs";
     zls.inputs.zig-overlay.follows = "zig";
   };
@@ -36,7 +39,16 @@
           ...
         }:
         let
-          zig = inputs'.zig.packages."0.15.2";
+          # zig = inputs'.zig.packages.master;
+          zig = inputs'.zig-src.packages.zig.override {
+            release = {
+              version = "0.16.0-dev.1658+698499215";
+              src = {
+                rev = "6984992153f0656b04c39279f9684fd5a06e952d";
+                hash = "sha256-+DVBImzap0PzcYfTN0/z3+lYLDOzRcNzKRvC2R2/ucE=";
+              };
+            };
+          };
           zls = inputs'.zls.packages.zls;
           codelldb-pkgs = inputs'.nixpkgs-codelldb.legacyPackages;
           # zig-llvmPackages = (

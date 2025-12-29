@@ -1,5 +1,6 @@
 const std = @import("std");
 const assert = std.debug.assert;
+const SegmentedList = @import("segmented_list.zig").SegmentedList;
 const RangedInt = @import("ranged_int.zig").RangedInt;
 const log = @import("./log.zig").scoped(.segmented_pool);
 
@@ -25,7 +26,7 @@ pub fn SegmentedPool(
         };
         const NodePtr = *align(@alignOf(Item)) Node;
 
-        segm_list: std.SegmentedList(Item, prealloc_item_count.to_int()) = .{},
+        segm_list: SegmentedList(Item, prealloc_item_count.to_int()) = .{},
         free_list: ?Num = null,
         // For leak detection
         len: if (is_debug) Num else void = if (is_debug) Num.coerce(0) else {},

@@ -1,24 +1,19 @@
 const std = @import("std");
 const uucode = @import("uucode");
 
-const uv = @import("./uv.zig");
-const c = uv.c;
 const MultiArrayPool = @import("./multi_array_pool.zig").MultiArrayPool;
 const EgcPool = @import("./EGCPool.zig");
 
 const assert = std.debug.assert;
-const upgrade_baton = uv.upgrade_baton;
-const downgrade_baton = uv.downgrade_baton;
 
 const Render = @This();
 
+io: std.Io,
 alloc: std.mem.Allocator,
-loop: *c.uv_loop_t,
-write_reqs: WriteReqPool,
 
 is_alive: bool = false,
-stdin: Tty = undefined,
-stdout: Tty = undefined,
+stdin: std.Io.File = undefined,
+stdout: std.Io.File = undefined,
 
 egc_pool: EgcPool = .empty,
 grids: Grids = .empty,
@@ -48,18 +43,18 @@ const Color = packed struct {
 };
 
 pub const Dimensions = struct {
-    w: u32,
-    h: u32,
+    w: u16,
+    h: u16,
     pub const zero: Dimensions = .{ .w = 0, .h = 0 };
-    pub fn to_vec(dims: Dimensions) @Vector(2, u32) {
+    pub fn to_vec(dims: Dimensions) @Vector(2, u16) {
         return .{ dims.w, dims.h };
     }
 };
 pub const Position = struct {
-    x: u32,
-    y: u32,
+    x: u16,
+    y: u16,
     pub const zero: Position = .{ .x = 0, .y = 0 };
-    pub fn to_vec(pos: Position) @Vector(2, u32) {
+    pub fn to_vec(pos: Position) @Vector(2, u16) {
         return .{ pos.x, pos.y };
     }
 
@@ -80,10 +75,10 @@ pub const Position = struct {
 };
 
 pub const Rectangle = struct {
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
     pub fn from_pos_dims(pos: Position, dims: Dimensions) Rectangle {
         return .{
             .x = pos.x,
@@ -251,9 +246,9 @@ const BitMap = struct {
 
         /// Returns the viewport x coord of the next set bit, or null if there
         /// are no more set bits in the row.
-        pub fn find_next_set_in_row(view: View, start_x: u32, row_y: u32) ?struct {
-            x: u32,
-            count: u32,
+        pub fn find_next_set_in_row(view: View, start_x: u16, row_y: u16) ?struct {
+            x: u16,
+            count: u16,
         } {
             view.assert_valid();
             std.debug.assert(row_y < view.bm_dims.h);
@@ -271,8 +266,8 @@ const BitMap = struct {
                 true,
                 native_endian,
             )) |bit_ofs| .{
-                .x = @as(u32, @intCast(bit_ofs)) + start_x,
-                .count = @as(u32, @intCast(first_set_bit(
+                .x = @as(u16, @intCast(bit_ofs)) + start_x,
+                .count = @as(u16, @intCast(first_set_bit(
                     view.bm,
                     base_bit_ofs + bit_ofs,
                     bit_len - bit_ofs,
@@ -302,7 +297,7 @@ const BitMap = struct {
         dest.assert_valid();
 
         for (0..dest.vp_dims.h) |vp_y| {
-            var vp_x: u32 = 0;
+            var vp_x: u16 = 0;
             const VEC_BITS = @bitSizeOf(Word);
             while (vp_x < dest.vp_dims.w) : (vp_x += VEC_BITS) {
                 var words: [N]Word = undefined;
@@ -672,143 +667,152 @@ const BitMap = struct {
     }
 };
 
-const Tty = extern struct {
-    raw_handle: uv.c.uv_tty_t,
-    r: *Render,
-
-    pub fn handle(t: *Tty) *c.uv_tty_t {
-        return downgrade_baton(t, c.uv_tty_t);
-    }
-
-    pub fn fromHandle(t: *c.uv_tty_t) *Tty {
-        return upgrade_baton(t, Tty);
-    }
-};
-
-const WriteReqPool = std.heap.MemoryPool(WriteReq);
-const WriteReq = extern struct {
-    req: uv.c.uv_write_t,
-    r: *Render,
-    buf: [128]u8,
-    overflow_buf: extern struct { ptr: [*]u8, len: u32 },
-};
-
-pub fn init(alloc: std.mem.Allocator, loop: *c.uv_loop_t) !Render {
+pub fn init(io: std.Io, alloc: std.mem.Allocator) !Render {
     return .{
+        .io = io,
         .alloc = alloc,
-        .loop = loop,
-        .write_reqs = .init(alloc),
     };
 }
 pub fn deinit(r: *Render) void {
     r.flush_overdraw_bm.deinit(r.alloc);
     r.flush_requdraw_bm.deinit(r.alloc);
     r.egc_pool.deinit(r.alloc);
-    r.write_reqs.deinit();
+
+    const surfaces_slice = r.surfaces.slice();
+    for (surfaces_slice.items(.cell_dirt)) |*cd| cd.deinit(r.alloc);
     r.surfaces.deinit(r.alloc);
+
+    // TODO: need to figure out a pattern for destroying
+    // multiarraypools without deinit'ing destroyed elems
+    const grids_slice = r.grids.slice();
+    for (grids_slice.items(.cell_char)) |*cc| cc.deinit(r.alloc);
+    for (grids_slice.items(.cell_bg)) |*cb| cb.deinit(r.alloc);
+    for (grids_slice.items(.cell_fg)) |*cf| cf.deinit(r.alloc);
+
+    r.grids.deinit(r.alloc);
     r.stack.deinit(r.alloc);
     r.* = undefined;
 }
 
-pub fn setup(r: *Render) !void {
-    if (c.uv_guess_handle(0) != c.UV_TTY)
-        return error.StdInNotATty;
-    if (c.uv_guess_handle(1) != c.UV_TTY)
-        return error.StdOutNotATty;
+fn tty_name_r(fd: std.posix.fd_t, buf: []u8) ![]u8 {
+    // prefer either using std version of ttyname or implementing one once
+    // std.Io.File.stat provides device ids so we can do the /dev/ scan
+    // ourselves
+    const c = struct {
+        extern "c" fn ttyname_r(fd: std.posix.fd_t, name: [*]u8, size: usize) c_int;
+    };
+    return switch (std.posix.errno(
+        c.ttyname_r(fd, buf.ptr, buf.len),
+    )) {
+        .SUCCESS => std.mem.sliceTo(buf, 0),
+        .BADF => error.BadFileDescriptor,
+        .NODEV => error.NoDevice,
+        .NOTTY => error.NotATty,
+        // our buffer was too small
+        .RANGE => error.OutOfMemory,
+        else => |err| std.posix.unexpectedErrno(err),
+    };
+}
 
-    r.stdin.r = r;
-    r.stdout.r = r;
-    try uv.unwrapErr(c.uv_tty_init(
-        r.loop,
-        r.stdin.handle(),
-        std.posix.STDIN_FILENO,
-        0,
-    ));
-    try uv.unwrapErr(uv.c.uv_tty_init(
-        r.loop,
-        r.stdout.handle(),
-        std.posix.STDOUT_FILENO,
-        0,
-    ));
+fn tty_attrs_set_raw_input(attrs: *std.posix.termios) void {
+    // terminal input control
+    attrs.iflag.BRKINT = false; // ign. BREAK condition
+    attrs.iflag.ICRNL = false; // map CR to NL
+    attrs.iflag.INPCK = false; // input parity check
+    attrs.iflag.ISTRIP = false; // strip 8th bit off chars
+    attrs.iflag.IXON = false; // output flow control
+    // terminal hardware control
+    attrs.cflag.CSIZE = .CS8; // 8bit char size mask
+    // local mode / function control
+    attrs.lflag.ECHO = false; // input char echoed to terminal
+    attrs.lflag.ICANON = false; // canonicalize input lines
+    attrs.lflag.IEXTEN = false; // terminal functions from input data
+    attrs.lflag.ISIG = false; // signals for INTR, QUIT, [D]SUSP
+    // special control characters
+    // input availability conditions
+    attrs.cc[@intFromEnum(std.posix.V.MIN)] = 1; // min buffered chars
+    attrs.cc[@intFromEnum(std.posix.V.TIME)] = 0; // min timeout
+}
+fn tty_attrs_set_raw_output(attrs: *std.posix.termios) void {
+    // terminal output control
+    attrs.oflag.ONLCR = true; // map NL to CR-NL
+    // terminal hardware control
+    attrs.cflag.CSIZE = .CS8; // 8bit char size mask
+}
+
+pub fn setup(r: *Render) !void {
+    const inaive = std.Io.File.stdin();
+    const onaive = std.Io.File.stdout();
+
+    var idev_buf: [128]u8 = @splat(0);
+    const idev = if (try inaive.isTty(r.io))
+        try tty_name_r(inaive.handle, &idev_buf)
+    else
+        null;
+
+    var odev_buf: [128]u8 = @splat(0);
+    const odev = if (try onaive.isTty(r.io))
+        try tty_name_r(onaive.handle, &odev_buf)
+    else
+        null;
+
+    if (idev != null and odev != null and
+        std.mem.eql(u8, idev.?, odev.?))
+    {
+        const tty = try std.Io.Dir.openFileAbsolute(r.io, odev.?, .{
+            .mode = .read_write,
+        });
+        // WARN: there is an inherent TOCTOU race here as we don't lock
+        //       termios/tcattrs on the device
+        var attrs = try std.posix.tcgetattr(tty.handle);
+        tty_attrs_set_raw_input(&attrs);
+        tty_attrs_set_raw_output(&attrs);
+        try std.posix.tcsetattr(tty.handle, .DRAIN, attrs);
+        r.stdout = tty;
+        r.stdin = r.stdout;
+    } else {
+        r.stdin = inaive;
+        r.stdout = onaive;
+
+        if (idev) |idev_| {
+            const tty = try std.Io.Dir.openFileAbsolute(r.io, idev_, .{
+                .mode = .read_only,
+            });
+            var attrs = try std.posix.tcgetattr(tty.handle);
+            tty_attrs_set_raw_input(&attrs);
+            try std.posix.tcsetattr(tty.handle, .DRAIN, attrs);
+            r.stdin = tty;
+        }
+        if (odev) |odev_| {
+            const tty = try std.Io.Dir.openFileAbsolute(r.io, odev_, .{
+                .mode = .write_only,
+            });
+            var attrs = try std.posix.tcgetattr(tty.handle);
+            tty_attrs_set_raw_output(&attrs);
+            try std.posix.tcsetattr(tty.handle, .DRAIN, attrs);
+            r.stdout = tty;
+        }
+    }
+
     r.is_alive = true;
 
-    try uv.unwrapErr(c.uv_tty_set_mode(r.stdout.handle(), c.UV_TTY_MODE_RAW));
-
     // enter alternate screen mode
-    try r.write(try r.write_req_create(), &.{
-        uv.bufFromSlice("\x1B[?1049h"),
-    }, struct {
-        fn cb(req: *WriteReq, status: i32) void {
-            uv.unwrapErr(status) catch unreachable;
-            req.r.write_req_destroy(req);
-        }
-    }.cb);
-
-    // start handling input
-    const cbs = struct {
-        fn alloc_cb(
-            h: [*c]c.uv_handle_t,
-            size: usize,
-            buf: [*c]c.uv_buf_t,
-        ) callconv(.c) void {
-            const r_ = Tty.fromHandle(@ptrCast(h)).r;
-            if (r_.alloc.alloc(u8, size)) |slice| {
-                buf.* = uv.bufFromSlice(slice);
-            } else |e| switch (e) {
-                error.OutOfMemory => {
-                    // libuv interprests this as an error
-                    buf.* = .{ .base = null, .len = 0 };
-                },
-            }
-        }
-        fn read_cb(
-            h: [*c]c.uv_stream_t,
-            nread: isize,
-            buf_: [*c]const c.uv_buf_t,
-        ) callconv(.c) void {
-            uv.unwrapErr(@intCast(nread)) catch |e| switch (e) {
-                error.EOF => {
-                    c.uv_stop(h.*.loop);
-                    return;
-                },
-
-                // NOTE: actually unreachable.
-                // Not other errors documented as possible.
-                else => unreachable,
-            };
-
-            const r_ = Tty.fromHandle(@ptrCast(h)).r;
-            const buf = uv.sliceFromBuf(buf_.*);
-            if (nread > 0 and buf.len > 0) {
-                r_.handle_input(buf) catch unreachable;
-            }
-            r_.alloc.free(buf);
-        }
-    };
-    try uv.unwrapErr(c.uv_read_start(
-        @ptrCast(r.stdin.handle()),
-        cbs.alloc_cb,
-        cbs.read_cb,
-    ));
+    try r.stdout.writeStreamingAll(r.io, "\x1B[?1049h");
 }
 pub fn teardown(r: *Render) !void {
     std.debug.assert(r.is_alive);
 
     // leave alternate screen mode
-    try r.write(try r.write_req_create(), &.{
-        uv.bufFromSlice("\x1B[?1049l"),
-    }, struct {
-        fn cb(req: *WriteReq, status: i32) void {
-            uv.unwrapErr(status) catch unreachable;
-            req.r.write_req_destroy(req);
-        }
-    }.cb);
+    try r.stdout.writeStreamingAll(r.io, "\x1B[?1049l");
 
-    try uv.unwrapErr(c.uv_tty_reset_mode());
+    // TODO: unset raw mode for stdout
+    //       what libuv does is save the orig termios state pre-raw mode and
+    //       restore it
+    // try uv.unwrapErr(c.uv_tty_reset_mode());
 
-    _ = c.uv_read_stop(@ptrCast(r.stdin.handle()));
-    c.uv_close(@ptrCast(r.stdin.handle()), null);
-    c.uv_close(@ptrCast(r.stdout.handle()), null);
+    r.stdin.close(r.io);
+    if (r.stdout.handle != r.stdin.handle)
+        r.stdout.close(r.io);
     r.is_alive = false;
 }
 
@@ -1100,9 +1104,9 @@ const GridView = struct {
         assert(std.meta.eql(src.vp_dims, mask.vp_dims));
 
         for (0..src.vp_dims.h) |y_| {
-            const y: u32 = @intCast(y_);
+            const y: u16 = @intCast(y_);
 
-            var start_x: u32 = 0;
+            var start_x: u16 = 0;
             while (mask.find_next_set_in_row(start_x, y)) |found| {
                 assert(found.count > 0);
                 assert(found.x < mask.vp_dims.w);
@@ -1179,13 +1183,15 @@ fn grid_direct_draw(r: *Render, grid: Grid, mask: BitMap.View) !void {
     mask.assert_valid();
     assert(std.meta.eql(grid.dims, mask.vp_dims));
 
-    var blit_req = try r.write_req_create();
-    var alloc_writer: std.Io.Writer.Allocating = .init(r.alloc);
-    var of_writer: OverflowingWriter = .init(
-        &blit_req.buf,
-        &alloc_writer.writer,
-    );
-    const writer = &of_writer.writer;
+    var buf: [1024]u8 = undefined;
+    var writer_ = r.stdout.writerStreaming(r.io, &buf);
+    const writer = &writer_.interface;
+    defer writer.flush() catch unreachable;
+    // TODO: what to do with cancellations?
+    //       currently turns into generic `WriteFailed`
+    // errdefer if (writer_.err) |e| switch (e) {
+    //     std.Io.Cancelable.Canceled =>
+    // };
 
     var current_cursor: ?struct {
         pos: Position,
@@ -1193,15 +1199,15 @@ fn grid_direct_draw(r: *Render, grid: Grid, mask: BitMap.View) !void {
         cell_fg: Color,
     } = null;
     for (0..grid.dims.h) |y_| {
-        const y: u32 = @intCast(y_);
+        const y: u16 = @intCast(y_);
 
-        var start_x: u32 = 0;
+        var start_x: u16 = 0;
         while (mask.find_next_set_in_row(start_x, y)) |found| {
             assert(found.count > 0);
             assert(found.x + found.count <= grid.dims.w);
 
             for (found.x..(found.x + found.count)) |x_| {
-                const x: u32 = @intCast(x_);
+                const x: u16 = @intCast(x_);
 
                 const i = grid.dims.w * y + x;
                 const cell_bg = grid.cell_bg.items[i];
@@ -1268,72 +1274,23 @@ fn grid_direct_draw(r: *Render, grid: Grid, mask: BitMap.View) !void {
             start_x = found.x + found.count;
         }
     }
-
-    const of_list = alloc_writer.toArrayList();
-    const of_buf = of_list.allocatedSlice();
-    blit_req.overflow_buf = .{
-        .ptr = of_buf.ptr,
-        .len = @intCast(of_buf.len),
-    };
-
-    try r.write(blit_req, &.{
-        uv.bufFromSlice(of_writer.writer.buffered()),
-        uv.bufFromSlice(of_list.items),
-    }, struct {
-        fn cb(req: *WriteReq, status: i32) void {
-            uv.unwrapErr(status) catch unreachable;
-            req.r.alloc.free(req.overflow_buf.ptr[0..req.overflow_buf.len]);
-            req.r.write_req_destroy(req);
-        }
-    }.cb);
-}
-
-fn write_req_create(r: *Render) !*WriteReq {
-    const req = try r.write_reqs.create();
-    req.r = r;
-    return req;
-}
-
-fn write_req_destroy(r: *Render, req: *WriteReq) void {
-    r.write_reqs.destroy(req);
-}
-
-fn write(
-    r: *Render,
-    req: *WriteReq,
-    bufs: []const c.uv_buf_t,
-    comptime cb: fn (req: *WriteReq, status: i32) void,
-) !void {
-    try uv.unwrapErr(c.uv_write(
-        downgrade_baton(req, c.uv_write_t),
-        @ptrCast(r.stdout.handle()),
-        bufs.ptr,
-        @intCast(bufs.len),
-        struct {
-            fn cb_(cbreq: [*c]c.uv_write_t, status: c_int) callconv(.c) void {
-                @call(.always_inline, cb, .{
-                    upgrade_baton(cbreq, WriteReq),
-                    status,
-                });
-            }
-        }.cb_,
-    ));
 }
 
 pub fn tty_get_dimensions(r: *Render) !Dimensions {
-    var c_w: c_int = undefined;
-    var c_h: c_int = undefined;
-
-    try uv.unwrapErr(c.uv_tty_get_winsize(&r.stdin.raw_handle, &c_w, &c_h));
-    return .{
-        .w = @intCast(c_w),
-        .h = @intCast(c_h),
+    var winsize: std.posix.winsize = .{
+        .row = 0,
+        .col = 0,
+        .xpixel = 0,
+        .ypixel = 0,
     };
-}
 
-fn handle_input(r: *Render, buf: []const u8) !void {
-    _ = r;
-    _ = buf;
+    if (std.posix.errno(
+        std.posix.system.ioctl(r.stdout.handle, std.posix.T.IOCGWINSZ, @intFromPtr(&winsize)),
+    ) == .SUCCESS) {}
+    return .{
+        .w = winsize.col,
+        .h = winsize.row,
+    };
 }
 
 pub fn grid_create(r: *Render) !GridNum {
@@ -1481,7 +1438,7 @@ pub fn surface_draw_utf8(
 
     // // ASCII fast path
     // if (zg.ascii.isAsciiOnly(text)) {
-    //     var cell_count: u32 = 0;
+    //     var cell_count: u16 = 0;
     //     for (text) |char| {
     //         // is ASCII
     //         std.debug.assert(char < 128);
@@ -1500,9 +1457,10 @@ pub fn surface_draw_utf8(
     //     return;
     // }
 
-    var cell_count: u32 = 0;
-    var gc_it = iter_graphemes(text);
-    while (gc_it.next()) |gc| {
+    var cell_count: u16 = 0;
+    var gc_it = uucode.grapheme.utf8Iterator(text);
+    while (nextGrapheme(&gc_it)) |gc_info| {
+        const gc = text[gc_info.start..gc_info.end];
         std.debug.assert(gc.len != 0);
         std.debug.assert(pos.x < g_dims.w);
 
@@ -1518,7 +1476,8 @@ pub fn surface_draw_utf8(
             cell_count += 1;
         } else {
             const ecg_idx = try r.egc_pool.register_grapheme(r.alloc, gc);
-            const width = grapheme_width(gc);
+            // const width = grapheme_width(gc);
+            const width = gc_info.wcwidth;
 
             const max_x = @min(s_dims.w, pos.x + width);
             {
@@ -1542,6 +1501,31 @@ pub fn surface_draw_utf8(
     s_cell_dirt_bm.set_rect(.from_pos_dims(pos_, .{ .h = 1, .w = cell_count }), 1);
     s_dirt.* = .partial;
     r.surfaces_dirty = true;
+}
+
+fn nextGrapheme(iter: *uucode.grapheme.Iterator(uucode.utf8.Iterator)) ?struct {
+    start: usize,
+    end: usize,
+    wcwidth: usize,
+} {
+    const start = iter.i;
+    const width = uucode.x.grapheme.wcwidthNext(iter);
+    const end = iter.i;
+
+    // HACK: wcwidthNext() should rly just return an optional
+    // also this doesn't strictly follow the same semantic of "next"
+    // as grapheme.Iterator.nextGrapheme as is counts invalid tail bytes even
+    // if they don't end in a break;
+    if (start == end) {
+        assert(width == 0);
+        return null;
+    }
+
+    return .{
+        .start = start,
+        .end = end,
+        .wcwidth = width,
+    };
 }
 
 const SurfaceGridInfo = struct {
@@ -1568,33 +1552,6 @@ fn ascii_char_is_invisible(char: u8) bool {
     return char < 32 or char == 127;
 }
 
-const GraphemeIter = struct {
-    cp_iter: uucode.utf8.Iterator,
-
-    fn next(it: *GraphemeIter) ?[]const u8 {
-        const start = it.cp_iter.i;
-        var cp_1 = it.cp_iter.next() orelse return null;
-
-        var cp_2_start = it.cp_iter.i;
-        var state: uucode.grapheme.BreakState = .default;
-        while (it.cp_iter.next()) |cp_2| {
-            if (uucode.grapheme.isBreak(cp_1, cp_2, &state)) {
-                // un-next() cp_2 back into the iterator
-                it.cp_iter.i = cp_2_start;
-                return it.cp_iter.bytes[start..it.cp_iter.i];
-            }
-            cp_1 = cp_2;
-            cp_2_start = it.cp_iter.i;
-        } else {
-            // end of string
-            return it.cp_iter.bytes[start..];
-        }
-    }
-};
-fn iter_graphemes(bytes: []const u8) GraphemeIter {
-    return .{ .cp_iter = .init(bytes) };
-}
-
 // TODO: query for mode 2027 support so we know how terminal handles
 // multi-codepoint grapheme clusters. (wcwidth vs. proper clustering)
 // https://mitchellh.com/writing/grapheme-clusters-in-terminals
@@ -1611,7 +1568,9 @@ fn grapheme_width(
     var gc_width: u2 = 0;
 
     while (cp_iter.next()) |cp| {
-        const w: i3 = uucode.get(.wcwidth, cp);
+        // COMBAK
+        // SPONGE: use new uucode api for iterator based wcwidth
+        const w: i3 = uucode.get(.wcwidth_standalone, cp);
 
         if (w >= 0) {
             // Only adding width of first non-zero-width code point.

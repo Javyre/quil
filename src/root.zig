@@ -1,11 +1,11 @@
 const std = @import("std");
 
-const uv = @import("./uv.zig");
-const c = uv.c;
 const MultiArrayPool = @import("./multi_array_pool.zig").MultiArrayPool;
 const Render = @import("./Render.zig");
 const WindowManager = @import("./WindowManager.zig");
 const BufferManager = @import("./BufferManager.zig");
+pub const logger = @import("./log.zig");
+const log = logger.scoped(.quil);
 
 const BufferNum = BufferManager.BufferNum;
 pub const Node = WindowManager.Node;
@@ -14,9 +14,6 @@ const ICtnrChildIdx = WindowManager.ICtnrChildIdx;
 test {
     std.testing.refAllDecls(@This());
 }
-
-const upgrade_baton = uv.upgrade_baton;
-const downgrade_baton = uv.downgrade_baton;
 
 const Error = if (std.meta.fieldIndex(@import("root"), "QuilError")) |_|
     @import("root").QuilError
@@ -32,40 +29,26 @@ const Command = struct {
 const Commands = MultiArrayPool(Command);
 
 pub const Quil = struct {
+    io: std.Io,
     alloc: std.mem.Allocator,
-    loop: *c.uv_loop_t,
     cmds: Commands = .empty,
     render: Render,
     win_manager: WindowManager,
     buf_manager: BufferManager,
     is_alive: bool = false,
 
-    pub fn init(q: *Quil, alloc: std.mem.Allocator) !void {
-        const loop = try alloc.create(c.uv_loop_t);
-        try uv.unwrapErr(c.uv_loop_init(loop));
-
+    pub fn init(q: *Quil, io: std.Io, alloc: std.mem.Allocator) !void {
         q.* = Quil{
+            .io = io,
             .alloc = alloc,
-            .loop = loop,
-            .render = try .init(alloc, loop),
-            .buf_manager = try .init(alloc, loop),
+            .render = try .init(io, alloc),
+            .buf_manager = try .init(io, alloc),
             .win_manager = try .init(alloc, &q.render, &q.buf_manager),
         };
     }
 
     pub fn deinit(q: *Quil) void {
         std.debug.assert(!q.is_alive);
-
-        c.uv_walk(q.loop, struct {
-            fn cb(handle: ?*c.uv_handle_t, _: ?*anyopaque) callconv(.c) void {
-                std.debug.panic(
-                    "Handle `{s}` still open on shutdown! This is a bug.\n",
-                    .{c.uv_handle_type_name(handle.?.type)},
-                );
-            }
-        }.cb, null);
-        uv.unwrapErr(c.uv_loop_close(q.loop)) catch unreachable;
-        q.alloc.destroy(q.loop);
 
         q.render.deinit();
         q.buf_manager.deinit();
@@ -135,12 +118,6 @@ pub fn run(q: *Quil, setup_cb: ?fn (*Quil) Error!void) !void {
     q.is_alive = true;
     defer q.is_alive = false;
 
-    // drive teardown requests.
-    defer {
-        const active_reqs_p = c.uv_run(q.loop, c.UV_RUN_DEFAULT);
-        uv.unwrapErr(active_reqs_p) catch unreachable;
-    }
-
     // Setup Renderer
     try q.render.setup();
     defer q.render.teardown() catch unreachable;
@@ -154,42 +131,42 @@ pub fn run(q: *Quil, setup_cb: ?fn (*Quil) Error!void) !void {
     defer q.win_manager.teardown() catch unreachable;
 
     // Handle Signals for graceful shutdown
-
-    const SigHandle = extern struct {
-        raw_handle: c.uv_signal_t = undefined,
-        q: *Quil,
+    const Static = struct {
+        // TODO: consider just having a static *Quil instead.
+        var io: ?std.Io = null;
+        var shutdown: std.Io.Event = .unset;
     };
-    var sigint_handle: SigHandle = .{ .q = q };
-    var sighup_handle: SigHandle = .{ .q = q };
-    const sigint_raw_handle = downgrade_baton(&sigint_handle, c.uv_signal_t);
-    const sighup_raw_handle = downgrade_baton(&sighup_handle, c.uv_signal_t);
-
-    const handle_signal = struct {
-        fn handler(raw_handle: ?*c.uv_signal_t, signum: c_int) callconv(.c) void {
-            const handle = upgrade_baton(raw_handle.?, SigHandle);
-
-            switch (signum) {
-                c.SIGINT, c.SIGHUP => c.uv_stop(handle.q.loop),
-                // we haven't listened for any other signums
-                else => unreachable,
+    Static.io = q.io;
+    defer Static.io = null;
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = struct {
+            fn handler(sig: std.posix.SIG) callconv(.c) void {
+                log.debug(@src(), "received shutdown signal", .{ .sig = sig });
+                Static.shutdown.set(Static.io.?);
             }
-        }
-    }.handler;
-
-    inline for (.{
-        .{ sighup_raw_handle, c.SIGHUP },
-        .{ sigint_raw_handle, c.SIGINT },
-    }) |sig| {
-        try uv.unwrapErr(c.uv_signal_init(q.loop, sig[0]));
-        try uv.unwrapErr(
-            c.uv_signal_start(sig[0], handle_signal, sig[1]),
-        );
-    }
+        }.handler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    var old_hup_act: std.posix.Sigaction = undefined;
+    var old_term_act: std.posix.Sigaction = undefined;
+    std.posix.sigaction(.HUP, &act, &old_hup_act);
+    std.posix.sigaction(.TERM, &act, &old_term_act);
     defer {
-        inline for (.{ sigint_raw_handle, sighup_raw_handle }) |raw_handle| {
-            std.debug.assert(c.uv_is_closing(@ptrCast(raw_handle)) == 0);
-            c.uv_close(@ptrCast(raw_handle), null);
-        }
+        var old_hup_act2: std.posix.Sigaction = undefined;
+        var old_term_act2: std.posix.Sigaction = undefined;
+        std.posix.sigaction(.HUP, &old_hup_act, &old_hup_act2);
+        std.posix.sigaction(.TERM, &old_term_act, &old_term_act2);
+        std.debug.assert(std.mem.eql(
+            u8,
+            std.mem.asBytes(&old_hup_act2),
+            std.mem.asBytes(&act),
+        ));
+        std.debug.assert(std.mem.eql(
+            u8,
+            std.mem.asBytes(&old_term_act2),
+            std.mem.asBytes(&act),
+        ));
     }
 
     try setup(q);
@@ -204,12 +181,40 @@ pub fn run(q: *Quil, setup_cb: ?fn (*Quil) Error!void) !void {
     }
     try q.render.flush();
 
-    // Run Main Loop
+    // Run Input Loop
+    var shutdown_fut = try q.io.concurrent(
+        std.Io.Event.wait,
+        .{ &Static.shutdown, q.io },
+    );
+    defer shutdown_fut.cancel(q.io) catch |e| switch (e) {
+        error.Canceled => {},
+    };
 
-    const active_reqs_p = c.uv_run(q.loop, c.UV_RUN_DEFAULT);
-    try uv.unwrapErr(active_reqs_p);
-    // _ = active_reqs_p; // we should probably log if this is nonzero
-    // Teardown defers run here after loop.stop()
+    var input_fut = q.io.async(input_loop, .{q});
+    defer input_fut.cancel(q.io) catch |e| switch (e) {
+        error.Canceled => {},
+        else => unreachable,
+    };
+
+    switch (try q.io.select(.{
+        .shutdown = &shutdown_fut,
+        .input = &input_fut,
+    })) {
+        .shutdown => {},
+        .input => log.err(@src(), "shutting down due to EOF", .{}),
+    }
+}
+
+fn input_loop(q: *Quil) !void {
+    var input_buf: [128]u8 = undefined;
+    var input_reader = q.render.stdin.readerStreaming(q.io, &input_buf);
+    while (input_reader.interface.takeByte() catch |e| switch (e) {
+        std.Io.Reader.Error.EndOfStream => null,
+        std.Io.Reader.Error.ReadFailed => return input_reader.err.?,
+    }) |byte| {
+        log.debug(@src(), "input", .{ .byte = &[_]u8{byte} });
+    }
+    log.debug(@src(), "EOF", .{});
 }
 
 fn setup(q: *Quil) !void {
@@ -230,9 +235,9 @@ fn setup(q: *Quil) !void {
 
     try q.ctnr_insert(root, win, 0);
     try q.win_set_buf(win, buf);
-    try q.buf_set_region(buf, 0, -1,
-        \\
-        \\// Scratch zig buffer
-        \\
-    );
+    // try q.buf_set_region(buf, 0, -1,
+    //     \\
+    //     \\// Scratch zig buffer
+    //     \\
+    // );
 }
