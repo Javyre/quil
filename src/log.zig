@@ -8,7 +8,10 @@ fn log(
     fields: anytype,
 ) !void {
     if (comptime @import("builtin").is_test) {
-        if (@intFromEnum(level) > @intFromEnum(std.testing.log_level)) return;
+        if (!test_log_enabled(level, scope)) {
+            @branchHint(.likely);
+            return;
+        }
     } else {
         if (comptime !std.log.logEnabled(level, scope)) return;
     }
@@ -108,4 +111,31 @@ pub fn scoped(comptime scope: @EnumLiteral()) type {
             log(src, .debug, scope, msg, fields) catch unreachable;
         }
     };
+}
+
+// HACK: we define our own copy of levels as the std version isn't usable with
+//       the default test runner.
+pub var testing_scope_levels: []const RuntimeScopeLevel = &.{};
+pub const RuntimeScopeLevel = struct {
+    scope: RuntimeScope,
+    level: std.log.Level,
+};
+pub const RuntimeScope = enum {
+    quil,
+    rope,
+    rope_test,
+    segmented_pool,
+    fuzz,
+};
+pub const testing_level = &std.testing.log_level;
+fn test_log_enabled(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+) bool {
+    for (testing_scope_levels) |scope_level| {
+        if (scope_level.scope == @as(RuntimeScope, scope)) {
+            return @intFromEnum(level) <= @intFromEnum(scope_level.level);
+        }
+    }
+    return @intFromEnum(level) <= @intFromEnum(std.testing.log_level);
 }

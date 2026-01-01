@@ -202,14 +202,29 @@ pub fn shr(this: *Db, ofs: Idx, amt_: Len) void {
     );
 }
 
-pub fn format(
-    this: *const Db,
-    w: *std.Io.Writer,
-) std.Io.Writer.Error!void {
+pub fn format(this: *const Db, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("Db{{ .meta = {any}, .bytes = \"{s}\" }}", .{
         this.meta,
         std.fmt.fmtSliceEscapeUpper(this.bytes[0..this.meta.bytes.to_int()]),
     });
+}
+
+pub fn jsonStringify(this: *const Db, jw: *std.json.Stringify) !void {
+    try jw.beginObject();
+    try jw.objectField("meta");
+    try jw.write(this.meta);
+    {
+        try jw.objectField("bytes");
+        // force as string
+        try jw.beginWriteRaw();
+        try std.json.Stringify.encodeJsonString(
+            this.bytes[0..this.meta.bytes.to_int()],
+            jw.options,
+            jw.writer,
+        );
+        jw.endWriteRaw();
+    }
+    try jw.endObject();
 }
 
 /// Slice over a single Data Block

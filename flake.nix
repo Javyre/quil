@@ -4,8 +4,6 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    nixpkgs-codelldb.url = "github:FraGag/nixpkgs/vscode-extensions.vadimcn.vscode-lldb";
-
     flake-parts.url = "github:hercules-ci/flake-parts";
 
     zig.url = "github:mitchellh/zig-overlay";
@@ -42,15 +40,14 @@
           # zig = inputs'.zig.packages.master;
           zig = inputs'.zig-src.packages.zig.override {
             release = {
-              version = "0.16.0-dev.1658+698499215";
+              version = "0.16.0-dev.2224+041701416";
               src = {
-                rev = "6984992153f0656b04c39279f9684fd5a06e952d";
-                hash = "sha256-+DVBImzap0PzcYfTN0/z3+lYLDOzRcNzKRvC2R2/ucE=";
+                rev = "041701416be59b94189c3a9d85053e5d69e7ba2c";
+                hash = "sha256-jsOaVGqEbSlTQUmuuqcvC4u4zCzKt5ElJI0wT6WQIdA=";
               };
             };
           };
           zls = inputs'.zls.packages.zls;
-          codelldb-pkgs = inputs'.nixpkgs-codelldb.legacyPackages;
           # zig-llvmPackages = (
           #   pkgs.llvmPackages_git.override rec {
           #     monorepoSrc = pkgs.fetchFromGitHub rec {
@@ -73,7 +70,7 @@
               zls
               # zig-llvmPackages.lldb
               pkgs.llvmPackages.lldb
-              codelldb-pkgs.vscode-extensions.vadimcn.vscode-lldb.adapter
+              pkgs.vscode-extensions.vadimcn.vscode-lldb.adapter
             ];
           };
         };

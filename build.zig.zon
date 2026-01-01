@@ -1,7 +1,7 @@
 .{
     .name = .quil,
     .version = "0.0.0",
-    .minimum_zig_version = "0.15.1",
+    .minimum_zig_version = "0.16.0",
     .fingerprint = 0x50c64fc366bade3e,
 
     .paths = .{
@@ -12,8 +12,8 @@
 
     .dependencies = .{
         .uucode = .{
-            .url = "git+https://github.com/Javyre/uucode.git#074f1df89969465fec0fe2c9a77ca8f37890760b",
-            .hash = "uucode-0.1.0-ZZjBPvxLTQCGyKb4QD2GBHFrtCH2-akwOdQYcym-UFYA",
+            .url = "git+https://github.com/Javyre/uucode.git#c6ebe11349eb9e3f185648d3379a5e89cd9f2049",
+            .hash = "uucode-0.1.0-ZZjBPmBMTQBWc2MNY3jtcI4r31yu6rc1u7WjQlxqSQjp",
         },
     },
 }

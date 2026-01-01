@@ -2048,6 +2048,138 @@ pub fn insert(r: *Rope, pos: RopeBytes, text: []const u8) !void {
     writer.writer.writeAll(text) catch unreachable;
 }
 
+test "fuzz" {
+    const log_ = @import("./log.zig");
+    log_.testing_level.* = .warn;
+    log_.testing_scope_levels = &.{
+        .{ .scope = .fuzz, .level = .info },
+        .{ .scope = .rope, .level = .debug },
+        .{ .scope = .rope_test, .level = .debug },
+    };
+    std.testing.random_seed = 0x6e199b53;// 0x72372649;
+    // try std.testing.fuzz(FuzzAgainstArrayList{}, FuzzAgainstArrayList.fuzz_bytes, .{});
+    try lame_fuzz(FuzzAgainstArrayList{}, FuzzAgainstArrayList.fuzz_bytes, .{});
+}
+
+const flog = @import("./log.zig").scoped(.fuzz);
+
+fn lame_fuzz(
+    context: anytype,
+    comptime test_one: fn (context: @TypeOf(context), input: []const u8) anyerror!void,
+    options: struct {
+        corpus: []const []const u8 = &.{},
+    },
+) !void {
+    _ = options;
+    var prng: std.Random.DefaultPrng = .init(std.testing.random_seed);
+    const random = prng.random();
+    var input: [1024]u8 = undefined;
+
+    for (0..50) |iter| {
+        // std.testing.log_level = .debug;
+        flog.info(@src(), "fuzzing", .{
+            .input_len = input.len,
+            .iter = iter,
+        });
+        // std.testing.log_level = .warn;
+        // _ = iter;
+
+        random.bytes(&input);
+        test_one(.{}, &input) catch |e| {
+            // minimize:
+            //   - remove one byte
+            //   - if no fail then put back but reduce value
+            return e;
+        };
+    }
+}
+
+const FuzzAgainstArrayList = struct {
+    fn fuzz_bytes(this: @This(), input: []const u8) !void {
+        var reader: std.Io.Reader = .fixed(input);
+        return fuzz(this, &reader);
+    }
+    fn fuzz(_: @This(), input: *std.Io.Reader) !void {
+        const testing = std.testing;
+        const gpa = testing.allocator;
+
+        var r: Rope = .init(gpa);
+        defer r.deinit();
+        var s: std.ArrayList(u8) = .empty;
+        defer s.deinit(gpa);
+
+        var prng: std.Random.DefaultPrng = .init(
+            input.takeByte() catch |e| switch (e) {
+                std.Io.Reader.Error.EndOfStream => return,
+                else => return e,
+            },
+        );
+        const random = prng.random();
+
+        const Action = enum {
+            insert_small,
+            insert_big,
+            delete,
+            _max,
+        };
+        try std.testing.expectEqual(s.items.len, r.get_len().to_int());
+        try r.expect_valid();
+        try std.testing.expectFmt(s.items, "{f}", .{r.fmtString()});
+
+        while (input.takeByte() catch |e| switch (e) {
+            std.Io.Reader.Error.EndOfStream => null,
+            else => return e,
+        }) |byte| {
+            switch (@as(Action, @enumFromInt(
+                byte % (@intFromEnum(Action._max)),
+            ))) {
+                .insert_small, .insert_big => |a| {
+                    var buf: [4 * 1024]u8 = undefined;
+                    const text = buf[0..random.uintLessThan(
+                        usize,
+                        if (a == .insert_big) buf.len else 16,
+                    )];
+                    random.bytes(text);
+                    // cast to ascii for readability
+                    for (text) |*b| {
+                        b.* = text[0]; // all same char
+                        if (b.* == '\n') continue;
+                        b.* = (b.* % (0x7F - 0x20)) + 0x20;
+                    }
+                    const idx = random.uintAtMost(usize, s.items.len);
+
+                    flog.info(@src(), "insert", .{
+                        .idx = idx,
+                        .text_len = text.len,
+                    });
+                    try r.insert(.cast(idx), text);
+                    try s.insertSlice(gpa, idx, text);
+                },
+                .delete => {
+                    const beg = random.uintAtMost(usize, s.items.len);
+                    const end = random.intRangeAtMost(usize, beg, s.items.len);
+
+                    flog.info(@src(), "delete", .{
+                        .beg = beg,
+                        .end = end,
+                    });
+                    r.delete(.cast(beg), .cast(end));
+                    s.replaceRangeAssumeCapacity(beg, end - beg, &.{});
+                },
+                ._max => unreachable,
+            }
+
+            try std.testing.expectEqual(s.items.len, r.get_len().to_int());
+            try r.expect_valid();
+            try std.testing.expectFmt(s.items, "{f}", .{r.fmtString()});
+        }
+
+        try std.testing.expectEqual(s.items.len, r.get_len().to_int());
+        try r.expect_valid();
+        try std.testing.expectFmt(s.items, "{f}", .{r.fmtString()});
+    }
+};
+
 test "insert-fuzz" {
     std.testing.log_level = .debug;
     // makes for easier print debugging
@@ -2138,6 +2270,9 @@ pub fn delete(r: *Rope, beg: RopeBytes, end: RopeBytes) void {
     assert(beg_path.items.len == r.indx_height.to_int());
     assert(r.indx_height.to_int() > 0);
 
+    // TODO: delete all dbs at once using the linked list and use subtree delete
+    //       only for IBs
+
     {
         const i = beg_path.items.len - 1;
         const beg_entry: BPathEntry = beg_path.items[i];
@@ -2221,12 +2356,14 @@ pub fn delete(r: *Rope, beg: RopeBytes, end: RopeBytes) void {
         if (!root.count_keys().eql(.coerce(1)))
             break;
 
+        log.info(@src(), "squashing root", .{ .root = root });
         const child_num = root.child_at(.coerce(0)).as(Ib.Num);
         const child = r.ib_at(child_num);
         assert(child.sum_subtree_bytes()
             .eql(.coerce(root.key_at(.coerce(0)).unwrap().?)));
         root.* = child.*;
         r.indx_blocks.destroy(child_num);
+        r.indx_height = r.indx_height.sub(.coerce(1));
     }
     assert(!root.count_keys().eql(.coerce(1)));
 }
@@ -2265,6 +2402,10 @@ fn delete__delete_layer(
         },
     },
 ) void {
+    log.info(@src(), "delete__delete_layer()", .{
+        .B = @typeName(B),
+        .args = args,
+    });
     // Special Case: delete slice within same parent
     if (args.beg.b == args.end.b) {
         @branchHint(switch (B) {
@@ -2304,15 +2445,19 @@ fn delete__delete_layer(
         args.beg.b.set_len(len_new);
 
         // unlucky case :( see equivalent below
-        if (len_new.eql(.coerce(1))) {
-            const side = r.delete__single_child_to_neigh(B, .{
+        const len_new_redist = if (len_new.eql(.coerce(1))) x: {
+            const side = r.delete__single_child_redist_neigh(B, .{
                 .beg_parent_path = args.beg_parent_path,
                 .end_parent_path = args.end_parent_path,
                 .beg_b = args.beg.b,
                 .end_b = args.end.b,
             });
-            assert(args.beg.b.get_len().eql(.coerce(
-                @as(u1, if (side) |_| 0 else
+            const len_new_redist = args.beg.b.get_len();
+            if (side) |_| {
+                // gave one or took one from/to neighbour
+                assert(len_new_redist.eql(.coerce(0)) or
+                    len_new_redist.eql(.coerce(2)));
+            } else {
                 // [CASE. no neighbour found]:
                 // Do nothing. leave a trail up to the root of 1-length
                 // blocks. We will have a reroot pass to clean this up
@@ -2321,8 +2466,19 @@ fn delete__delete_layer(
                 // If no neighbours to this block were found then this must be
                 // either root or only-child of string of only-childs up to
                 // root.
-                1),
-            )));
+                assert(len_new_redist.eql(.coerce(1)));
+            }
+            break :x len_new_redist;
+        } else len_new;
+
+        if (B == Db and len_new_redist.eql(.coerce(0))) {
+            // Skip self in db linked list
+            if (args.beg.b.meta.prev.unwrap()) |n| {
+                r.db_at(n).meta.next = args.beg.b.meta.next;
+            }
+            if (args.beg.b.meta.next.unwrap()) |n| {
+                r.db_at(n).meta.prev = args.beg.b.meta.prev;
+            }
         }
 
         const subtree_size = args.beg.b.get_subtree_bytes();
@@ -2377,33 +2533,59 @@ fn delete__delete_layer(
     // We deleted all but one of the children of $l||r$.
     // So now we are left with an invalid l = [single child].
     // We have to put this single child somewhere.
-    if (res.left_len_new.eql(.coerce(1))) {
+    const redist_left_len_new = if (res.left_len_new.eql(.coerce(1))) x: {
         assert(res.right_len_new.eql(.coerce(0)));
-        const side = r.delete__single_child_to_neigh(B, .{
+        const side = r.delete__single_child_redist_neigh(B, .{
             .beg_parent_path = args.beg_parent_path,
             .end_parent_path = args.end_parent_path,
             .beg_b = args.beg.b,
             .end_b = args.end.b,
         });
-        assert(args.beg.b.get_len().eql(.coerce(
-            @as(u1, if (side) |_| 0 else
+        const redist_left_len_new = args.beg.b.get_len();
+        if (side) |_| {
+            // gave one or took one from/to neighbour
+            assert(redist_left_len_new.eql(.coerce(0)) or
+                redist_left_len_new.eql(.coerce(2)));
+        } else {
             // [CASE. no neighbour found]:
             // Do nothing. leave a trail up to the root of 1-length
             // blocks. We will have a reroot pass to clean this up
             // later.
-            1),
-        )));
+            assert(redist_left_len_new.eql(.coerce(1)));
+        }
         assert(args.end.b.get_len().eql(.coerce(0)));
-    }
+        break :x redist_left_len_new;
+    } else res.left_len_new;
 
     if (B == Db) {
+        const beg_real, //
+        const beg_real_num: Db.NumOpt =
+            if (redist_left_len_new.eql(.coerce(0))) .{
+                // Skip empty self
+                if (args.beg.b.meta.prev.unwrap()) |n| r.db_at(n) else null,
+                args.beg.b.meta.prev,
+            } else .{
+                args.beg.b,
+                .some(args.extra.beg_num),
+            };
+        const end_real, //
+        const end_real_num: Db.NumOpt =
+            if (res.right_len_new.eql(.coerce(0))) .{
+                // Skip empty self
+                if (args.end.b.meta.next.unwrap()) |n| r.db_at(n) else null,
+                args.end.b.meta.next,
+            } else .{
+                args.end.b,
+                .some(args.extra.end_num),
+            };
+
         // Skip over deleted data block range in linked list
         //
         // (the data blocks themselves will be deleted as part of cone of
         // destruction subtree deletion below without needing to worry
         // anymore about the linked list fixup)
-        args.end.b.meta.next = .some(args.extra.end_num);
-        args.beg.b.meta.prev = .some(args.extra.beg_num);
+        if (end_real) |b| b.meta.prev = beg_real_num;
+        if (beg_real) |b| b.meta.next = end_real_num;
     }
 
     const left_bytes: TreeSize = .cast(args.beg.b.get_subtree_bytes());
@@ -2412,7 +2594,7 @@ fn delete__delete_layer(
     update_parent_keys(args.end_parent_path, right_bytes);
 }
 
-fn delete__single_child_to_neigh(
+fn delete__single_child_redist_neigh(
     r: *Rope,
     comptime B: type,
     args: struct {
@@ -2422,8 +2604,13 @@ fn delete__single_child_to_neigh(
         end_b: *B,
     },
 ) ?Side {
+    log.info(@src(), "delete__single_child_redist_neigh", .{
+        .B = @typeName(B),
+        .args = args,
+    });
     assert(args.beg_b.get_len().eql(.coerce(1)));
-    assert(args.end_b.get_len().eql(.coerce(0)));
+    assert(args.beg_b == args.end_b or
+        args.end_b.get_len().eql(.coerce(0)));
     // Either fit this into a neighbour block or take one away from
     // a neighbour block.
     //
@@ -2814,7 +3001,12 @@ pub const Cursor = struct {
 
 fn expect_valid(r: *Rope) !void {
     try std.testing.expect(r.indx_height.to_int() > 0);
-    const res = try r.expect_valid_ib(r.ib_at(r.indx_root), .min_val, null);
+    const res = try r.expect_valid_ib(
+        r.ib_at(r.indx_root),
+        r.indx_root,
+        .min_val,
+        null,
+    );
 
     var head_path_buf: BPathBuf = undefined;
     var head_path = std.ArrayList(BPathEntry).initBuffer(&head_path_buf);
@@ -2831,6 +3023,7 @@ fn expect_valid(r: *Rope) !void {
     while (true) : (i += 1) {
         if (i >= bounds.data_blocks_max)
             @panic("reached max iterations. probably a bug.");
+        // tlog.debug(@src(), "fetching db", .{ .num = cur_db_num });
         const db = r.db_at(cur_db_num);
         len = len.add(.coerce(db.meta.bytes));
         cur_db_num = db.meta.next.unwrap() orelse break;
@@ -2844,11 +3037,17 @@ const ValidBlockResult = struct { len: RopeBytes, last_db: ?Db.Num };
 fn expect_valid_ib(
     r: *Rope,
     ib: *Ib,
+    ib_num: Ib.Num,
     depth: IbHeight,
     prev_db: ?Db.Num,
 ) !ValidBlockResult {
+    tlog.debug(@src(), "expect_valid_ib()", .{
+        .depth = depth,
+        .prev_db = prev_db,
+        .ib_num = ib_num,
+        .ib = ib,
+    });
     // root
-    // if (depth.eql(.min_val) and r.indx_height.eql(.coerce(1))) {
     if (depth.eql(.min_val)) {
         try std.testing.expectEqual(r.ib_at(r.indx_root), ib);
         try std.testing.expect(ib.key_at(.coerce(0)).unwrap() != null);
@@ -2892,12 +3091,14 @@ fn expect_valid_ib(
                 .last_db = child.as(Db.Num),
                 .len = .coerce(try r.expect_valid_db(
                     r.db_at(child.as(Db.Num)),
+                    child.as(Db.Num),
                     DbDepth.cast(depth.to_int() + 1),
                     last_db,
                 )),
             };
         } else try r.expect_valid_ib(
             r.ib_at(child.as(Ib.Num)),
+            child.as(Ib.Num),
             depth.add(.coerce(1)),
             last_db,
         );
@@ -2921,9 +3122,17 @@ const DbDepth = RangedInt(
 fn expect_valid_db(
     r: *Rope,
     db: *Db,
+    db_num: Db.Num,
     depth: DbDepth,
     prev_db: ?Db.Num,
 ) !Db.Len {
+    tlog.debug(@src(), "expect_valid_db()", .{
+        .depth = depth,
+        .db_num = db_num,
+        .prev_db = prev_db,
+        .db_len = db.meta.bytes,
+        // .db = db,
+    });
     if (depth.to_int() > 1) try std.testing.expect(
         db.meta.bytes.to_int() >= bounds.data_block_bytes_min,
     );

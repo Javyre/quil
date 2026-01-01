@@ -4,11 +4,14 @@ const quil = @import("quil");
 pub const QuilError = error{};
 const Error = QuilError;
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     var gpa_: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer std.debug.assert(gpa_.deinit() == .ok);
     const gpa = gpa_.allocator();
-    var rt: std.Io.Threaded = .init(gpa, .{});
+    var rt: std.Io.Threaded = .init(gpa, .{
+        .environ = init.environ,
+        .argv0 = .init(init.args),
+    });
     const io = rt.io();
 
     var q: quil.Quil = undefined;
