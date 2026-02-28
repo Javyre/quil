@@ -4,6 +4,8 @@ const SegmentedList = @import("segmented_list.zig").SegmentedList;
 const RangedInt = @import("ranged_int.zig").RangedInt;
 const log = @import("./log.zig").scoped(.segmented_pool);
 
+const Allocator = std.mem.Allocator;
+
 const is_debug = @import("builtin").mode == .Debug;
 
 pub fn SegmentedPool(
@@ -31,6 +33,8 @@ pub fn SegmentedPool(
         // For leak detection
         len: if (is_debug) Num else void = if (is_debug) Num.coerce(0) else {},
 
+        pub const empty: Pool = .{};
+
         pub fn deinit(pool: *Pool, alloc: std.mem.Allocator) void {
             if ((comptime is_debug) and !pool.len.eql(.coerce(0)))
                 log.debug(@src(), "Pool leaked items", .{ .items = pool.len });
@@ -43,7 +47,7 @@ pub fn SegmentedPool(
             num: Num,
         };
 
-        pub fn create(pool: *Pool, alloc: std.mem.Allocator) !ItemPair {
+        pub fn create(pool: *Pool, alloc: std.mem.Allocator) Allocator.Error!ItemPair {
             if (pool.free_list) |num| {
                 const item: *Item = pool.segm_list.at(num.to_int());
                 const node: NodePtr = @ptrCast(item);

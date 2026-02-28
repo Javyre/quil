@@ -2056,7 +2056,7 @@ test "fuzz" {
         .{ .scope = .rope, .level = .debug },
         .{ .scope = .rope_test, .level = .debug },
     };
-    std.testing.random_seed = 0x6e199b53;// 0x72372649;
+    std.testing.random_seed = 0x6e199b53; // 0x72372649;
     // try std.testing.fuzz(FuzzAgainstArrayList{}, FuzzAgainstArrayList.fuzz_bytes, .{});
     try lame_fuzz(FuzzAgainstArrayList{}, FuzzAgainstArrayList.fuzz_bytes, .{});
 }
@@ -2126,6 +2126,7 @@ const FuzzAgainstArrayList = struct {
         try r.expect_valid();
         try std.testing.expectFmt(s.items, "{f}", .{r.fmtString()});
 
+        var act_idx: usize = 0;
         while (input.takeByte() catch |e| switch (e) {
             std.Io.Reader.Error.EndOfStream => null,
             else => return e,
@@ -2151,6 +2152,7 @@ const FuzzAgainstArrayList = struct {
                     flog.info(@src(), "insert", .{
                         .idx = idx,
                         .text_len = text.len,
+                        .act_idx = act_idx,
                     });
                     try r.insert(.cast(idx), text);
                     try s.insertSlice(gpa, idx, text);
@@ -2162,6 +2164,7 @@ const FuzzAgainstArrayList = struct {
                     flog.info(@src(), "delete", .{
                         .beg = beg,
                         .end = end,
+                        .act_idx = act_idx,
                     });
                     r.delete(.cast(beg), .cast(end));
                     s.replaceRangeAssumeCapacity(beg, end - beg, &.{});
@@ -2172,6 +2175,8 @@ const FuzzAgainstArrayList = struct {
             try std.testing.expectEqual(s.items.len, r.get_len().to_int());
             try r.expect_valid();
             try std.testing.expectFmt(s.items, "{f}", .{r.fmtString()});
+
+            act_idx += 1;
         }
 
         try std.testing.expectEqual(s.items.len, r.get_len().to_int());
@@ -2339,9 +2344,22 @@ pub fn delete(r: *Rope, beg: RopeBytes, end: RopeBytes) void {
                 end_entry.key_idx,
         };
 
+        const beg_c: BCursor(Ib) = .{
+            .b = beg_entry.parent_ib,
+            .ofs = beg_ofs,
+        };
+        const end_c: BCursor(Ib) = .{
+            .b = end_entry.parent_ib,
+            .ofs = end_ofs,
+        };
+
+        if (std.meta.eql(beg_c, end_c)) {
+            break;
+        }
+
         r.delete__delete_layer(Ib, .{
-            .beg = .{ .b = beg_entry.parent_ib, .ofs = beg_ofs },
-            .end = .{ .b = end_entry.parent_ib, .ofs = end_ofs },
+            .beg = beg_c,
+            .end = end_c,
             .beg_parent_path = beg_path.items[0..i],
             .end_parent_path = end_path.items[0..i],
             .extra = .{
@@ -2437,10 +2455,10 @@ fn delete__delete_layer(
         const len_old = args.beg.b.get_len();
         const len_new = len_old.sub(args.end.ofs.sub(args.beg.ofs));
 
-        var slice_from = args.beg.b.slice(args.end.ofs, len_old);
-        const slice_to = args.beg.b.slice(args.beg.ofs, len_old);
-        _ = B.write(slice_to, &slice_from);
-        assert(slice_from.len.eql(.coerce(0)));
+        const slice_from = args.beg.b.slice(args.end.ofs, len_old);
+        const slice_to = args.beg.b.slice(args.beg.ofs, len_old)
+            .slice(null, slice_from.len);
+        B.copyForwards(slice_to, slice_from);
 
         args.beg.b.set_len(len_new);
 
@@ -3041,24 +3059,25 @@ fn expect_valid_ib(
     depth: IbHeight,
     prev_db: ?Db.Num,
 ) !ValidBlockResult {
+    const ib_len = ib.count_keys();
     tlog.debug(@src(), "expect_valid_ib()", .{
         .depth = depth,
         .prev_db = prev_db,
         .ib_num = ib_num,
         .ib = ib,
+        .ib_len = ib_len,
     });
     // root
     if (depth.eql(.min_val)) {
         try std.testing.expectEqual(r.ib_at(r.indx_root), ib);
         try std.testing.expect(ib.key_at(.coerce(0)).unwrap() != null);
         try std.testing.expect(ib.key_at(.coerce(1)).unwrap() != null);
-        try std.testing.expect(ib.count_keys().to_int() >= 2);
+        try std.testing.expect(ib_len.to_int() >= 2);
     } else {
         try std.testing.expect(r.ib_at(r.indx_root) != ib);
         // rerooting creataes an empty block on the right that should be filled
         // by instert_in_blocks (or split) to have at least 2 children.
-        if (ib.count_keys().to_int() < 2) {
-            tlog.err(@src(), "", .{ .ib = ib });
+        if (ib_len.to_int() < 2) {
             return error.TestExpectedIBMinTwoChildren;
         }
         // try std.testing.expect(
@@ -3093,6 +3112,7 @@ fn expect_valid_ib(
                     r.db_at(child.as(Db.Num)),
                     child.as(Db.Num),
                     DbDepth.cast(depth.to_int() + 1),
+                    ib_len,
                     last_db,
                 )),
             };
@@ -3124,6 +3144,7 @@ fn expect_valid_db(
     db: *Db,
     db_num: Db.Num,
     depth: DbDepth,
+    parent_len: Ib.Len,
     prev_db: ?Db.Num,
 ) !Db.Len {
     tlog.debug(@src(), "expect_valid_db()", .{
@@ -3131,11 +3152,17 @@ fn expect_valid_db(
         .db_num = db_num,
         .prev_db = prev_db,
         .db_len = db.meta.bytes,
+        .parent_len = parent_len,
         // .db = db,
     });
-    if (depth.to_int() > 1) try std.testing.expect(
-        db.meta.bytes.to_int() >= bounds.data_block_bytes_min,
-    );
+
+    assert(depth.to_int() != 0); // Db can't be root
+    if (!(depth.to_int() == 1 and parent_len.to_int() == 2)) {
+        try std.testing.expect(
+            db.meta.bytes.to_int() >= bounds.data_block_bytes_min,
+        );
+    }
+
     try std.testing.expectEqual(prev_db, db.meta.prev.unwrap());
     if (prev_db) |p| try std.testing.expectEqual(
         r.db_at(r.db_at(p).meta.next.unwrap().?),

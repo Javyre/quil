@@ -13,6 +13,7 @@ const ICtnrChildIdx = WindowManager.ICtnrChildIdx;
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("SkipRope.zig");
 }
 
 const Error = if (std.meta.fieldIndex(@import("root"), "QuilError")) |_|
