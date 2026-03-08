@@ -17,7 +17,10 @@ fn log(
     }
 
     var buf: [64]u8 = undefined;
-    const term = std.debug.lockStderr(&buf).terminal();
+    var term = std.debug.lockStderr(&buf).terminal();
+    // HACK: currently zig build doesn't let us pass CLICOLOR_FORCE to test
+    if (@import("builtin").is_test)
+        term.mode = .escape_codes;
     defer std.debug.unlockStderr();
 
     try term.setColor(.bold);

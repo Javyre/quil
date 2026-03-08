@@ -183,26 +183,40 @@ pub fn run(q: *Quil, setup_cb: ?fn (*Quil) Error!void) !void {
     try q.render.flush();
 
     // Run Input Loop
-    var shutdown_fut = try q.io.concurrent(
-        std.Io.Event.wait,
-        .{ &Static.shutdown, q.io },
-    );
-    defer shutdown_fut.cancel(q.io) catch |e| switch (e) {
-        error.Canceled => {},
+
+    const SelectRes = union(enum) {
+        shutdown: std.Io.Cancelable!void,
+        input: anyerror!void,
+    };
+    var select_buf: [2]SelectRes = undefined;
+    var select: std.Io.Select(SelectRes) = .init(q.io, &select_buf);
+
+    select.concurrent(.shutdown, std.Io.Event.wait, .{
+        &Static.shutdown,
+        q.io,
+    }) catch unreachable;
+    select.concurrent(.input, input_loop, .{q}) catch unreachable;
+
+    defer while (select.cancel()) |res| switch (res) {
+        .shutdown => |r| r catch |e| switch (e) {
+            std.Io.Cancelable.Canceled => {},
+        },
+        .input => |r| r catch |e| switch (e) {
+            std.Io.Cancelable.Canceled => {},
+            else => unreachable,
+        },
     };
 
-    var input_fut = q.io.async(input_loop, .{q});
-    defer input_fut.cancel(q.io) catch |e| switch (e) {
-        error.Canceled => {},
-        else => unreachable,
-    };
-
-    switch (try q.io.select(.{
-        .shutdown = &shutdown_fut,
-        .input = &input_fut,
-    })) {
-        .shutdown => {},
-        .input => log.err(@src(), "shutting down due to EOF", .{}),
+    switch (try select.await()) {
+        .shutdown => |r| r catch |e| switch (e) {
+            std.Io.Cancelable.Canceled => {},
+        },
+        .input => |r| if (r) {
+            log.err(@src(), "shutting down due to EOF", .{});
+        } else |e| switch (e) {
+            std.Io.Cancelable.Canceled => {},
+            else => unreachable,
+        },
     }
 }
 

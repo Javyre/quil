@@ -12,8 +12,8 @@
 
     .dependencies = .{
         .uucode = .{
-            .url = "git+https://github.com/Javyre/uucode.git#c6ebe11349eb9e3f185648d3379a5e89cd9f2049",
-            .hash = "uucode-0.1.0-ZZjBPmBMTQBWc2MNY3jtcI4r31yu6rc1u7WjQlxqSQjp",
+            .url = "git+https://github.com/jacobsandlund/uucode.git#zig-0.16",
+            .hash = "uucode-0.2.0-ZZjBPkJiVABQGPdyw9BOtU2sflHv3vovBzmYtPRj2hvm",
         },
     },
 }
