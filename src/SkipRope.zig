@@ -38,7 +38,7 @@
 //! ```
 //! L2: [-inf]               L2: [0]
 //! L1: [-inf]    Becomes:   L1: [0]
-//! L0: [-inf]               L0: [0]
+//! L0: [-inf]               L0: []
 //! ```
 const std = @import("std");
 const assert = std.debug.assert;
@@ -162,12 +162,15 @@ const Ib = extern struct {
         pub fn find(
             first: PtrNum,
             r: *SkipRope,
+            comptime track_prev: bool,
+            prev: if (track_prev) ?PtrNum else void,
             first_ofs: BytesInt,
             first_is_header: bool,
             ofs: BytesInt,
         ) ?struct {
             ib: PtrNum,
             ib_ofs: BytesInt,
+            ib_prev: if (track_prev) ?PtrNum else void,
             rank: CapInt,
             rank_ofs: BytesInt,
         } {
@@ -186,10 +189,12 @@ const Ib = extern struct {
                 @branchHint(.unlikely);
                 assert(ib_ofs == 0);
             } else {
+                if (track_prev) assert(prev != null);
                 // Only header Ib can have 0-width
                 assert(it.peek(r).?.ptr.wide[0] != 0);
             }
 
+            var ib_prev = prev;
             while (it.next(r)) |ib| {
                 var ib_w: u32 = 0;
                 for (0.., ib.ptr.wide, ib.ptr.down) |i, w, d| {
@@ -198,34 +203,16 @@ const Ib = extern struct {
                         return .{
                             .ib = ib,
                             .ib_ofs = ib_ofs,
+                            .ib_prev = ib_prev,
                             .rank = @intCast(i),
                             .rank_ofs = ib_ofs + ib_w,
                         };
                     ib_w += w;
                 }
                 ib_ofs += ib_w;
+                if (track_prev) ib_prev = ib;
             }
             return null;
-        }
-
-        /// `ib_cur` becomes `at` long after split.
-        pub fn split(
-            ib_cur: PtrNum,
-            r: *SkipRope,
-            gpa: Allocator,
-            comptime at: Ib.CapInt,
-        ) Allocator.Error!PtrNum {
-            const ib_new = try r.ib_create(gpa);
-            ib_new.ptr.* = .{};
-            ib_new.ptr.next = ib_cur.ptr.next;
-            ib_cur.ptr.next = ib_new.num;
-            const len_1 = at;
-            const len_2 = Ib.capacity - at;
-            ib_new.ptr.wide[0..len_2].* = ib_cur.ptr.wide[len_1..].*;
-            ib_new.ptr.down[0..len_2].* = ib_cur.ptr.down[len_1..].*;
-            ib_cur.ptr.wide[len_1..].* = @splat(0);
-            ib_cur.ptr.down[len_1..].* = @splat(0);
-            return ib_new;
         }
 
         /// Append slice items in this layer after last of `ib_cur`.
@@ -295,18 +282,6 @@ const Ib = extern struct {
     pub fn truncate(ib: *Ib, new_len: CapInt) void {
         @memset(ib.wide[new_len..], 0);
         @memset(ib.down[new_len..], 0);
-    }
-
-    pub fn insert(ib: *Ib, ib_len: CapInt, at: CapInt, item: struct {
-        w: u32,
-        d: u32,
-    }) void {
-        var wide_list: std.ArrayList(u32) = .initBuffer(&ib.ptr.wide);
-        var down_list: std.ArrayList(u32) = .initBuffer(&ib.ptr.down);
-        wide_list.items.len = ib_len;
-        down_list.items.len = ib_len;
-        wide_list.insertAssumeCapacity(at, item.w);
-        down_list.insertAssumeCapacity(at, item.d);
     }
 };
 
@@ -409,27 +384,6 @@ const Db = extern struct {
             return null;
         }
 
-        /// `db_cur` becomes `at` long after split.
-        pub fn split(
-            db_cur: PtrNum,
-            r: *SkipRope,
-            gpa: Allocator,
-            comptime at: CapInt,
-        ) Allocator.Error!PtrNum {
-            const db_new = try r.db_create(gpa);
-            db_new.ptr.* = .{};
-            db_new.ptr.next = db_cur.ptr.next;
-            db_cur.ptr.next = db_new.num;
-            assert(at <= Db.capacity);
-            const len_1 = at;
-            const len_2 = Db.capacity - at;
-            db_new.ptr.data[0..len_2].* = db_cur.ptr.data[len_1..].*;
-            db_cur.ptr.data[len_1..].* = undefined;
-            db_new.ptr.len = len_2;
-            db_cur.ptr.len = len_1;
-            return db_new;
-        }
-
         /// Append slice items in this layer after last of `db_cur`.
         /// May allocate one new sdbling block if needed.
         pub fn append_db_slice(
@@ -489,83 +443,93 @@ const Db = extern struct {
         @memset(db.data[new_len..], undefined);
         db.len = new_len;
     }
-
-    // pub fn insert(db: *Db, db_len: CapInt, at: CapInt, item: struct {
-    //     w: u32,
-    //     d: u32,
-    // }) void {}
 };
 
-const FindCursor = struct {
-    b: union {
-        ib: Ib.PtrNum,
-        db: Db.PtrNum,
-    },
-    b_ofs: BytesInt,
-    b_is_header: bool,
-    down: struct {
-        rank: union { in_ib: Ib.CapInt, in_db: Db.CapInt },
-        rank_ofs: BytesInt,
-    } = undefined,
+const FindCursorCfg = struct {
+    track_prev: bool = false,
+};
+fn FindCursor(comptime cfg: FindCursorCfg) type {
+    return struct {
+        b: union {
+            ib: Ib.PtrNum,
+            db: Db.PtrNum,
+        },
+        prev_b: if (cfg.track_prev) union {
+            ib: ?Ib.PtrNum,
+            db: ?Db.PtrNum,
+        } else void,
+        b_ofs: BytesInt,
+        b_is_header: bool,
+        down: struct {
+            rank: union { in_ib: Ib.CapInt, in_db: Db.CapInt },
+            rank_ofs: BytesInt,
+        } = undefined,
 
-    pub fn ib_find_ofs(c: *FindCursor, r: *SkipRope, ofs: BytesInt) bool {
-        const found = c.b.ib.find(r, c.b_ofs, c.b_is_header, ofs) orelse
-            return false;
-        if (c.b.ib.num != found.ib.num) c.b_is_header = false;
-        c.b = .{ .ib = found.ib };
-        c.b_ofs = found.ib_ofs;
-        c.down = .{
-            .rank = .{ .in_ib = found.rank },
-            .rank_ofs = found.rank_ofs,
-        };
-        return true;
-    }
-    pub fn ib_descend_as_ib(c: *FindCursor, r: *SkipRope) void {
-        c.b_is_header = c.b_is_header and c.down.rank.in_ib == 0;
-        const ib: Ib.PtrNum = .{
-            .num = @enumFromInt(c.b.ib.ptr.down[c.down.rank.in_ib]),
-            .ptr = r.ib_at(@enumFromInt(c.b.ib.ptr.down[c.down.rank.in_ib])),
-        };
-        c.b = .{ .ib = ib };
-        c.b_ofs = c.down.rank_ofs;
-    }
-    pub fn ib_descend_as_db(c: *FindCursor, r: *SkipRope) void {
-        c.b_is_header = c.b_is_header and c.down.rank.in_ib == 0;
-        const db: Db.PtrNum = .{
-            .num = @enumFromInt(c.b.ib.ptr.down[c.down.rank.in_ib]),
-            .ptr = r.db_at(@enumFromInt(c.b.ib.ptr.down[c.down.rank.in_ib])),
-        };
-        c.b = .{ .db = db };
-        c.b_ofs = c.down.rank_ofs;
-    }
-    pub fn db_find_ofs(c: *FindCursor, r: *SkipRope, ofs: BytesInt) bool {
-        const found = c.b.db.find(r, c.b_ofs, c.b_is_header, ofs) orelse
-            return false;
-        if (c.b.db.num != found.db.num) c.b_is_header = false;
-        c.b = .{ .db = found.db };
-        c.b_ofs = found.db_ofs;
-        c.down = .{
-            .rank = .{ .in_db = found.rank },
-            .rank_ofs = found.rank_ofs,
-        };
-        return true;
-    }
-
-    pub fn ib_find_ofs_leaf(
-        c: *FindCursor,
-        r: *SkipRope,
-        ib_height: HeightInt,
-        ofs: BytesInt,
-    ) bool {
-        for (0..ib_height) |_| {
-            if (!c.ib_find_ofs(r, ofs)) return false;
-            c.ib_descend_as_ib(r);
+        pub fn ib_find_ofs(c: *@This(), r: *SkipRope, ofs: BytesInt) bool {
+            const found = c.b.ib.find(
+                r,
+                cfg.track_prev,
+                if (cfg.track_prev) c.prev_b.ib else {},
+                c.b_ofs,
+                c.b_is_header,
+                ofs,
+            ) orelse return false;
+            if (c.b.ib.num != found.ib.num) c.b_is_header = false;
+            c.b = .{ .ib = found.ib };
+            c.b_ofs = found.ib_ofs;
+            c.down = .{
+                .rank = .{ .in_ib = found.rank },
+                .rank_ofs = found.rank_ofs,
+            };
+            return true;
         }
-        if (!c.ib_find_ofs(r, ofs)) return false;
-        c.ib_descend_as_db(r);
-        return c.db_find_ofs(r, ofs);
-    }
-};
+        pub fn ib_descend_as_ib(c: *@This(), r: *SkipRope) void {
+            c.b_is_header = c.b_is_header and c.down.rank.in_ib == 0;
+            const num: Ib.Num = @enumFromInt(
+                c.b.ib.ptr.down[c.down.rank.in_ib],
+            );
+            const ib: Ib.PtrNum = .{ .num = num, .ptr = r.ib_at(num) };
+            c.b = .{ .ib = ib };
+            c.b_ofs = c.down.rank_ofs;
+        }
+        pub fn ib_descend_as_db(c: *@This(), r: *SkipRope) void {
+            c.b_is_header = c.b_is_header and c.down.rank.in_ib == 0;
+            const num: Db.Num = @enumFromInt(
+                c.b.ib.ptr.down[c.down.rank.in_ib],
+            );
+            const db: Db.PtrNum = .{ .num = num, .ptr = r.db_at(num) };
+            c.b = .{ .db = db };
+            c.b_ofs = c.down.rank_ofs;
+        }
+        pub fn db_find_ofs(c: *@This(), r: *SkipRope, ofs: BytesInt) bool {
+            const found = c.b.db.find(r, c.b_ofs, c.b_is_header, ofs) orelse
+                return false;
+            if (c.b.db.num != found.db.num) c.b_is_header = false;
+            c.b = .{ .db = found.db };
+            c.b_ofs = found.db_ofs;
+            c.down = .{
+                .rank = .{ .in_db = found.rank },
+                .rank_ofs = found.rank_ofs,
+            };
+            return true;
+        }
+
+        pub fn ib_find_ofs_leaf(
+            c: *@This(),
+            r: *SkipRope,
+            ib_height: HeightInt,
+            ofs: BytesInt,
+        ) bool {
+            for (0..ib_height) |_| {
+                if (!c.ib_find_ofs(r, ofs)) return false;
+                c.ib_descend_as_ib(r);
+            }
+            if (!c.ib_find_ofs(r, ofs)) return false;
+            c.ib_descend_as_db(r);
+            return c.db_find_ofs(r, ofs);
+        }
+    };
+}
 
 pub fn deinit(r: *SkipRope, gpa: Allocator) void {
     r.ibs.deinit(gpa);
@@ -679,7 +643,7 @@ pub fn insert(
 
     assert(h_ins <= h_tree - 1);
 
-    var cur: FindCursor = .{
+    var cur: FindCursor(.{}) = .{
         .b = .{ .ib = root },
         .b_ofs = 0,
         .b_is_header = true,
@@ -811,6 +775,56 @@ test "insert" {
     try r.insert(std.testing.allocator, 1, "Hello, world!");
     try r.insert(std.testing.allocator, 0, "Hello, world!");
     std.debug.print("{f}", .{r.fmtString(0, r.len)});
+}
+
+pub fn delete(
+    r: *SkipRope,
+    gpa: Allocator,
+    pos: BytesInt,
+    len: BytesInt,
+) void {
+    if (r.root == .null) {
+        assert(len == 0);
+        return;
+    }
+
+    const root = .{
+        .num = r.root,
+        .ptr = r.ib_at(r.root),
+    };
+
+    var cur: FindCursor(.{ .track_prev = true }) = .{
+        .b = .{ .ib = root },
+        .b_ofs = 0,
+        .b_is_header = true,
+    };
+
+    var h_cur = r.ib_height + 1;
+    while (h_cur > 0) : (h_cur -= 1) {
+        if (!cur.ib_find_ofs(r, pos))
+            std.debug.panic("deletion point out of bounds", .{});
+
+        const rank = cur.down.rank.in_ib;
+
+        if (cur.down.rank_ofs == pos) {
+            // if we remove the leader element then we merge the gaps
+            cur.b.ib.delete(
+                cur.prev_b.ib,
+            );
+        } else {}
+        // if (len <= cur.b.ib.ptr.wide[rank] - (pos - cur.down.rank_ofs)) {
+        //     cur.b.ib.ptr.wide[rank] -= len;
+        // } else if () {
+
+        // }
+
+        if (h_cur > 1)
+            cur.ib_descend_as_ib(r)
+        else
+            cur.ib_descend_as_db(r);
+    }
+    if (!cur.db_find_ofs(r, pos))
+        std.debug.panic("deletion point out of bounds", .{});
 }
 
 const InsertFuzz = struct {
@@ -1256,7 +1270,7 @@ fn formatString(
     if (args.len == 0) return;
 
     const root: Ib.PtrNum = .{ .num = r.root, .ptr = r.ib_at(r.root) };
-    var find_cur: FindCursor = .{
+    var find_cur: FindCursor(.{}) = .{
         .b = .{ .ib = root },
         .b_ofs = 0,
         .b_is_header = true,
