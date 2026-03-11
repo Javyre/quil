@@ -475,6 +475,7 @@ fn FindCursor(comptime cfg: FindCursorCfg) type {
                 ofs,
             ) orelse return false;
             if (c.b.ib.num != found.ib.num) c.b_is_header = false;
+            if (cfg.track_prev) c.prev_b = .{ .ib = found.ib_prev };
             c.b = .{ .ib = found.ib };
             c.b_ofs = found.ib_ofs;
             c.down = .{
@@ -558,6 +559,14 @@ pub fn db_at(r: *SkipRope, num: Db.Num) *Db {
 pub fn ib_at(r: *SkipRope, num: Ib.Num) *Ib {
     assert(num != .null);
     return r.ibs.at(.cast(@intFromEnum(num) - 1));
+}
+pub fn db_destroy(r: *SkipRope, num: Db.Num) void {
+    assert(num != .null);
+    r.dbs.destroy(.cast(@intFromEnum(num) - 1));
+}
+pub fn ib_destroy(r: *SkipRope, num: Ib.Num) void {
+    assert(num != .null);
+    r.ibs.destroy(.cast(@intFromEnum(num) - 1));
 }
 
 pub fn jsonStringify(r: *const SkipRope, jw: anytype) !void {
@@ -645,6 +654,7 @@ pub fn insert(
 
     var cur: FindCursor(.{}) = .{
         .b = .{ .ib = root },
+        .prev_b = {},
         .b_ofs = 0,
         .b_is_header = true,
     };
@@ -777,74 +787,209 @@ test "insert" {
     std.debug.print("{f}", .{r.fmtString(0, r.len)});
 }
 
+test "delete-smoke" {
+    var r: SkipRope = .empty;
+    defer r.deinit(std.testing.allocator);
+
+    try r.insert(std.testing.allocator, 0, "Hello, world!");
+    r.delete(5, 2);
+    try r.expect_valid();
+    try std.testing.expectFmt("Helloworld!", "{f}", .{r.fmtString(0, r.len)});
+    try std.testing.expectFmt("world", "{f}", .{r.fmtString(5, 5)});
+
+    r.delete(0, 5);
+    try r.expect_valid();
+    try std.testing.expectFmt("world!", "{f}", .{r.fmtString(0, r.len)});
+
+    var big: [Db.capacity * 3]u8 = undefined;
+    for (&big, 0..) |*c, i| c.* = 'a' + @as(u8, @intCast(i % 26));
+    try r.insert(std.testing.allocator, r.len, &big);
+    try r.expect_valid();
+
+    r.delete(3, Db.capacity + 17);
+    try r.expect_valid();
+
+    var expect: std.ArrayList(u8) = .empty;
+    defer expect.deinit(std.testing.allocator);
+    try expect.appendSlice(std.testing.allocator, "wor");
+    try expect.appendSlice(std.testing.allocator, big[Db.capacity + 14 ..]);
+    try std.testing.expectFmt(expect.items, "{f}", .{r.fmtString(0, r.len)});
+}
+
 pub fn delete(
     r: *SkipRope,
-    gpa: Allocator,
     pos: BytesInt,
     len: BytesInt,
 ) void {
+    if (len == 0) return;
     if (r.root == .null) {
         assert(len == 0);
         return;
     }
+    assert(pos <= r.len);
+    assert(pos + len <= r.len);
 
-    const root = .{
+    log.info(@src(), "delete()", .{
+        .r_len = r.len,
+        .pos = pos,
+        .len = len,
+    });
+
+    const root: Ib.PtrNum = .{
         .num = r.root,
         .ptr = r.ib_at(r.root),
     };
 
-    var cur: FindCursor(.{ .track_prev = true }) = .{
+    var cur: FindCursor(.{}) = .{
         .b = .{ .ib = root },
+        .prev_b = {},
         .b_ofs = 0,
         .b_is_header = true,
     };
+    var ib_end: Ib.Num = .null;
+    var db_end: Db.Num = .null;
 
     var h_cur = r.ib_height + 1;
     while (h_cur > 0) : (h_cur -= 1) {
         if (!cur.ib_find_ofs(r, pos))
             std.debug.panic("deletion point out of bounds", .{});
-
         const rank = cur.down.rank.in_ib;
 
-        if (cur.down.rank_ofs == pos) {
-            // if we remove the leader element then we merge the gaps
-            cur.b.ib.delete(
-                cur.prev_b.ib,
-            );
-        } else {}
-        // if (len <= cur.b.ib.ptr.wide[rank] - (pos - cur.down.rank_ofs)) {
-        //     cur.b.ib.ptr.wide[rank] -= len;
-        // } else if () {
+        const child_end: Ib.Num =
+            if (ib_end != .null) @enumFromInt(r.ib_at(ib_end).down[0]) else .null;
 
-        // }
+        var suffix_w: BytesInt = 0;
+        var suffix_it = cur.b.ib.iter();
+        var suffix_first = true;
+        while (suffix_it.next(r)) |ib| {
+            const begin_rank: usize = if (suffix_first) rank else 0;
+            suffix_first = false;
+            for (ib.ptr.wide[begin_rank..], ib.ptr.down[begin_rank..]) |w, d| {
+                if (d == 0) break;
+                suffix_w += w;
+            }
+            if (ib.ptr.next == ib_end) break;
+        }
+        assert(cur.down.rank_ofs + suffix_w >= pos + len);
 
-        if (h_cur > 1)
-            cur.ib_descend_as_ib(r)
-        else
+        const new_w: BytesInt = suffix_w - len;
+
+        var ib_dead = cur.b.ib.ptr.next;
+        cur.b.ib.ptr.wide[rank] = @intCast(new_w);
+        cur.b.ib.ptr.truncate(rank + 1);
+        cur.b.ib.ptr.next = ib_end;
+        while (ib_dead != ib_end) {
+            const ib_next = r.ib_at(ib_dead).next;
+            r.ib_destroy(ib_dead);
+            ib_dead = ib_next;
+        }
+
+        if (h_cur > 1) {
+            cur.ib_descend_as_ib(r);
+            ib_end = child_end;
+        } else {
             cur.ib_descend_as_db(r);
+            db_end = @enumFromInt(@intFromEnum(child_end));
+        }
     }
-    if (!cur.db_find_ofs(r, pos))
-        std.debug.panic("deletion point out of bounds", .{});
+
+    {
+        if (!cur.db_find_ofs(r, pos))
+            std.debug.panic("deletion point out of bounds", .{});
+        const rank = cur.down.rank.in_db;
+
+        var read_db_ofs = cur.b_ofs;
+        var read_rank: Db.CapInt = rank;
+        var read_it = cur.b.db.iter();
+        var read_db = read_it.next(r).?;
+        while (pos + len > read_db_ofs + read_db.ptr.len) {
+            read_db_ofs += read_db.ptr.len;
+            read_db = read_it.next(r) orelse
+                std.debug.panic("deletion point out of bounds", .{});
+            read_rank = 0;
+        }
+        read_rank = @intCast(pos + len - read_db_ofs);
+
+        var write_db = cur.b.db;
+        var write_rank = rank;
+        while (true) {
+            if (read_rank == read_db.ptr.len) {
+                read_db_ofs += read_db.ptr.len;
+                read_db = read_it.next(r) orelse break;
+                read_rank = 0;
+                continue;
+            }
+            if (write_rank == Db.capacity) {
+                assert(write_db.ptr.next != db_end);
+                write_db.ptr.len = Db.capacity;
+                write_db = .{
+                    .num = write_db.ptr.next,
+                    .ptr = r.db_at(write_db.ptr.next),
+                };
+                write_rank = 0;
+            }
+
+            const cpy_len: Db.CapInt = @intCast(@min(
+                read_db.ptr.len - read_rank,
+                Db.capacity - write_rank,
+            ));
+            std.mem.copyForwards(
+                u8,
+                write_db.ptr.data[write_rank..][0..cpy_len],
+                read_db.ptr.data[read_rank..][0..cpy_len],
+            );
+            write_rank += cpy_len;
+            if (write_rank > write_db.ptr.len) write_db.ptr.len = write_rank;
+            read_rank += cpy_len;
+        }
+
+        if (write_rank == Db.capacity) {
+            write_db.ptr.len = Db.capacity;
+        } else {
+            write_db.ptr.truncate(write_rank);
+        }
+        var db_dead = write_db.ptr.next;
+        write_db.ptr.next = db_end;
+        while (db_dead != db_end) {
+            const db_next = r.db_at(db_dead).next;
+            r.db_destroy(db_dead);
+            db_dead = db_next;
+        }
+
+        if (r.len == len and cur.b_is_header) {
+            cur.b.db.ptr.truncate(0);
+            cur.b.db.ptr.next = db_end;
+        }
+    }
+
+    r.len -= len;
 }
 
-const InsertFuzz = struct {
+const FuzzAgainstArrayList = struct {
     pub fn test_one(ctx: void, smith: *std.testing.Smith) !void {
         _ = ctx;
-
         const gpa = std.testing.allocator;
         var r: SkipRope = .empty;
         defer r.deinit(gpa);
         var s: std.ArrayList(u8) = .empty;
         defer s.deinit(gpa);
 
-        // while (!smith.eos()) {
-        while (!smith.eosWeightedSimple(1, 1)) {
-            const pos = smith.valueRangeAtMost(SkipRope.BytesInt, 0, r.len);
-            var buf: [1024]u8 = undefined;
-            const text = buf[0..smith.slice(&buf)];
+        while (!smith.eosWeightedSimple(64, 1)) {
+            if (r.len == 0 or smith.value(bool)) {
+                const pos = smith.valueRangeAtMost(BytesInt, 0, r.len);
+                var buf: [1024]u8 = undefined;
+                const text = buf[0..smith.slice(&buf)];
 
-            try r.insert(gpa, pos, text);
-            try s.insertSlice(gpa, pos, text);
+                try r.insert(gpa, pos, text);
+                try s.insertSlice(gpa, pos, text);
+            } else {
+                const pos = smith.valueRangeAtMost(BytesInt, 0, r.len);
+                const del_len =
+                    smith.valueRangeAtMost(BytesInt, 0, r.len - pos);
+
+                r.delete(pos, del_len);
+                s.replaceRangeAssumeCapacity(pos, del_len, "");
+            }
 
             try r.expect_valid();
             try std.testing.expectFmt(s.items, "{f}", .{
@@ -854,7 +999,7 @@ const InsertFuzz = struct {
     }
 };
 
-test "insert-fuzz" {
+test "fuzz-against-arraylist" {
     const log_ = @import("./log.zig");
     log_.testing_level.* = .warn;
     log_.testing_scope_levels = &.{
@@ -865,8 +1010,8 @@ test "insert-fuzz" {
 
     // std.testing.random_seed = 0x8d31b0a1;
 
-    try std.testing.fuzz({}, InsertFuzz.test_one, .{});
-    // try lame_fuzz({}, InsertFuzz.test_one, .{});
+    // try std.testing.fuzz({}, FuzzAgainstArrayList.test_one, .{});
+    try lame_fuzz({}, FuzzAgainstArrayList.test_one, .{});
 }
 
 fn lame_fuzz(
@@ -881,23 +1026,48 @@ fn lame_fuzz(
     _ = options;
     var prng: std.Random.DefaultPrng = .init(std.testing.random_seed);
     const random = prng.random();
-    var input: [8 * 1024]u8 = undefined;
 
     for (0..50) |iter| {
-        // std.testing.log_level = .debug;
+        var input: [64 * (1 + 8 + 4 + 1024)]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&input);
+
+        var len: usize = 0;
+        const n_ops = random.intRangeAtMost(usize, 0, 64);
+        for (0..n_ops) |_| {
+            try w.writeByte(0);
+            const do_insert = len == 0 or random.boolean();
+            if (len != 0)
+                try w.writeInt(u64, @intFromBool(do_insert), .little);
+
+            if (do_insert) {
+                try w.writeInt(
+                    u64,
+                    @intCast(random.intRangeAtMost(usize, 0, len)),
+                    .little,
+                );
+
+                const text_len = random.intRangeAtMost(usize, 0, 1024);
+                try w.writeInt(u32, @intCast(text_len), .little);
+                random.bytes(input[w.end..][0..text_len]);
+                w.end += text_len;
+                len += text_len;
+            } else {
+                const beg = random.intRangeAtMost(usize, 0, len - 1);
+                const end = random.intRangeAtMost(usize, beg, len);
+                try w.writeInt(u64, beg, .little);
+                try w.writeInt(u64, end, .little);
+                len -= end - beg;
+            }
+        }
+        try w.writeByte(1);
+
         flog.info(@src(), "fuzzing", .{
-            .input_len = input.len,
+            .input_len = w.end,
             .iter = iter,
         });
-        // std.testing.log_level = .warn;
-        // _ = iter;
 
-        random.bytes(&input);
-        var smith: std.testing.Smith = .{ .in = &input };
+        var smith: std.testing.Smith = .{ .in = input[0..w.end] };
         test_one(ctx, &smith) catch |e| {
-            // minimize:
-            //   - remove one byte
-            //   - if no fail then put back but reduce value
             return e;
         };
     }
@@ -1266,12 +1436,13 @@ fn formatString(
     const r = args.r;
 
     assert(args.ofs <= r.len);
-    assert(args.ofs + args.len <= args.len);
+    assert(args.ofs + args.len <= r.len);
     if (args.len == 0) return;
 
     const root: Ib.PtrNum = .{ .num = r.root, .ptr = r.ib_at(r.root) };
     var find_cur: FindCursor(.{}) = .{
         .b = .{ .ib = root },
+        .prev_b = {},
         .b_ofs = 0,
         .b_is_header = true,
     };
@@ -1284,8 +1455,9 @@ fn formatString(
     var iter = find_cur.b.db.iter();
     while (rest > 0) {
         const db = iter.peek(r).?;
-        try w.writeAll(db.ptr.data[rank_cur..db.ptr.len]);
-        rest -= db.ptr.len - rank_cur;
+        const cpy_len = @min(rest, db.ptr.len - rank_cur);
+        try w.writeAll(db.ptr.data[rank_cur..][0..cpy_len]);
+        rest -= cpy_len;
         if (rest > 0) {
             rank_cur = 0;
             _ = iter.next(r);
