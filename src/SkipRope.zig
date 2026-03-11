@@ -28,8 +28,8 @@
 //! - `LN >= L1`: Index Layer (Ib)
 //! - `L0`      : Data Layer (Db)
 //!
-//! Note that the `-inf` element doesn't actually have a rank in L0.
-//! This turns out to be easier to special case for our rope usecase.
+//! Note that the `-inf` element doesn't have a real L0 rank.
+//! `L0: []` means an empty header `Db`, not a byte.
 //!
 //! We still follow the same algorithms in terms of block leaders despite this
 //! physical repr.
