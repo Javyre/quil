@@ -372,36 +372,41 @@ const Db = extern struct {
             return .{ .prev_is_next = true, .prev = first };
         }
 
-        pub const Found = struct {
-            db: PtrNum,
-            db_ofs: BytesInt,
-            rank: CapInt,
-            rank_ofs: BytesInt,
-        };
         /// Find down ptr of absolute ofs within this db layer
         pub fn find(
             first: PtrNum,
             r: *SkipRope,
+            comptime track_prev: bool,
+            prev: if (track_prev) ?PtrNum else void,
             first_ofs: BytesInt,
             first_is_header: bool,
             ofs: BytesInt,
-        ) ?Found {
+        ) ?struct {
+            db: PtrNum,
+            db_ofs: BytesInt,
+            db_prev: if (track_prev) ?PtrNum else void,
+            rank: CapInt,
+            rank_ofs: BytesInt,
+        } {
             var db_ofs = first_ofs;
             var it = first.iter();
             if (!first_is_header) {
                 @branchHint(.likely);
                 assert(it.peek(r).?.ptr.len > 0);
             }
+            var db_prev = prev;
             while (it.next(r)) |db| {
                 if (ofs <= db_ofs + db.ptr.len) {
                     return .{
                         .db = db,
                         .db_ofs = db_ofs,
+                        .db_prev = db_prev,
                         .rank = @intCast(ofs - db_ofs),
                         .rank_ofs = ofs,
                     };
                 }
                 db_ofs += db.ptr.len;
+                if (track_prev) db_prev = db;
             }
             return null;
         }
@@ -527,9 +532,16 @@ fn FindCursor(comptime cfg: FindCursorCfg) type {
             c.b_ofs = c.down.rank_ofs;
         }
         pub fn db_find_ofs(c: *@This(), r: *SkipRope, ofs: BytesInt) bool {
-            const found = c.b.db.find(r, c.b_ofs, c.b_is_header, ofs) orelse
-                return false;
+            const found = c.b.db.find(
+                r,
+                cfg.track_prev,
+                if (cfg.track_prev) c.prev_b.db else {},
+                c.b_ofs,
+                c.b_is_header,
+                ofs,
+            ) orelse return false;
             if (c.b.db.num != found.db.num) c.b_is_header = false;
+            if (cfg.track_prev) c.prev_b = .{ .db = found.db_prev };
             c.b = .{ .db = found.db };
             c.b_ofs = found.db_ofs;
             c.down = .{
