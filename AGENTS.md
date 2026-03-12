@@ -1,4 +1,5 @@
 - this is primarily a jj repo. git is colocated. stick to jj when possible
+- use `jj diff --tool difft` (difftastic) for understanding semantic diffs
 
 ## Codestyle
 - prefer explicit control flow and composition in callers
