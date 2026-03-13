@@ -180,6 +180,22 @@ const Ib = extern struct {
             return .{ .prev_is_next = true, .prev = first };
         }
 
+        pub fn shift_suffix_left(ib: PtrNum, src_rank: CapInt) void {
+            const src_len = ib.ptr.len();
+            const move_len = src_len - src_rank;
+            std.mem.copyForwards(
+                u32,
+                ib.ptr.wide[0..move_len],
+                ib.ptr.wide[src_rank..src_len],
+            );
+            std.mem.copyForwards(
+                u32,
+                ib.ptr.down[0..move_len],
+                ib.ptr.down[src_rank..src_len],
+            );
+            ib.ptr.truncate(move_len);
+        }
+
         /// Find down ptr of absolute ofs within this ib layer
         pub fn find(
             first: PtrNum,
@@ -305,6 +321,21 @@ const Ib = extern struct {
         @memset(ib.wide[new_len..], 0);
         @memset(ib.down[new_len..], 0);
     }
+
+    pub inline fn end(ib: *const Ib, start: CapInt) CapInt {
+        return if (start < Ib.capacity)
+            for (start.., ib.down[start..]) |i, d| {
+                if (d == 0) break @intCast(i);
+            } else Ib.capacity
+        else
+            start;
+    }
+
+    pub inline fn len(ib: *const Ib) CapInt {
+        return for (0.., ib.down) |i, d| {
+            if (d == 0) break @intCast(i);
+        } else Ib.capacity;
+    }
 };
 
 /// Data Leaf Block
@@ -370,6 +401,17 @@ const Db = extern struct {
         };
         pub fn iter(first: PtrNum) Iter {
             return .{ .prev_is_next = true, .prev = first };
+        }
+
+        pub fn shift_suffix_left(db: PtrNum, src_rank: CapInt) void {
+            const src_len = db.ptr.len;
+            const move_len = src_len - src_rank;
+            std.mem.copyForwards(
+                u8,
+                db.ptr.data[0..move_len],
+                db.ptr.data[src_rank..src_len],
+            );
+            db.ptr.truncate(@intCast(move_len));
         }
 
         /// Find down ptr of absolute ofs within this db layer
@@ -512,13 +554,38 @@ fn FindCursor(comptime cfg: FindCursorCfg) type {
             return true;
         }
         pub fn ib_descend_as_ib(c: *@This(), r: *SkipRope) void {
-            c.b_is_header = c.b_is_header and c.down.rank.in_ib == 0;
+            const parent = c.b.ib;
+            const rank = c.down.rank.in_ib;
+            const is_header = c.b_is_header and rank == 0;
             const num: Ib.Num = @enumFromInt(
-                c.b.ib.ptr.down[c.down.rank.in_ib],
+                parent.ptr.down[rank],
             );
             const ib: Ib.PtrNum = .{ .num = num, .ptr = r.ib_at(num) };
+            var prev_ib: ?Ib.PtrNum = null;
+            if (cfg.track_prev and !is_header) {
+                const prev_start_num: Ib.Num = if (rank > 0)
+                    @enumFromInt(parent.ptr.down[rank - 1])
+                else blk: {
+                    const prev_parent = c.prev_b.ib.?;
+                    break :blk @enumFromInt(
+                        prev_parent.ptr.down[prev_parent.ptr.len() - 1],
+                    );
+                };
+                var it = Ib.PtrNum.iter(.{
+                    .num = prev_start_num,
+                    .ptr = r.ib_at(prev_start_num),
+                });
+                while (it.next(r)) |prev| {
+                    if (prev.ptr.next == num) {
+                        prev_ib = prev;
+                        break;
+                    }
+                }
+                assert(prev_ib != null);
+            }
+            c.b_is_header = is_header;
             c.b = .{ .ib = ib };
-            if (cfg.track_prev) c.prev_b = .{ .ib = null };
+            if (cfg.track_prev) c.prev_b = .{ .ib = prev_ib };
             c.b_ofs = c.down.rank_ofs;
         }
         pub fn ib_descend_as_db(c: *@This(), r: *SkipRope) void {
@@ -699,18 +766,12 @@ pub fn insert(
     var h_cur = h_tree - 1;
     while (h_cur > 0) : (h_cur -= 1) {
         if (!cur.ib_find_ofs(r, pos)) {
-            log.err(@src(), "insert out of bounds", .{ .pos = pos, .cur = cur.b.ib, .r_len = r.len });
             std.debug.panic("insertion point out of bounds", .{});
         }
 
         const rank = cur.down.rank.in_ib;
         if (h_cur == h_ins) {
-            const ib_cur_len: Ib.CapInt = if (rank < Ib.capacity - 1)
-                (for (rank + 1.., cur.b.ib.ptr.down[rank + 1 ..]) |i, d| {
-                    if (d == 0) break @intCast(i); // end of ib
-                } else Ib.capacity)
-            else
-                rank + 1;
+            const ib_cur_len = cur.b.ib.ptr.end(rank + 1);
 
             const w_over: u32 =
                 @intCast(cur.b.ib.ptr.wide[rank] - (pos - cur.down.rank_ofs));
@@ -733,10 +794,7 @@ pub fn insert(
 
             // move all ib_cur[rank+1..] to the end of tail
             if (rank < Ib.capacity - 1) {
-                const ib_cur_len: Ib.CapInt =
-                    for (rank + 1.., cur.b.ib.ptr.down[rank + 1 ..]) |i, d| {
-                        if (d == 0) break @intCast(i); // end of ib
-                    } else Ib.capacity;
+                const ib_cur_len = cur.b.ib.ptr.end(rank + 1);
 
                 // NOTE: down ptrs are zero in this case as the subt is being
                 //       built lazily. We count the len here based on 0-wides.
@@ -890,6 +948,131 @@ test "delete-against-arraylist" {
     try r.expect_valid();
     try std.testing.expectFmt(s.items, "{f}", .{r.fmtString(0, r.len)});
 }
+
+test "delete: targeted regression cases" {
+    const gpa = std.testing.allocator;
+    const db_cap: BytesInt = @intCast(Db.capacity);
+    const short = @max(
+        @as(BytesInt, 1),
+        @as(BytesInt, @intCast(Db.capacity / 16)),
+    );
+    const cross: BytesInt = db_cap + short;
+    const many_leaf_blocks = Db.capacity * (Ib.capacity + 8);
+
+    const Case = struct {
+        text_len: usize,
+        pos: BytesInt,
+        len: BytesInt,
+    };
+    const cases = [_]Case{
+        // same-block keep-slot
+        .{
+            .text_len = Db.capacity * 2,
+            .pos = short,
+            .len = short,
+        },
+        // same-block merge-left
+        .{
+            .text_len = Db.capacity * 2,
+            .pos = db_cap,
+            .len = short,
+        },
+        // later-block keep-slot
+        .{
+            .text_len = Db.capacity * 4,
+            .pos = db_cap - short,
+            .len = cross,
+        },
+        // later-block merge-left
+        .{
+            .text_len = Db.capacity * 4,
+            .pos = db_cap,
+            .len = cross,
+        },
+        // exact-tail
+        .{
+            .text_len = Db.capacity * 5,
+            .pos = db_cap + short,
+            .len = db_cap * 2 - short,
+        },
+        // whole-rope
+        .{
+            .text_len = Db.capacity * 3,
+            .pos = 0,
+            .len = db_cap * 3,
+        },
+        // multi-ib later-block keep-slot
+        .{
+            .text_len = many_leaf_blocks,
+            .pos = db_cap * 2,
+            .len = db_cap * 20 + 11,
+        },
+        // multi-ib later-block merge-left
+        .{
+            .text_len = many_leaf_blocks,
+            .pos = db_cap * 31,
+            .len = db_cap * 5 + 19,
+        },
+    };
+    const max_text_len = comptime blk: {
+        var max_len: usize = 0;
+        for (cases) |c| max_len = @max(max_len, c.text_len);
+        break :blk max_len;
+    };
+    var text_buf: [max_text_len]u8 = undefined;
+
+    for (cases) |c| {
+        var r: SkipRope = .empty;
+        defer r.deinit(gpa);
+        var s: std.ArrayList(u8) = .empty;
+        defer s.deinit(gpa);
+
+        const text = text_buf[0..c.text_len];
+        for (text, 0..) |_, i| {
+            text[i] = 'a' + @as(u8, @intCast(i % 26));
+        }
+
+        try r.insert(gpa, 0, text);
+        try s.appendSlice(gpa, text);
+
+        r.delete(c.pos, c.len);
+        s.replaceRangeAssumeCapacity(c.pos, c.len, "");
+
+        try r.expect_valid();
+        try std.testing.expectFmt(
+            s.items,
+            "{f}",
+            .{r.fmtString(0, r.len)},
+        );
+    }
+}
+
+test "delete: edge-aligned keep-slot and merge-left cases" {
+    const gpa = std.testing.allocator;
+
+    var r: SkipRope = .empty;
+    defer r.deinit(gpa);
+    var s: std.ArrayList(u8) = .empty;
+    defer s.deinit(gpa);
+
+    const text_len = Db.capacity * (Ib.capacity + 4);
+    var text: [text_len]u8 = undefined;
+    for (&text, 0..) |*b, i| b.* = 'a' + @as(u8, @intCast(i % 26));
+
+    try r.insert(gpa, 0, &text);
+    try s.appendSlice(gpa, &text);
+
+    r.delete(Db.capacity - 1, Db.capacity * 3 + 1);
+    s.replaceRangeAssumeCapacity(Db.capacity - 1, Db.capacity * 3 + 1, "");
+    try r.expect_valid();
+    try std.testing.expectFmt(s.items, "{f}", .{r.fmtString(0, r.len)});
+
+    r.delete(Db.capacity * 2, Db.capacity * 2);
+    s.replaceRangeAssumeCapacity(Db.capacity * 2, Db.capacity * 2, "");
+    try r.expect_valid();
+    try std.testing.expectFmt(s.items, "{f}", .{r.fmtString(0, r.len)});
+}
+
 pub fn delete(
     r: *SkipRope,
     pos: BytesInt,
@@ -921,8 +1104,10 @@ pub fn delete(
     };
 
     // Delete rule:
-    // - If the owning byte survives, only rewrite the width.
-    // - If the owning byte is deleted, delete that slot and merge its gap left.
+    // - If delete starts inside a slot, its owning byte survives and only
+    //   that gap width changes.
+    // - If delete starts at a slot head, that owning byte dies and its gap
+    //   merges left.
     // - Header `-inf` is the only exception.
 
     // Walk index layers top-down, rewriting the touched suffix in-place
@@ -932,216 +1117,165 @@ pub fn delete(
         if (!cur.ib_find_ofs(r, pos))
             std.debug.panic("deletion point out of bounds", .{});
         const rank = cur.down.rank.in_ib;
-        const rank_del = pos - cur.down.rank_ofs;
-        const keep_cur = rank_del > 0 or (cur.b_is_header and rank == 0);
+        const del_ofs_in_slot: u32 = @intCast(pos - cur.down.rank_ofs);
+        const delete_head =
+            del_ofs_in_slot == 0 and !(cur.b_is_header and rank == 0);
+        // Keep this slot unless delete starts at its head byte.
+        const keep_slot = !delete_head;
 
-        const ib_cur_len: Ib.CapInt = if (rank < Ib.capacity - 1)
-            (for (rank + 1.., cur.b.ib.ptr.down[rank + 1 ..]) |i, d| {
-                if (d == 0) break @intCast(i); // end of ib
-            } else Ib.capacity)
-        else
-            rank + 1;
-
-        // Keep the prefix before `pos`, then consume `rest` across this layer's
-        // suffix until we find the surviving right tail.
+        // `dst_*` names the surviving left gap in this layer.
         var rest = len;
-        var keep_ib = cur.b.ib;
-        var keep_rank = rank;
-        var keep_len: Ib.CapInt = rank + 1;
-        var w_keep: BytesInt = rank_del;
-        if (!keep_cur) {
+        var dst_ib = cur.b.ib;
+        var dst_rank = rank;
+        var dst_end: Ib.CapInt = rank + 1;
+        var dst_w = del_ofs_in_slot;
+        if (!keep_slot) {
+            // Slot head was deleted, so merge its gap into the left slot.
             if (rank > 0) {
-                keep_rank = rank - 1;
-                keep_len = rank;
+                dst_rank = rank - 1;
+                dst_end = rank;
             } else {
-                keep_ib = cur.prev_b.ib.?;
-                keep_len =
-                    for (0.., keep_ib.ptr.down) |i, d| {
-                        if (d == 0) break @intCast(i);
-                    } else Ib.capacity;
-                keep_rank = keep_len - 1;
+                dst_ib = cur.prev_b.ib.?;
+                dst_end = dst_ib.ptr.len();
+                dst_rank = dst_end - 1;
             }
-            w_keep = keep_ib.ptr.wide[keep_rank];
+            dst_w = dst_ib.ptr.wide[dst_rank];
         }
-        var tail_ib: ?Ib.PtrNum = null;
-        var tail_rank: Ib.CapInt = 0;
-        var ib_it = cur.b.ib.iter();
-        var ib_first = true;
-        scan: while (ib_it.next(r)) |ib| {
-            const begin_rank: Ib.CapInt = if (ib_first) rank else 0;
-            ib_first = false;
-            const is_first_block = ib.num == cur.b.ib.num;
-            var slot: usize = @as(usize, begin_rank);
-            while (slot < Ib.capacity) : (slot += 1) {
-                const w = ib.ptr.wide[slot];
-                const d = ib.ptr.down[slot];
-                if (d == 0) break;
 
-                const slot_w: BytesInt = @as(BytesInt, w);
-                const slot_is_first = is_first_block and slot == @as(usize, @intCast(rank));
-                const skip = if (slot_is_first) rank_del else 0;
-                const avail = slot_w - skip;
-                const del_slot = @min(rest, avail);
-                rest -= del_slot;
-                w_keep += avail - del_slot;
+        // Pick the surviving left gap, consume deleted width, then reconnect
+        // the first surviving right gap.
+        var src_ib_opt: ?Ib.PtrNum = cur.b.ib;
+        var src_rank = rank;
+        var dst_next: Ib.Num = .null;
+        while (src_ib_opt) |src_ib| {
+            const next_num = src_ib.ptr.next;
+            const src_len = src_ib.ptr.len();
 
-                if (rest == 0) {
-                    // `slot` was the last touched entry in this layer; anything
-                    // after it is the surviving suffix.
-                    const next_slot = slot + 1;
-                    if (next_slot < Ib.capacity and ib.ptr.down[next_slot] != 0) {
-                        tail_ib = ib;
-                        tail_rank = @intCast(next_slot);
-                    } else if (ib.ptr.next != .null) {
-                        tail_ib = .{
-                            .num = ib.ptr.next,
-                            .ptr = r.ib_at(ib.ptr.next),
-                        };
-                        tail_rank = 0;
-                    }
-                    break :scan;
-                }
-            }
-        }
-        assert(rest == 0);
-
-        keep_ib.ptr.wide[keep_rank] = @intCast(w_keep);
-        if (keep_cur) {
-            if (tail_ib) |ib| {
-                if (ib.num == cur.b.ib.num) {
-                    // The surviving right tail stays in the current block.
-                    const move_len = ib_cur_len - tail_rank;
-                    std.mem.copyForwards(
-                        u32,
-                        cur.b.ib.ptr.wide[rank + 1 ..][0..move_len],
-                        cur.b.ib.ptr.wide[tail_rank..][0..move_len],
-                    );
-                    std.mem.copyForwards(
-                        u32,
-                        cur.b.ib.ptr.down[rank + 1 ..][0..move_len],
-                        cur.b.ib.ptr.down[tail_rank..][0..move_len],
-                    );
-                    cur.b.ib.ptr.truncate(rank + 1 + move_len);
-                } else {
-                    // The surviving right tail starts in a later sibling block.
-                    if (tail_rank > 0) {
-                        const tail_len: Ib.CapInt =
-                            for (tail_rank + 1.., ib.ptr.down[tail_rank + 1 ..]) |i, d| {
-                                if (d == 0) break @intCast(i);
-                            } else Ib.capacity;
-                        const move_len = tail_len - tail_rank;
-                        std.mem.copyForwards(
-                            u32,
-                            ib.ptr.wide[0..move_len],
-                            ib.ptr.wide[tail_rank..tail_len],
-                        );
-                        std.mem.copyForwards(
-                            u32,
-                            ib.ptr.down[0..move_len],
-                            ib.ptr.down[tail_rank..tail_len],
-                        );
-                        ib.ptr.truncate(move_len);
-                    }
-
-                    var ib_dead = cur.b.ib.ptr.next;
-                    cur.b.ib.ptr.truncate(rank + 1);
-                    cur.b.ib.ptr.next = ib.num;
-                    while (ib_dead != ib.num) {
-                        const ib_next = r.ib_at(ib_dead).next;
-                        r.ib_destroy(ib_dead);
-                        ib_dead = ib_next;
+            if (rest > 0) {
+                const is_first_block = src_ib.num == cur.b.ib.num;
+                var slot = src_rank;
+                while (slot < src_len) : (slot += 1) {
+                    const slot_w = src_ib.ptr.wide[slot];
+                    const slot_is_first = is_first_block and slot == rank;
+                    const slot_left_kept =
+                        if (slot_is_first) del_ofs_in_slot else 0;
+                    const avail = slot_w - slot_left_kept;
+                    const del_slot = @min(rest, avail);
+                    rest -= del_slot;
+                    dst_w += avail - del_slot;
+                    if (rest == 0) {
+                        src_rank = slot + 1;
+                        break;
                     }
                 }
-            } else {
-                // The delete reached the end of this layer, so the touched block
-                // becomes the new layer tail.
-                var ib_dead = cur.b.ib.ptr.next;
-                cur.b.ib.ptr.truncate(rank + 1);
-                cur.b.ib.ptr.next = .null;
-                while (ib_dead != .null) {
-                    const ib_next = r.ib_at(ib_dead).next;
-                    r.ib_destroy(ib_dead);
-                    ib_dead = ib_next;
-                }
-            }
-        } else if (keep_ib.num == cur.b.ib.num and tail_ib != null and tail_ib.?.num == cur.b.ib.num) {
-            // The deleted owning slot and surviving suffix are both in the same
-            // block, so just shift the suffix left over the removed slot.
-            const move_len = ib_cur_len - tail_rank;
-            std.mem.copyForwards(
-                u32,
-                cur.b.ib.ptr.wide[rank..][0..move_len],
-                cur.b.ib.ptr.wide[tail_rank..][0..move_len],
-            );
-            std.mem.copyForwards(
-                u32,
-                cur.b.ib.ptr.down[rank..][0..move_len],
-                cur.b.ib.ptr.down[tail_rank..][0..move_len],
-            );
-            cur.b.ib.ptr.truncate(rank + move_len);
-        } else {
-            // The owning byte is gone, so remove this slot and merge its gap
-            // into the previous surviving slot.
-            var src_ib_opt = tail_ib;
-            var src_rank = tail_rank;
-            var ib_dead = keep_ib.ptr.next;
-            while (ib_dead != .null and (src_ib_opt == null or ib_dead != src_ib_opt.?.num)) {
-                const ib_next = r.ib_at(ib_dead).next;
-                r.ib_destroy(ib_dead);
-                ib_dead = ib_next;
-            }
 
-            while (src_ib_opt != null and keep_len < Ib.capacity) {
-                const src_ib = src_ib_opt.?;
-                const src_len: Ib.CapInt =
-                    for (0.., src_ib.ptr.down) |i, d| {
-                        if (d == 0) break @intCast(i);
-                    } else Ib.capacity;
-                const cpy_len = @min(Ib.capacity - keep_len, src_len - src_rank);
-                std.mem.copyForwards(
-                    u32,
-                    keep_ib.ptr.wide[keep_len..][0..cpy_len],
-                    src_ib.ptr.wide[src_rank..][0..cpy_len],
-                );
-                std.mem.copyForwards(
-                    u32,
-                    keep_ib.ptr.down[keep_len..][0..cpy_len],
-                    src_ib.ptr.down[src_rank..][0..cpy_len],
-                );
-                keep_len += cpy_len;
-                src_rank += cpy_len;
-
-                if (src_rank == src_len) {
-                    const next_num = src_ib.ptr.next;
-                    r.ib_destroy(src_ib.num);
+                // Either delete still runs past this block, or it ended exactly
+                // at the block tail, so there is no surviving right gap here.
+                const src_exhausted = src_rank == src_len;
+                if (rest > 0 or src_exhausted) {
+                    if (src_ib.num == dst_ib.num) {
+                        dst_ib.ptr.truncate(dst_end);
+                    } else {
+                        r.ib_destroy(src_ib.num);
+                    }
                     src_ib_opt = if (next_num == .null) null else .{
                         .num = next_num,
                         .ptr = r.ib_at(next_num),
                     };
                     src_rank = 0;
-                } else {
-                    const move_len = src_len - src_rank;
-                    std.mem.copyForwards(
-                        u32,
-                        src_ib.ptr.wide[0..move_len],
-                        src_ib.ptr.wide[src_rank..][0..move_len],
-                    );
-                    std.mem.copyForwards(
-                        u32,
-                        src_ib.ptr.down[0..move_len],
-                        src_ib.ptr.down[src_rank..][0..move_len],
-                    );
-                    src_ib.ptr.truncate(move_len);
-                    src_ib_opt = src_ib;
-                    src_rank = 0;
-                    break;
+                    continue;
                 }
             }
 
-            keep_ib.ptr.truncate(keep_len);
-            keep_ib.ptr.next = if (src_ib_opt) |src_ib| src_ib.num else .null;
-        }
+            assert(rest == 0);
+            // Once `rest` hits zero, `src_rank` now marks the start of the
+            // surviving right gap in `src_ib`.
+            if (keep_slot) {
+                // If the owning byte survives, later surviving gaps keep
+                // starting where they already begin.
+                if (src_ib.num == dst_ib.num) {
+                    const move_len = src_len - src_rank;
+                    std.mem.copyForwards(
+                        u32,
+                        dst_ib.ptr.wide[dst_end..][0..move_len],
+                        src_ib.ptr.wide[src_rank..src_len],
+                    );
+                    std.mem.copyForwards(
+                        u32,
+                        dst_ib.ptr.down[dst_end..][0..move_len],
+                        src_ib.ptr.down[src_rank..src_len],
+                    );
+                    dst_end += move_len;
+                    dst_next = next_num;
+                    break;
+                }
 
+                if (src_rank > 0) src_ib.shift_suffix_left(src_rank);
+                dst_next = src_ib.num;
+                break;
+            }
+
+            // If the owning byte dies, its gap merges left, so later surviving
+            // gaps may need to be pulled left behind that survivor.
+            if (src_ib.num == dst_ib.num) {
+                const move_len = src_len - src_rank;
+                std.mem.copyForwards(
+                    u32,
+                    dst_ib.ptr.wide[dst_end..][0..move_len],
+                    src_ib.ptr.wide[src_rank..src_len],
+                );
+                std.mem.copyForwards(
+                    u32,
+                    dst_ib.ptr.down[dst_end..][0..move_len],
+                    src_ib.ptr.down[src_rank..src_len],
+                );
+                dst_end += move_len;
+                dst_next = next_num;
+                break;
+            }
+
+            // Drain one later block at a time into dst_ib until it is full or
+            // until a partial surviving right gap remains.
+            const cpy_len = @min(Ib.capacity - dst_end, src_len - src_rank);
+            std.mem.copyForwards(
+                u32,
+                dst_ib.ptr.wide[dst_end..][0..cpy_len],
+                src_ib.ptr.wide[src_rank..src_len][0..cpy_len],
+            );
+            std.mem.copyForwards(
+                u32,
+                dst_ib.ptr.down[dst_end..][0..cpy_len],
+                src_ib.ptr.down[src_rank..src_len][0..cpy_len],
+            );
+            dst_end += cpy_len;
+            src_rank += cpy_len;
+
+            if (src_rank == src_len) {
+                r.ib_destroy(src_ib.num);
+                src_ib_opt = if (next_num == .null) null else .{
+                    .num = next_num,
+                    .ptr = r.ib_at(next_num),
+                };
+                src_rank = 0;
+                if (dst_end == Ib.capacity) {
+                    dst_next = if (src_ib_opt) |ib| ib.num else .null;
+                    break;
+                }
+                continue;
+            }
+
+            src_ib.shift_suffix_left(src_rank);
+            dst_next = src_ib.num;
+            break;
+        }
+        assert(rest == 0);
+
+        // Reconnect the first surviving right gap behind the left survivor.
+        dst_ib.ptr.wide[dst_rank] = dst_w;
+        dst_ib.ptr.truncate(dst_end);
+        dst_ib.ptr.next = dst_next;
+
+        // Descend after the local rewrite is complete.
         if (h_cur > 1)
             cur.ib_descend_as_ib(r)
         else
@@ -1150,77 +1284,84 @@ pub fn delete(
 
     assert(h_cur == 0);
     {
-        // Leaf step: splice the surviving byte tail back after the kept prefix.
+        // Leaf step: keep left prefix, splice back surviving byte tail.
         if (!cur.db_find_ofs(r, pos))
             std.debug.panic("deletion point out of bounds", .{});
         const rank = cur.down.rank.in_db;
 
-        // Find the first surviving byte after the deleted range.
-        var read_cur: FindCursor(.{ .track_prev = true }) = cur;
-        if (!read_cur.db_find_ofs(r, pos + len))
-            std.debug.panic("deletion point out of bounds", .{});
-        var read_db = read_cur.b.db;
-        const read_rank = read_cur.down.rank.in_db;
-        var tail_db: ?Db.PtrNum = null;
-        var tail_rank: Db.CapInt = 0;
-        if (read_rank < read_db.ptr.len) {
-            tail_db = read_db;
-            tail_rank = read_rank;
-        } else if (read_db.ptr.next != .null) {
-            tail_db = .{
-                .num = read_db.ptr.next,
-                .ptr = r.db_at(read_db.ptr.next),
-            };
-            tail_rank = 0;
-        }
+        var rest = len;
+        var dst_end = rank;
+        var src_db_opt: ?Db.PtrNum = cur.b.db;
+        var src_rank = rank;
+        var dst_next: Db.Num = .null;
+        while (src_db_opt) |src_db| {
+            const next_num = src_db.ptr.next;
+            const src_len = src_db.ptr.len;
 
-        if (tail_db) |db| {
-            if (db.num == cur.b.db.num) {
-                // The surviving bytes stay in the current db block.
-                const move_len = db.ptr.len - tail_rank;
+            if (rest > 0) {
+                const del_len = @min(rest, src_len - src_rank);
+                rest -= del_len;
+                src_rank += @intCast(del_len);
+                if (rest > 0 or src_rank == src_len) {
+                    if (src_db.num == cur.b.db.num) {
+                        cur.b.db.ptr.truncate(dst_end);
+                    } else {
+                        r.db_destroy(src_db.num);
+                    }
+                    src_db_opt = if (next_num == .null) null else .{
+                        .num = next_num,
+                        .ptr = r.db_at(next_num),
+                    };
+                    src_rank = 0;
+                    continue;
+                }
+            }
+
+            assert(rest == 0);
+            const src_exhausted = src_rank == src_len;
+            if (src_exhausted) {
+                // Delete ended at this block tail, so there is no surviving
+                // right gap here; keep scanning for the first later one.
+                if (src_db.num == cur.b.db.num) {
+                    cur.b.db.ptr.truncate(dst_end);
+                } else {
+                    r.db_destroy(src_db.num);
+                }
+                src_db_opt = if (next_num == .null) null else .{
+                    .num = next_num,
+                    .ptr = r.db_at(next_num),
+                };
+                src_rank = 0;
+                continue;
+            }
+
+            // Once `rest` hits zero, `src_rank` now marks the start of the
+            // surviving right gap in `src_db`.
+            if (src_db.num == cur.b.db.num) {
+                const move_len = src_len - src_rank;
                 std.mem.copyForwards(
                     u8,
-                    cur.b.db.ptr.data[rank..][0..move_len],
-                    cur.b.db.ptr.data[tail_rank..][0..move_len],
+                    cur.b.db.ptr.data[dst_end..][0..move_len],
+                    src_db.ptr.data[src_rank..src_len],
                 );
-                cur.b.db.ptr.truncate(@intCast(rank + move_len));
-            } else {
-                // The surviving bytes start in a later db block.
-                if (tail_rank > 0) {
-                    const move_len = db.ptr.len - tail_rank;
-                    std.mem.copyForwards(
-                        u8,
-                        db.ptr.data[0..move_len],
-                        db.ptr.data[tail_rank..][0..move_len],
-                    );
-                    db.ptr.truncate(@intCast(move_len));
-                }
-
-                var db_dead = cur.b.db.ptr.next;
-                cur.b.db.ptr.truncate(rank);
-                cur.b.db.ptr.next = db.num;
-                while (db_dead != db.num) {
-                    const db_next = r.db_at(db_dead).next;
-                    r.db_destroy(db_dead);
-                    db_dead = db_next;
-                }
+                dst_end += @intCast(move_len);
+                dst_next = next_num;
+                break;
             }
-        } else {
-            // No surviving tail bytes; truncate at the kept prefix and drop the
-            // rest of the db chain.
-            var db_dead = cur.b.db.ptr.next;
-            cur.b.db.ptr.truncate(rank);
+
+            // Later leaf survives from the middle, so shift its kept tail to
+            // the front and relink to it.
+            if (src_rank > 0) src_db.shift_suffix_left(src_rank);
+            dst_next = src_db.num;
+            break;
+        }
+        assert(rest == 0);
+        cur.b.db.ptr.truncate(dst_end);
+        cur.b.db.ptr.next = dst_next;
+
+        if (r.len == len and cur.b_is_header) {
+            cur.b.db.ptr.truncate(0);
             cur.b.db.ptr.next = .null;
-            while (db_dead != .null) {
-                const db_next = r.db_at(db_dead).next;
-                r.db_destroy(db_dead);
-                db_dead = db_next;
-            }
-
-            if (r.len == len and cur.b_is_header) {
-                cur.b.db.ptr.truncate(0);
-                cur.b.db.ptr.next = .null;
-            }
         }
     }
 
@@ -1228,6 +1369,45 @@ pub fn delete(
 }
 
 const FuzzAgainstArrayList = struct {
+    const PosCase = enum(u2) { start, end, inner, any };
+    const DelCase = enum(u2) { zero, short, to_end, any };
+
+    fn pick_pos(smith: *std.testing.Smith, len: BytesInt) BytesInt {
+        if (len == 0) return 0;
+
+        // Hit ends often, but still spend most cases on a full-range pick.
+        return switch (smith.valueWeighted(PosCase, &.{
+            std.testing.Smith.Weight.value(PosCase, .start, 3),
+            std.testing.Smith.Weight.value(PosCase, .end, 3),
+            std.testing.Smith.Weight.value(PosCase, .inner, 1),
+            std.testing.Smith.Weight.value(PosCase, .any, 9),
+        })) {
+            .start => 0,
+            .end => len,
+            .inner => smith.valueRangeAtMost(BytesInt, 0, len - 1),
+            .any => smith.valueRangeAtMost(BytesInt, 0, len),
+        };
+    }
+
+    fn pick_del_len(smith: *std.testing.Smith, max_len: BytesInt) BytesInt {
+        if (max_len == 0) return 0;
+
+        // Bias to short dels for more ops,
+        // keep some full-tail and full-range cases.
+        return switch (smith.valueWeighted(DelCase, &.{
+            std.testing.Smith.Weight.value(DelCase, .zero, 1),
+            std.testing.Smith.Weight.value(DelCase, .short, 8),
+            std.testing.Smith.Weight.value(DelCase, .to_end, 2),
+            // Keep some full-range dels so long cuts still show up.
+            std.testing.Smith.Weight.value(DelCase, .any, 4),
+        })) {
+            .zero => 0,
+            .short => smith.valueRangeAtMost(BytesInt, 1, @min(max_len, 16)),
+            .to_end => max_len,
+            .any => smith.valueRangeAtMost(BytesInt, 0, max_len),
+        };
+    }
+
     pub fn test_one(ctx: void, smith: *std.testing.Smith) !void {
         _ = ctx;
         const gpa = std.testing.allocator;
@@ -1236,18 +1416,35 @@ const FuzzAgainstArrayList = struct {
         var s: std.ArrayList(u8) = .empty;
         defer s.deinit(gpa);
 
-        while (!smith.eosWeightedSimple(64, 1)) {
-            if (r.len == 0 or smith.value(bool)) {
-                const pos = smith.valueRangeAtMost(BytesInt, 0, r.len);
-                var buf: [1024]u8 = undefined;
-                const text = buf[0..smith.slice(&buf)];
+        while (!smith.eosWeightedSimple(31, 1)) {
+            const do_insert = if (r.len == 0)
+                true
+            else
+                smith.valueWeighted(bool, &.{
+                    // Slight insert bias keeps state
+                    // rich before dels cut it back.
+                    std.testing.Smith.Weight.value(bool, false, 3),
+                    std.testing.Smith.Weight.value(bool, true, 5),
+                });
+            if (do_insert) {
+                const pos = pick_pos(smith, r.len);
+                var buf: [256]u8 = undefined;
+                const text = buf[0..smith.sliceWeighted(&buf, &.{
+                    // Mostly short inserts for more ops per case,
+                    // with a long tail.
+                    std.testing.Smith.Weight.value(u32, 0, 1),
+                    std.testing.Smith.Weight.rangeAtMost(u32, 1, 16, 12),
+                    std.testing.Smith.Weight.rangeAtMost(u32, 17, 64, 4),
+                    std.testing.Smith.Weight.rangeAtMost(u32, 65, 256, 1),
+                }, &.{
+                    std.testing.Smith.Weight.rangeAtMost(u8, 0, 255, 1),
+                })];
 
                 try r.insert(gpa, pos, text);
                 try s.insertSlice(gpa, pos, text);
             } else {
-                const pos = smith.valueRangeAtMost(BytesInt, 0, r.len);
-                const del_len =
-                    smith.valueRangeAtMost(BytesInt, 0, r.len - pos);
+                const pos = pick_pos(smith, r.len);
+                const del_len = pick_del_len(smith, r.len - pos);
 
                 r.delete(pos, del_len);
                 s.replaceRangeAssumeCapacity(pos, del_len, "");
@@ -1278,7 +1475,10 @@ test "fuzz-against-arraylist" {
 
 fn lame_fuzz(
     ctx: anytype,
-    comptime test_one: fn (ctx: @TypeOf(ctx), smith: *std.testing.Smith) anyerror!void,
+    comptime test_one: fn (
+        ctx: @TypeOf(ctx),
+        smith: *std.testing.Smith,
+    ) anyerror!void,
     options: struct {
         corpus: []const []const u8 = &.{},
     },
