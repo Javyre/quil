@@ -12,8 +12,10 @@
 
     .dependencies = .{
         .uucode = .{
-            .url = "git+https://github.com/jacobsandlund/uucode.git#zig-0.16",
-            .hash = "uucode-0.2.0-ZZjBPkJiVABQGPdyw9BOtU2sflHv3vovBzmYtPRj2hvm",
+            // temp pin to fork while upstream PR is pending:
+            // https://github.com/jacobsandlund/uucode/pull/41
+            .url = "git+https://github.com/Javyre/uucode.git#zig-0.16",
+            .hash = "uucode-0.2.0-ZZjBPpNiVAAvcKSRs5BObHKbEnayfGkc5G7NoJqR-94F",
         },
     },
 }

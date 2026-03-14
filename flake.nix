@@ -40,11 +40,10 @@
           # zig = inputs'.zig.packages.master;
           zig = inputs'.zig-src.packages.zig.override {
             release = {
-              version = "0.16.0-dev.2684+3b515fbed";
+              version = "0.16.0-dev.2878+5d71e3051";
               src = {
-                rev = "3b515fbede945a2927d5aba59212553a8b26b944";
-                hash = "sha256-XaBCkDq8op4ItpsEUpluVGRu492EnB3zBiEv2YTX76M=";
-                # hash = "sha256-rFJJkJ725+QipJ9nuyptGGkJbFZ/i52cNbL31D32Cdw=";
+                rev = "5d71e3051833d20dd2dbfe801e060b3a1a3afa69";
+                hash = "sha256-Al9jK5KtOFYKzsrBwaOyaw4u8fk1fr//YlgixZjzfq4=";
               };
             };
           };

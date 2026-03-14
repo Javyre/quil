@@ -5,7 +5,7 @@ pub const QuilError = error{};
 const Error = QuilError;
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    var gpa_: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    var gpa_: std.heap.DebugAllocator(.{}) = .init;
     defer std.debug.assert(gpa_.deinit() == .ok);
     const gpa = gpa_.allocator();
     var rt: std.Io.Threaded = .init(gpa, .{

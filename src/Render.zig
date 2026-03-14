@@ -116,9 +116,9 @@ const Grid = struct {
 
     pub const empty: Grid = .{
         .dims = .zero,
-        .cell_char = .{},
-        .cell_bg = .{},
-        .cell_fg = .{},
+        .cell_char = .empty,
+        .cell_bg = .empty,
+        .cell_fg = .empty,
     };
 };
 
