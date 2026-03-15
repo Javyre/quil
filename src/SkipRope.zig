@@ -647,6 +647,33 @@ pub fn ib_at(r: *SkipRope, num: Ib.Num) *Ib {
     assert(num != .null);
     return r.ibs.at(.cast(@intFromEnum(num) - 1));
 }
+fn ib_descend_prev(
+    r: *SkipRope,
+    parent: Ib.PtrNum,
+    parent_prev: ?Ib.PtrNum,
+    parent_is_header: bool,
+    rank: Ib.CapInt,
+) ?Ib.PtrNum {
+    if (parent_is_header and rank == 0) return null;
+
+    const num: Ib.Num = @enumFromInt(parent.ptr.down[rank]);
+    const prev_start_num: Ib.Num = if (rank > 0)
+        @enumFromInt(parent.ptr.down[rank - 1])
+    else blk: {
+        const prev_parent = parent_prev.?;
+        break :blk @enumFromInt(
+            prev_parent.ptr.down[prev_parent.ptr.len() - 1],
+        );
+    };
+    var it = Ib.PtrNum.iter(.{
+        .num = prev_start_num,
+        .ptr = r.ib_at(prev_start_num),
+    });
+    while (it.next(r)) |prev| {
+        if (prev.ptr.next == num) return prev;
+    }
+    unreachable;
+}
 pub fn db_destroy(r: *SkipRope, num: Db.Num) void {
     assert(num != .null);
     r.dbs.destroy(.cast(@intFromEnum(num) - 1));
@@ -1169,8 +1196,9 @@ pub fn delete(
     // Walk index layers top-down, rewriting the touched suffix in-place
     // before descending.
     var h_cur = r.ib_height + 1;
+    var prev_ib: ?Ib.PtrNum = null;
     while (h_cur > 0) : (h_cur -= 1) {
-        const found = cur.ib_find_ofs_with_prev(r, pos, null) orelse
+        const found = cur.ib_find_ofs_with_prev(r, pos, prev_ib) orelse
             std.debug.panic("deletion point out of bounds", .{});
         const rank = cur.down.rank.in_ib;
         const del_ofs_in_slot: u32 = @intCast(pos - cur.down.rank_ofs);
@@ -1332,10 +1360,18 @@ pub fn delete(
         dst_ib.ptr.next = dst_next;
 
         // Descend after the local rewrite is complete.
-        if (h_cur > 1)
-            cur.ib_descend_as_ib(r)
-        else
+        if (h_cur > 1) {
+            prev_ib = ib_descend_prev(
+                r,
+                cur.b.ib,
+                prev_ib,
+                cur.b_is_header,
+                cur.down.rank.in_ib,
+            );
+            cur.ib_descend_as_ib(r);
+        } else {
             cur.ib_descend_as_db(r);
+        }
     }
 
     assert(h_cur == 0);
