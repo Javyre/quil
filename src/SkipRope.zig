@@ -1056,6 +1056,80 @@ test "delete: edge-aligned keep-slot and merge-left cases" {
     try std.testing.expectFmt(s.items, "{f}", .{r.fmtString(0, r.len)});
 }
 
+test "delete: non-header ib subtree start deletes" {
+    const gpa = std.testing.allocator;
+
+    const text_len = Db.capacity * Ib.capacity * Ib.capacity + Db.capacity * 4;
+    var text: [text_len]u8 = undefined;
+    for (&text, 0..) |*b, i| b.* = 'a' + @as(u8, @intCast(i % 26));
+
+    const Collect = struct {
+        fn child_starts(
+            r: *SkipRope,
+            ib: Ib.PtrNum,
+            ofs: BytesInt,
+            is_header: bool,
+            ib_layers_left: usize,
+            starts: *std.ArrayList(BytesInt),
+        ) !void {
+            assert(ib_layers_left > 1);
+
+            var slot_ofs = ofs;
+            for (0..ib.ptr.len()) |i| {
+                const child_ofs = slot_ofs;
+                const child_is_header = is_header and i == 0;
+                if (!child_is_header) try starts.append(gpa, child_ofs);
+
+                if (ib_layers_left > 2) {
+                    const child_num: Ib.Num = @enumFromInt(ib.ptr.down[i]);
+                    try child_starts(
+                        r,
+                        .{ .num = child_num, .ptr = r.ib_at(child_num) },
+                        child_ofs,
+                        child_is_header,
+                        ib_layers_left - 1,
+                        starts,
+                    );
+                }
+
+                slot_ofs += ib.ptr.wide[i];
+            }
+        }
+    };
+
+    var seed: SkipRope = .empty;
+    defer seed.deinit(gpa);
+    try seed.insert(gpa, 0, &text);
+    try std.testing.expect(seed.ib_height >= 2);
+
+    var starts: std.ArrayList(BytesInt) = .empty;
+    defer starts.deinit(gpa);
+    try Collect.child_starts(
+        &seed,
+        .{ .num = seed.root, .ptr = seed.ib_at(seed.root) },
+        0,
+        true,
+        seed.ib_height + 1,
+        &starts,
+    );
+    try std.testing.expect(starts.items.len > 0);
+
+    for (starts.items) |pos| {
+        var r: SkipRope = .empty;
+        defer r.deinit(gpa);
+        var s: std.ArrayList(u8) = .empty;
+        defer s.deinit(gpa);
+
+        try r.insert(gpa, 0, &text);
+        try s.appendSlice(gpa, &text);
+
+        r.delete(pos, 1);
+        s.replaceRangeAssumeCapacity(pos, 1, "");
+        try r.expect_valid();
+        try std.testing.expectFmt(s.items, "{f}", .{r.fmtString(0, r.len)});
+    }
+}
+
 pub fn delete(
     r: *SkipRope,
     pos: BytesInt,
