@@ -200,15 +200,15 @@ const Ib = extern struct {
         pub fn find(
             first: PtrNum,
             r: *SkipRope,
-            comptime track_prev: bool,
-            prev: if (track_prev) ?PtrNum else void,
+            comptime with_prev: bool,
+            prev: if (with_prev) ?PtrNum else void,
             first_ofs: BytesInt,
             first_is_header: bool,
             ofs: BytesInt,
         ) ?struct {
             ib: PtrNum,
             ib_ofs: BytesInt,
-            ib_prev: if (track_prev) ?PtrNum else void,
+            ib_prev: if (with_prev) ?PtrNum else void,
             rank: CapInt,
             rank_ofs: BytesInt,
         } {
@@ -227,7 +227,7 @@ const Ib = extern struct {
                 @branchHint(.unlikely);
                 assert(ib_ofs == 0);
             } else {
-                if (track_prev) assert(prev != null);
+                if (with_prev) assert(prev != null);
                 // Only header Ib can have 0-width
                 assert(it.peek(r).?.ptr.wide[0] != 0);
             }
@@ -248,7 +248,7 @@ const Ib = extern struct {
                     ib_w += w;
                 }
                 ib_ofs += ib_w;
-                if (track_prev) ib_prev = ib;
+                if (with_prev) ib_prev = ib;
             }
             return null;
         }
@@ -418,15 +418,12 @@ const Db = extern struct {
         pub fn find(
             first: PtrNum,
             r: *SkipRope,
-            comptime track_prev: bool,
-            prev: if (track_prev) ?PtrNum else void,
             first_ofs: BytesInt,
             first_is_header: bool,
             ofs: BytesInt,
         ) ?struct {
             db: PtrNum,
             db_ofs: BytesInt,
-            db_prev: if (track_prev) ?PtrNum else void,
             rank: CapInt,
             rank_ofs: BytesInt,
         } {
@@ -436,19 +433,16 @@ const Db = extern struct {
                 @branchHint(.likely);
                 assert(it.peek(r).?.ptr.len > 0);
             }
-            var db_prev = prev;
             while (it.next(r)) |db| {
                 if (ofs <= db_ofs + db.ptr.len) {
                     return .{
                         .db = db,
                         .db_ofs = db_ofs,
-                        .db_prev = db_prev,
                         .rank = @intCast(ofs - db_ofs),
                         .rank_ofs = ofs,
                     };
                 }
                 db_ofs += db.ptr.len;
-                if (track_prev) db_prev = db;
             }
             return null;
         }
@@ -514,19 +508,12 @@ const Db = extern struct {
     }
 };
 
-const FindCursorCfg = struct {
-    track_prev: bool = false,
-};
-fn FindCursor(comptime cfg: FindCursorCfg) type {
+fn FindCursor() type {
     return struct {
         b: union {
             ib: Ib.PtrNum,
             db: Db.PtrNum,
         },
-        prev_b: if (cfg.track_prev) union {
-            ib: ?Ib.PtrNum,
-            db: ?Db.PtrNum,
-        } else void,
         b_ofs: BytesInt,
         b_is_header: bool,
         down: struct {
@@ -537,14 +524,13 @@ fn FindCursor(comptime cfg: FindCursorCfg) type {
         pub fn ib_find_ofs(c: *@This(), r: *SkipRope, ofs: BytesInt) bool {
             const found = c.b.ib.find(
                 r,
-                cfg.track_prev,
-                if (cfg.track_prev) c.prev_b.ib else {},
+                false,
+                {},
                 c.b_ofs,
                 c.b_is_header,
                 ofs,
             ) orelse return false;
             if (c.b.ib.num != found.ib.num) c.b_is_header = false;
-            if (cfg.track_prev) c.prev_b = .{ .ib = found.ib_prev };
             c.b = .{ .ib = found.ib };
             c.b_ofs = found.ib_ofs;
             c.down = .{
@@ -552,6 +538,31 @@ fn FindCursor(comptime cfg: FindCursorCfg) type {
                 .rank_ofs = found.rank_ofs,
             };
             return true;
+        }
+        pub fn ib_find_ofs_with_prev(
+            c: *@This(),
+            r: *SkipRope,
+            ofs: BytesInt,
+            prev: ?Ib.PtrNum,
+        ) ?struct {
+            ib_prev: ?Ib.PtrNum,
+        } {
+            const found = c.b.ib.find(
+                r,
+                true,
+                prev,
+                c.b_ofs,
+                c.b_is_header,
+                ofs,
+            ) orelse return null;
+            if (c.b.ib.num != found.ib.num) c.b_is_header = false;
+            c.b = .{ .ib = found.ib };
+            c.b_ofs = found.ib_ofs;
+            c.down = .{
+                .rank = .{ .in_ib = found.rank },
+                .rank_ofs = found.rank_ofs,
+            };
+            return .{ .ib_prev = found.ib_prev };
         }
         pub fn ib_descend_as_ib(c: *@This(), r: *SkipRope) void {
             const parent = c.b.ib;
@@ -561,31 +572,8 @@ fn FindCursor(comptime cfg: FindCursorCfg) type {
                 parent.ptr.down[rank],
             );
             const ib: Ib.PtrNum = .{ .num = num, .ptr = r.ib_at(num) };
-            var prev_ib: ?Ib.PtrNum = null;
-            if (cfg.track_prev and !is_header) {
-                const prev_start_num: Ib.Num = if (rank > 0)
-                    @enumFromInt(parent.ptr.down[rank - 1])
-                else blk: {
-                    const prev_parent = c.prev_b.ib.?;
-                    break :blk @enumFromInt(
-                        prev_parent.ptr.down[prev_parent.ptr.len() - 1],
-                    );
-                };
-                var it = Ib.PtrNum.iter(.{
-                    .num = prev_start_num,
-                    .ptr = r.ib_at(prev_start_num),
-                });
-                while (it.next(r)) |prev| {
-                    if (prev.ptr.next == num) {
-                        prev_ib = prev;
-                        break;
-                    }
-                }
-                assert(prev_ib != null);
-            }
             c.b_is_header = is_header;
             c.b = .{ .ib = ib };
-            if (cfg.track_prev) c.prev_b = .{ .ib = prev_ib };
             c.b_ofs = c.down.rank_ofs;
         }
         pub fn ib_descend_as_db(c: *@This(), r: *SkipRope) void {
@@ -595,20 +583,16 @@ fn FindCursor(comptime cfg: FindCursorCfg) type {
             );
             const db: Db.PtrNum = .{ .num = num, .ptr = r.db_at(num) };
             c.b = .{ .db = db };
-            if (cfg.track_prev) c.prev_b = .{ .db = null };
             c.b_ofs = c.down.rank_ofs;
         }
         pub fn db_find_ofs(c: *@This(), r: *SkipRope, ofs: BytesInt) bool {
             const found = c.b.db.find(
                 r,
-                cfg.track_prev,
-                if (cfg.track_prev) c.prev_b.db else {},
                 c.b_ofs,
                 c.b_is_header,
                 ofs,
             ) orelse return false;
             if (c.b.db.num != found.db.num) c.b_is_header = false;
-            if (cfg.track_prev) c.prev_b = .{ .db = found.db_prev };
             c.b = .{ .db = found.db };
             c.b_ofs = found.db_ofs;
             c.down = .{
@@ -755,9 +739,8 @@ pub fn insert(
 
     assert(h_ins <= h_tree - 1);
 
-    var cur: FindCursor(.{ .track_prev = true }) = .{
+    var cur: FindCursor() = .{
         .b = .{ .ib = root },
-        .prev_b = .{ .ib = null },
         .b_ofs = 0,
         .b_is_header = true,
     };
@@ -1096,9 +1079,8 @@ pub fn delete(
         .num = r.root,
         .ptr = r.ib_at(r.root),
     };
-    var cur: FindCursor(.{ .track_prev = true }) = .{
+    var cur: FindCursor() = .{
         .b = .{ .ib = root },
-        .prev_b = .{ .ib = null },
         .b_ofs = 0,
         .b_is_header = true,
     };
@@ -1114,7 +1096,7 @@ pub fn delete(
     // before descending.
     var h_cur = r.ib_height + 1;
     while (h_cur > 0) : (h_cur -= 1) {
-        if (!cur.ib_find_ofs(r, pos))
+        const found = cur.ib_find_ofs_with_prev(r, pos, null) orelse
             std.debug.panic("deletion point out of bounds", .{});
         const rank = cur.down.rank.in_ib;
         const del_ofs_in_slot: u32 = @intCast(pos - cur.down.rank_ofs);
@@ -1135,7 +1117,7 @@ pub fn delete(
                 dst_rank = rank - 1;
                 dst_end = rank;
             } else {
-                dst_ib = cur.prev_b.ib.?;
+                dst_ib = found.ib_prev.?;
                 dst_end = dst_ib.ptr.len();
                 dst_rank = dst_end - 1;
             }
@@ -1902,9 +1884,8 @@ fn formatString(
     if (args.len == 0) return;
 
     const root: Ib.PtrNum = .{ .num = r.root, .ptr = r.ib_at(r.root) };
-    var find_cur: FindCursor(.{}) = .{
+    var find_cur: FindCursor() = .{
         .b = .{ .ib = root },
-        .prev_b = {},
         .b_ofs = 0,
         .b_is_header = true,
     };
