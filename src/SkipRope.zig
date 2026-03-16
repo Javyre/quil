@@ -876,11 +876,11 @@ pub fn insert(
 test "insert" {
     const log_ = @import("./log.zig");
     log_.testing_level.* = .warn;
-    log_.testing_scope_levels = &.{
-        .{ .scope = .fuzz, .level = .info },
-        .{ .scope = .rope, .level = .debug },
-        .{ .scope = .rope_test, .level = .debug },
-    };
+    // log_.testing_scope_levels = &.{
+    //     .{ .scope = .fuzz, .level = .info },
+    //     .{ .scope = .rope, .level = .debug },
+    //     .{ .scope = .rope_test, .level = .debug },
+    // };
 
     var r: SkipRope = .empty;
     defer r.deinit(std.testing.allocator);
@@ -888,7 +888,7 @@ test "insert" {
     try r.insert(std.testing.allocator, 0, "Hello, world!");
     try r.insert(std.testing.allocator, 1, "Hello, world!");
     try r.insert(std.testing.allocator, 0, "Hello, world!");
-    std.debug.print("{f}", .{r.fmtString(0, r.len)});
+    // std.debug.print("{f}", .{r.fmtString(0, r.len)});
 }
 
 test "delete-smoke" {
