@@ -1,5 +1,5 @@
 const std = @import("std");
-const Rope = @import("./Rope.zig");
+const SkipRope = @import("./SkipRope.zig");
 
 const MultiArrayPool = @import("./multi_array_pool.zig").MultiArrayPool;
 
@@ -8,7 +8,7 @@ const BufferManager = @This();
 test {
     std.testing.refAllDecls(@This());
     // TODO: figure out why we need this line if the above line already exists
-    _ = Rope;
+    _ = SkipRope;
 }
 
 io: std.Io,

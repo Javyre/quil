@@ -234,12 +234,12 @@ fn input_loop(q: *Quil) !void {
 
 fn setup(q: *Quil) !void {
     {
-        // SPONGE: delete this once we refer to rope outside of just tests
-        const Rope = @import("Rope.zig");
-        var r: Rope = .init(q.alloc);
-        defer r.deinit();
-        try r.insert(.coerce(0), "testing 123");
-        r.delete(.coerce(1), .coerce(3));
+        // SPONGE: delete this once we refer to skiprope outside of just tests
+        const SkipRope = @import("SkipRope.zig");
+        var r: SkipRope = .empty;
+        defer r.deinit(q.alloc);
+        try r.insert(q.alloc, 0, "testing 123");
+        r.delete(1, 3);
     }
 
     const buf = try q.buf_create("*Scratch*");
