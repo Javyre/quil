@@ -1083,6 +1083,29 @@ test "delete: edge-aligned keep-slot and merge-left cases" {
     try std.testing.expectFmt(s.items, "{f}", .{r.fmtString(0, r.len)});
 }
 
+test "delete shortens unary top levels" {
+    const gpa = std.testing.allocator;
+
+    var r: SkipRope = .empty;
+    defer r.deinit(gpa);
+
+    var text: [Db.capacity * Ib.capacity * 2]u8 = undefined;
+    for (&text, 0..) |*b, i| b.* = 'a' + @as(u8, @intCast(i % 26));
+
+    try r.insert(gpa, 0, &text);
+    try std.testing.expect(r.ib_height > 0);
+
+    const old_root = r.root;
+    r.delete(0, text.len);
+
+    try r.expect_valid();
+    try std.testing.expectEqual(@as(BytesInt, 0), r.len);
+    try std.testing.expectEqual(@as(HeightInt, 0), r.ib_height);
+    try std.testing.expectEqual(SkipRope.empty.root, r.root);
+    try std.testing.expect(r.root != old_root);
+    try std.testing.expectFmt("", "{f}", .{r.fmtString(0, r.len)});
+}
+
 pub fn delete(
     r: *SkipRope,
     pos: BytesInt,
@@ -1384,6 +1407,34 @@ pub fn delete(
     }
 
     r.len -= len;
+
+    while (r.ib_height > 0) {
+        const root_num = r.root;
+        const root_ptr = r.ib_at(root_num);
+        const root_is_unary = root_ptr.next == .null and root_ptr.down[1] == 0;
+        if (!root_is_unary) break;
+
+        r.root = @enumFromInt(root_ptr.down[0]);
+        r.ib_height -= 1;
+        r.ib_destroy(root_num);
+    }
+
+    if (r.len == 0) {
+        const root_num = r.root;
+        const root_ptr = r.ib_at(root_num);
+        assert(root_ptr.next == .null);
+        assert(root_ptr.down[1] == 0);
+
+        const db_num: Db.Num = @enumFromInt(root_ptr.down[0]);
+        const db_ptr = r.db_at(db_num);
+        assert(db_ptr.next == .null);
+        assert(db_ptr.len == 0);
+
+        r.db_destroy(db_num);
+        r.ib_destroy(root_num);
+        r.root = .null;
+        r.ib_height = 0;
+    }
 }
 
 const FuzzAgainstArrayList = struct {
