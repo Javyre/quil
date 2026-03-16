@@ -250,9 +250,9 @@ fn setup(q: *Quil) !void {
 
     try q.ctnr_insert(root, win, 0);
     try q.win_set_buf(win, buf);
-    // try q.buf_set_region(buf, 0, -1,
-    //     \\
-    //     \\// Scratch zig buffer
-    //     \\
-    // );
+    try q.buf_set_region(buf, 0, -1,
+        \\
+        \\// Scratch zig buffer
+        \\
+    );
 }

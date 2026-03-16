@@ -261,17 +261,23 @@ fn redraw_window(
 ) !void {
     // TODO: impl word/text wrapping
 
-    const buf_lines = wm.buf_manager.buffer_get_lines(window.buf).items;
-    const buf_draw_height = @min(dims.h, buf_lines.len);
+    const rope = wm.buf_manager.buffer_get_rope(window.buf);
+    if (rope.len == 0) return;
 
-    for (
-        0..,
-        buf_lines[0..buf_draw_height],
-    ) |y, line| {
+    const text = try std.fmt.allocPrint(
+        wm.gpa,
+        "{f}",
+        .{rope.fmtString(0, rope.len)},
+    );
+    defer wm.gpa.free(text);
+
+    var y: u16 = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (y < dims.h and lines.next()) |line| : (y += 1) {
         try wm.render.surface_draw_utf8(window.surface, .{
             .x = 0,
-            .y = @intCast(y),
-        }, line.items);
+            .y = y,
+        }, line);
     }
 }
 
