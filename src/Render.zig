@@ -1,8 +1,8 @@
 const std = @import("std");
 const uucode = @import("uucode");
-
 const MultiArrayPool = @import("./multi_array_pool.zig").MultiArrayPool;
 const EgcPool = @import("./EGCPool.zig");
+const stdx = @import("./stdx.zig");
 
 const assert = std.debug.assert;
 
@@ -53,7 +53,7 @@ pub const Dimensions = struct {
 pub const Position = struct {
     x: u16,
     y: u16,
-    pub const zero: Position = .{ .x = 0, .y = 0 };
+    pub const origin: Position = .{ .x = 0, .y = 0 };
     pub fn to_vec(pos: Position) @Vector(2, u16) {
         return .{ pos.x, pos.y };
     }
@@ -137,13 +137,13 @@ const Surface = struct {
     dirt: Dirt = .clean,
     /// Position on the screen
     /// TODO: Relative offset to parent if parent not null.
-    screen_pos: Position = .zero,
+    screen_pos: Position = .origin,
     /// Size of the surface.
     /// This is the portion of the grid that will be used.
     dims: Dimensions = .zero,
 
     // For updating E to invalidate the previously rendered cells:
-    flush_prev_screen_pos: Position = .zero,
+    flush_prev_screen_pos: Position = .origin,
     flush_prev_dims: Dimensions = .zero,
 
     /// Bitmap of dirty cells.
@@ -151,9 +151,9 @@ const Surface = struct {
     /// Backing grid. surfaces can share larger backing grids.
     grid: GridNum = .null,
     /// Position on the backing grid.
-    grid_pos: Position = .zero,
+    grid_pos: Position = .origin,
     /// Offset applied to grid_pos. Overflows wrap around our grid portion.
-    wrapping_ofs: Position = .zero,
+    wrapping_ofs: Position = .origin,
 
     default_fg: Color = .white,
     default_bg: Color = .default,
@@ -179,14 +179,14 @@ const BitMap = struct {
     const View = struct {
         bm: []Word,
         bm_dims: Dimensions,
-        vp_ofs: Position = .zero,
+        vp_ofs: Position = .origin,
         vp_dims: Dimensions = .zero,
 
         pub fn entire(bm: []Word, bm_dims: Dimensions) View {
             return .{
                 .bm = bm,
                 .bm_dims = bm_dims,
-                .vp_ofs = .zero,
+                .vp_ofs = .origin,
                 .vp_dims = bm_dims,
             };
         }
@@ -246,13 +246,18 @@ const BitMap = struct {
 
         /// Returns the viewport x coord of the next set bit, or null if there
         /// are no more set bits in the row.
+        ///
+        /// `start_x` scans the half-open range `[start_x, view.vp_dims.w)`.
+        /// Passing `start_x == view.vp_dims.w` is valid and signals the end of
+        /// iteration for that row.
         pub fn find_next_set_in_row(view: View, start_x: u16, row_y: u16) ?struct {
             x: u16,
             count: u16,
         } {
             view.assert_valid();
-            std.debug.assert(row_y < view.bm_dims.h);
-            std.debug.assert(start_x < view.bm_dims.w);
+            std.debug.assert(row_y < view.vp_dims.h);
+            std.debug.assert(start_x <= view.vp_dims.w);
+            if (start_x == view.vp_dims.w) return null;
 
             const y = view.vp_ofs.y + row_y;
             const x = view.vp_ofs.x;
@@ -273,7 +278,7 @@ const BitMap = struct {
                     bit_len - bit_ofs,
                     false,
                     native_endian,
-                ) orelse view.vp_dims.w)),
+                ) orelse bit_len - bit_ofs)),
             } else null;
         }
     };
@@ -403,6 +408,24 @@ const BitMap = struct {
             std.mem.sliceAsBytes(expected.bm),
             std.mem.sliceAsBytes(result.bm),
         );
+    }
+
+    test "find_next_set_in_row end sentinel and tail count" {
+        var bm = [_]Word{0};
+        const whole = BitMap.View.entire(&bm, .{ .w = 16, .h = 3 });
+        const view = BitMap.View.subview(
+            whole,
+            .{ .x = 4, .y = 1 },
+            .{ .w = 5, .h = 1 },
+        );
+
+        view.set_rect(.{ .x = 1, .y = 0, .w = 4, .h = 1 }, 1);
+
+        try std.testing.expect(view.find_next_set_in_row(5, 0) == null);
+        const found = view.find_next_set_in_row(0, 0).?;
+        try std.testing.expectEqual(@as(u16, 1), found.x);
+        try std.testing.expectEqual(@as(u16, 4), found.count);
+        try std.testing.expect(view.find_next_set_in_row(found.x + found.count, 0) == null);
     }
 
     /// Get a slice containing the bits of an unaligned bit read.
@@ -1043,7 +1066,7 @@ fn surface_cp_to_grid(
     }{
         .{
             .grid_pos = src_s.grid_pos,
-            .surf_pos = .zero,
+            .surf_pos = .origin,
             .dims = tl_dims,
         },
         .{
@@ -1306,6 +1329,8 @@ pub fn surface_create(r: *Render) !SurfaceNum {
 }
 
 pub fn surface_destroy(r: *Render, num: SurfaceNum) void {
+    const slice = r.surfaces.slice();
+    slice.items(.cell_dirt)[num.to_idx().?].deinit(r.alloc);
     r.surfaces.destroy(r.alloc, num);
 }
 
@@ -1404,13 +1429,258 @@ pub fn surface_get_grid_position(r: *Render, num: SurfaceNum) Position {
     return slice.items(.grid_pos)[num.to_idx().?];
 }
 
-pub fn surface_draw_utf8(
+pub const SurfaceWriteUtf8Result = struct {
+    pub const End = enum {
+        need_feed,
+        eos,
+        newline,
+        row_full,
+    };
+
+    bytes: usize,
+    cells: u16,
+    end: End,
+};
+
+pub const Utf8StreamWriter = struct {
+    // One row writer over one contig text stream.
+    // Extra state is just for gc cuts at input chunk bounds.
+    render: *Render,
+    surface: SurfaceNum,
+    pos: Position,
+    gc_iter: *TrueGcIter,
+
+    pub fn init(
+        render: *Render,
+        surface: SurfaceNum,
+        pos: Position,
+        gc_iter: *TrueGcIter,
+    ) Utf8StreamWriter {
+        return .{
+            .render = render,
+            .surface = surface,
+            .pos = pos,
+            .gc_iter = gc_iter,
+        };
+    }
+
+    pub fn write(writer: *Utf8StreamWriter) !SurfaceWriteUtf8Result {
+        return try surface_write_utf8_impl(
+            writer.render,
+            writer.surface,
+            writer,
+        );
+    }
+};
+
+pub const TrueGcIter = struct {
+    // Holds carry bytes across chunk cuts.
+    // Naive per-slice gc scan would split at read bounds.
+    ring: stdx.ByteRing(buf_cap),
+    input_done: bool,
+
+    pub const buf_cap = 256;
+
+    pub const empty: TrueGcIter = .{
+        .ring = .empty,
+        .input_done = false,
+    };
+
+    pub const Item = struct {
+        bytes: stdx.ByteParts,
+        wcwidth: usize,
+    };
+
+    pub const Next = union(enum) {
+        item: Item,
+        need_feed,
+        eos,
+    };
+
+    pub fn feed_cp(it: *TrueGcIter, text: []const u8) usize {
+        std.debug.assert(!it.input_done);
+        if (text.len == 0) return 0;
+
+        var utf8_it = uucode.utf8.Iterator.init(text);
+        _ = utf8_it.next() orelse return 0;
+        // Only push one full cp.
+        const cp_len = utf8_it.i;
+        assert(cp_len != 0);
+        it.ring.push_slice(text[0..cp_len]) catch unreachable;
+        return cp_len;
+    }
+
+    pub fn finish_input(it: *TrueGcIter) void {
+        it.input_done = true;
+    }
+
+    pub fn buffered(it: *const TrueGcIter) stdx.ByteParts {
+        return it.ring.parts();
+    }
+
+    pub fn discard(it: *TrueGcIter, n: u16) void {
+        it.ring.pop_front(n);
+    }
+
+    pub fn next(it: *TrueGcIter) Next {
+        if (it.ring.len == 0) {
+            return if (it.input_done) .eos else .need_feed;
+        }
+
+        const ring = it.ring.parts();
+        var gc_it = uucode.grapheme.Iterator(BiUtf8Iterator).init(
+            .init(ring.a, ring.b),
+        );
+        const start = gc_it.i;
+        const wcwidth = uucode.x.grapheme.wcwidthNext(&gc_it);
+        const end = gc_it.i;
+        if (start == end) {
+            assert(wcwidth == 0);
+            return if (it.input_done) .eos else .need_feed;
+        }
+        assert(start == 0);
+
+        if (gc_it.next_cp == null and !it.input_done) {
+            // Found one gc, but maybe only from stream end.
+            // Need more bytes to tell real gc end from read cut.
+            return .need_feed;
+        }
+
+        const gc = it.ring.span(0, @intCast(end));
+        it.ring.pop_front(@intCast(end));
+        return .{ .item = .{
+            .bytes = gc,
+            .wcwidth = wcwidth,
+        } };
+    }
+};
+
+const BiUtf8Iterator = struct {
+    i: usize = 0,
+    first: uucode.utf8.Iterator,
+    second: uucode.utf8.Iterator,
+
+    fn init(first: []const u8, second: []const u8) BiUtf8Iterator {
+        return .{
+            .first = .init(first),
+            .second = .init(second),
+        };
+    }
+
+    pub fn next(it: *BiUtf8Iterator) ?u21 {
+        if (it.first.peek()) |cp| {
+            _ = it.first.next();
+            it.i = it.first.i;
+            return cp;
+        }
+        if (it.second.peek()) |cp| {
+            _ = it.second.next();
+            it.i = it.first.bytes.len + it.second.i;
+            return cp;
+        }
+        return null;
+    }
+
+    pub fn peek(it: BiUtf8Iterator) ?u21 {
+        var next_it = it;
+        return next_it.next();
+    }
+};
+
+test "TrueGcIter split grapheme feed protocol" {
+    var gc_it: TrueGcIter = .empty;
+    try std.testing.expectEqual(1, gc_it.feed_cp("A\u{0300}"));
+    try std.testing.expectEqual(.need_feed, gc_it.next());
+    try std.testing.expectEqual(1, gc_it.ring.len);
+    try std.testing.expectEqual(2, gc_it.feed_cp("\u{0300}"));
+    try std.testing.expectEqual(.need_feed, gc_it.next());
+    try std.testing.expectEqual(3, gc_it.ring.len);
+    _ = gc_it.feed_cp("B");
+    var gc_buf: [8]u8 = undefined;
+    const first = gc_it.next().item;
+    try std.testing.expectEqual(3, first.bytes.len());
+    try std.testing.expectEqualStrings("A\u{0300}", first.bytes.flatten(&gc_buf));
+
+    gc_it.finish_input();
+    const second = gc_it.next().item;
+    try std.testing.expectEqual(1, second.wcwidth);
+    try std.testing.expectEqual(1, second.bytes.len());
+    try std.testing.expectEqualStrings("B", second.bytes.flatten(&gc_buf));
+    try std.testing.expectEqual(.eos, gc_it.next());
+}
+
+test "TrueGcIter keeps ring wrap grapheme whole" {
+    var gc_it: TrueGcIter = .empty;
+    gc_it.ring.head = TrueGcIter.buf_cap - 1;
+    gc_it.ring.len = 1;
+    gc_it.ring.buf[TrueGcIter.buf_cap - 1] = 'A';
+    try std.testing.expectEqual(2, gc_it.feed_cp("\u{0300}B"));
+    try std.testing.expectEqual(1, gc_it.feed_cp("B"));
+    gc_it.finish_input();
+    var gc_buf: [8]u8 = undefined;
+
+    const gc = gc_it.next().item;
+    try std.testing.expectEqualStrings("A\u{0300}", gc.bytes.flatten(&gc_buf));
+}
+
+test "surface_write_utf8 aggregates split feed result" {
+    var r = try Render.init(undefined, std.testing.allocator);
+    defer r.deinit();
+
+    const grid = try r.grid_create();
+    try r.grid_set_dimensions(grid, .{ .w = 8, .h = 1 });
+
+    const surface = try r.surface_create();
+    r.surface_set_grid(surface, grid);
+    try r.surface_set_dimensions(surface, .{ .w = 8, .h = 1 });
+    r.surface_set_grid_position(surface, .origin);
+
+    const ret = try r.surface_write_utf8(surface, .origin, "ab");
+    try std.testing.expectEqual(@as(usize, 2), ret.bytes);
+    try std.testing.expectEqual(@as(u16, 2), ret.cells);
+    try std.testing.expectEqual(.eos, ret.end);
+}
+
+pub fn surface_write_utf8(
     r: *Render,
     num: SurfaceNum,
-    pos_: Position,
+    pos: Position,
     text: []const u8,
-) !void {
-    var pos = pos_;
+) !SurfaceWriteUtf8Result {
+    var gc_it: TrueGcIter = .empty;
+    var writer = Utf8StreamWriter.init(r, num, pos, &gc_it);
+    var text_i: usize = 0;
+    var bytes: usize = 0;
+    var cells: u16 = 0;
+
+    while (true) {
+        const ret = try writer.write();
+        bytes += ret.bytes;
+        cells += ret.cells;
+        switch (ret.end) {
+            .need_feed => {
+                if (text_i == text.len) {
+                    gc_it.finish_input();
+                    continue;
+                }
+                text_i += gc_it.feed_cp(text[text_i..]);
+            },
+            else => return .{
+                .bytes = bytes,
+                .cells = cells,
+                .end = ret.end,
+            },
+        }
+    }
+}
+
+fn surface_write_utf8_impl(
+    r: *Render,
+    num: SurfaceNum,
+    writer: *Utf8StreamWriter,
+) !SurfaceWriteUtf8Result {
+    const pos0 = writer.pos;
+    var pos = pos0;
 
     const s_slice = r.surfaces.slice();
     const s_dims = s_slice.items(.dims)[num.to_idx().?];
@@ -1436,38 +1706,29 @@ pub fn surface_draw_utf8(
 
     const s_cell_dirt_bm = BitMap.View.entire(s_cell_dirt.items, s_dims);
 
-    // // ASCII fast path
-    // if (zg.ascii.isAsciiOnly(text)) {
-    //     var cell_count: u16 = 0;
-    //     for (text) |char| {
-    //         // is ASCII
-    //         std.debug.assert(char < 128);
-    //         if (ascii_char_is_invisible(char)) {
-    //             continue;
-    //         }
-    //
-    //         const g_pos = grid_pos_from_surface_pos(info, pos);
-    //         g_grid.items[g_dims.w * g_pos.y + g_pos.x] = char;
-    //         pos.x += 1;
-    //         cell_count += 1;
-    //     }
-    //     s_cell_dirt_bm.set_rect(.from_pos_dims(pos_, .{ .h = 1, .w = cell_count }), 1);
-    //     s_dirt.* = .partial;
-    //     r.surfaces_dirty = true;
-    //     return;
-    // }
-
     var cell_count: u16 = 0;
-    var gc_it = uucode.grapheme.utf8Iterator(text);
-    while (nextGrapheme(&gc_it)) |gc_info| {
-        const gc = text[gc_info.start..gc_info.end];
-        std.debug.assert(gc.len != 0);
+    var byte_count: usize = 0;
+    const end: SurfaceWriteUtf8Result.End = while (true) {
+        const gc_info = switch (writer.gc_iter.next()) {
+            .item => |gc_info| gc_info,
+            .need_feed => break .need_feed,
+            .eos => {
+                break .eos;
+            },
+        };
+        const gc = gc_info.bytes;
+        std.debug.assert(gc.len() != 0);
         std.debug.assert(pos.x < g_dims.w);
 
-        if (gc.len == 1) {
-            const char = gc[0];
-            // is ASCII
+        if (gc.len() == 1 and gc.first() == '\n') {
+            byte_count += gc.len();
+            break .newline;
+        }
+
+        if (gc.len() == 1) {
+            const char = gc.first();
             std.debug.assert(char < 128);
+            byte_count += gc.len();
             if (ascii_char_is_invisible(char)) continue;
 
             const g_pos = grid_pos_from_surface_pos(info, pos);
@@ -1475,8 +1736,15 @@ pub fn surface_draw_utf8(
             pos.x += 1;
             cell_count += 1;
         } else {
-            const ecg_idx = try r.egc_pool.register_grapheme(r.alloc, gc);
-            // const width = grapheme_width(gc);
+            const ecg_idx = try r.egc_pool.register_grapheme2(
+                r.alloc,
+                gc.a,
+                gc.b,
+            );
+            // TODO: query mode 2027 so we know how terminal handles
+            // multi-codepoint gc clusters. wcwidth is just a stand-in.
+            // https://mitchellh.com/writing/grapheme-clusters-in-terminals
+            // https://github.com/jameslanska/unicode-display-width?tab=readme-ov-file#how-it-works
             const width = gc_info.wcwidth;
 
             const max_x = @min(s_dims.w, pos.x + width);
@@ -1492,40 +1760,38 @@ pub fn surface_draw_utf8(
                 pos.x += 1;
                 cell_count += 1;
             }
+            byte_count += gc.len();
         }
 
-        // we should at most be exactly one after the last row cell
-        if (pos.x == s_dims.w) break;
+        if (pos.x == s_dims.w) {
+            break .row_full;
+        }
         std.debug.assert(pos.x < s_dims.w);
-    }
-    s_cell_dirt_bm.set_rect(.from_pos_dims(pos_, .{ .h = 1, .w = cell_count }), 1);
-    s_dirt.* = .partial;
-    r.surfaces_dirty = true;
-}
+    };
 
-fn nextGrapheme(iter: *uucode.grapheme.Iterator(uucode.utf8.Iterator)) ?struct {
-    start: usize,
-    end: usize,
-    wcwidth: usize,
-} {
-    const start = iter.i;
-    const width = uucode.x.grapheme.wcwidthNext(iter);
-    const end = iter.i;
+    writer.pos.x += cell_count;
 
-    // HACK: wcwidthNext() should rly just return an optional
-    // also this doesn't strictly follow the same semantic of "next"
-    // as grapheme.Iterator.nextGrapheme as is counts invalid tail bytes even
-    // if they don't end in a break;
-    if (start == end) {
-        assert(width == 0);
-        return null;
+    if (cell_count != 0) {
+        s_cell_dirt_bm.set_rect(.from_pos_dims(pos0, .{ .h = 1, .w = cell_count }), 1);
+        s_dirt.* = .partial;
+        r.surfaces_dirty = true;
     }
 
     return .{
-        .start = start,
+        .bytes = byte_count,
+        .cells = cell_count,
         .end = end,
-        .wcwidth = width,
     };
+}
+
+pub fn grid_get_cell_char(
+    r: *Render,
+    num: GridNum,
+    pos: Position,
+) u16 {
+    const slice = r.grids.slice();
+    const dims = slice.items(.dims)[num.to_idx().?];
+    return slice.items(.cell_char)[num.to_idx().?].items[dims.w * pos.y + pos.x];
 }
 
 const SurfaceGridInfo = struct {
@@ -1550,41 +1816,4 @@ fn ascii_char_is_invisible(char: u8) bool {
     std.debug.assert(char < 128);
     // C0 control char or DEL
     return char < 32 or char == 127;
-}
-
-// TODO: query for mode 2027 support so we know how terminal handles
-// multi-codepoint grapheme clusters. (wcwidth vs. proper clustering)
-// https://mitchellh.com/writing/grapheme-clusters-in-terminals
-//
-// probably measure grapheme width like this:
-// https://github.com/jameslanska/unicode-display-width?tab=readme-ov-file#how-it-works
-fn grapheme_width(
-    gc_bytes: []const u8,
-) u2 {
-    comptime assert(u2 == std.math.IntFittingRange(0, std.math.maxInt(i3)));
-
-    // code here adapted from strWidth
-    var cp_iter = uucode.utf8.Iterator{ .bytes = gc_bytes };
-    var gc_width: u2 = 0;
-
-    while (cp_iter.next()) |cp| {
-        // COMBAK
-        // SPONGE: use new uucode api for iterator based wcwidth
-        const w: i3 = uucode.get(.wcwidth_standalone, cp);
-
-        if (w >= 0) {
-            // Only adding width of first non-zero-width code point.
-            assert(gc_width == 0);
-            gc_width = @intCast(w);
-            // Handle text emoji sequence.
-            if (cp_iter.next()) |ncp| {
-                // emoji text sequence.
-                if (ncp == 0xFE0E) gc_width = 1;
-                if (ncp == 0xFE0F) gc_width = 2;
-            }
-            break;
-        }
-    }
-
-    return gc_width;
 }

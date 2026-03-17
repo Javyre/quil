@@ -1,6 +1,5 @@
 const std = @import("std");
 const SkipRope = @import("./SkipRope.zig");
-
 const MultiArrayPool = @import("./multi_array_pool.zig").MultiArrayPool;
 
 const BufferManager = @This();
@@ -23,11 +22,7 @@ const Buffers = MultiArrayPool(Buffer);
 pub const BufferNum = Buffers.Idx;
 const RopeInt = @TypeOf(SkipRope.empty.len);
 
-pub const Error = error{
-    RegionOutOfBounds,
-};
-
-pub fn init(io: std.Io, alloc: std.mem.Allocator) !BufferManager {
+pub fn init(io: std.Io, alloc: std.mem.Allocator) BufferManager {
     return .{
         .io = io,
         .alloc = alloc,
@@ -49,14 +44,17 @@ pub fn deinit(bm: *BufferManager) void {
     bm.* = undefined;
 }
 
-pub fn setup(bm: *BufferManager) !void {
+pub fn setup(bm: *BufferManager) void {
     _ = bm;
 }
-pub fn teardown(bm: *BufferManager) !void {
+pub fn teardown(bm: *BufferManager) void {
     _ = bm;
 }
 
-pub fn buffer_create(bm: *BufferManager, name: []const u8) !BufferNum {
+pub fn buffer_create(
+    bm: *BufferManager,
+    name: []const u8,
+) std.mem.Allocator.Error!BufferNum {
     return try bm.buffers.create(bm.alloc, .{
         .name = try bm.alloc.dupe(u8, name),
         .rope = .empty,
@@ -69,7 +67,7 @@ pub fn buffer_set_region(
     start: isize,
     end: isize,
     text: []const u8,
-) !void {
+) (std.mem.Allocator.Error || error{RegionOutOfBounds})!void {
     const idx = num.to_idx().?;
     const bufs = bm.buffers.slice();
     const rope = &bufs.items(.rope)[idx];
@@ -89,7 +87,16 @@ pub fn buffer_get_rope(bm: *BufferManager, num: BufferNum) *SkipRope {
     return &bm.buffers.slice().items(.rope)[num.to_idx().?];
 }
 
-fn region_pos(len: RopeInt, pos: isize) Error!RopeInt {
+pub fn buffer_get_rope_reader(
+    bm: *BufferManager,
+    num: BufferNum,
+    ofs: isize,
+) error{RegionOutOfBounds}!SkipRope.ReadCursor {
+    const rope = bm.buffer_get_rope(num);
+    return rope.read_cursor_at(try region_pos(rope.len, ofs));
+}
+
+fn region_pos(len: RopeInt, pos: isize) error{RegionOutOfBounds}!RopeInt {
     const len_usize: usize = len;
     if (pos >= 0) {
         const ofs: usize = @intCast(pos);
@@ -113,31 +120,44 @@ fn expect_text(
     try std.testing.expectFmt(want, "{f}", .{rope.fmtString(0, rope.len)});
 }
 
-test "buffer: set region writes rope text" {
-    var bm = try BufferManager.init(undefined, std.testing.allocator);
+test "buffer: set region cases" {
+    var bm = BufferManager.init(undefined, std.testing.allocator);
     defer bm.deinit();
 
-    const buf = try bm.buffer_create("scratch");
-    try bm.buffer_set_region(buf, 0, -1, "one\ntwo\n");
-    try expect_text(&bm, buf, "one\ntwo\n");
-}
+    const cases = [_]struct {
+        init_text: []const u8,
+        start: isize,
+        end: isize,
+        text: []const u8,
+        want: []const u8,
+    }{
+        .{
+            .init_text = "",
+            .start = 0,
+            .end = -1,
+            .text = "one\ntwo\n",
+            .want = "one\ntwo\n",
+        },
+        .{
+            .init_text = "alpha beta",
+            .start = 6,
+            .end = 10,
+            .text = "gamma",
+            .want = "alpha gamma",
+        },
+        .{
+            .init_text = "abc",
+            .start = -1,
+            .end = -1,
+            .text = "def",
+            .want = "abcdef",
+        },
+    };
 
-test "buffer: set region can replace middle range" {
-    var bm = try BufferManager.init(undefined, std.testing.allocator);
-    defer bm.deinit();
-
-    const buf = try bm.buffer_create("scratch");
-    try bm.buffer_set_region(buf, 0, -1, "alpha beta");
-    try bm.buffer_set_region(buf, 6, 10, "gamma");
-    try expect_text(&bm, buf, "alpha gamma");
-}
-
-test "buffer: set region can append at tail with -1" {
-    var bm = try BufferManager.init(undefined, std.testing.allocator);
-    defer bm.deinit();
-
-    const buf = try bm.buffer_create("scratch");
-    try bm.buffer_set_region(buf, 0, -1, "abc");
-    try bm.buffer_set_region(buf, -1, -1, "def");
-    try expect_text(&bm, buf, "abcdef");
+    for (cases) |case| {
+        const buf = try bm.buffer_create("scratch");
+        try bm.buffer_set_region(buf, 0, -1, case.init_text);
+        try bm.buffer_set_region(buf, case.start, case.end, case.text);
+        try expect_text(&bm, buf, case.want);
+    }
 }

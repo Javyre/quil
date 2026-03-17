@@ -691,6 +691,119 @@ pub fn jsonStringify(r: *const SkipRope, jw: anytype) !void {
     });
 }
 
+pub const ReadCursor = struct {
+    it: ?Db.PtrNum.Iter,
+    rank: Db.CapInt,
+    rest: BytesInt,
+
+    pub fn peek(cur: *ReadCursor, r: *SkipRope) ?[]const u8 {
+        if (cur.rest == 0) return null;
+
+        const it = &(cur.it orelse return null);
+        const db = it.peek(r) orelse {
+            cur.it = null;
+            cur.rest = 0;
+            return null;
+        };
+
+        const avail: usize = db.ptr.len - cur.rank;
+        assert(avail != 0);
+
+        const len: Db.CapInt = @intCast(@min(
+            @as(usize, cur.rest),
+            avail,
+        ));
+        return db.ptr.data[cur.rank..][0..len];
+    }
+
+    pub fn consume(cur: *ReadCursor, r: *SkipRope, n_: BytesInt) void {
+        assert(n_ <= cur.rest);
+        var n = n_;
+        while (n != 0) {
+            const chunk = cur.peek(r) orelse unreachable;
+            const take: BytesInt = @intCast(@min(@as(usize, n), chunk.len));
+
+            cur.rest -= take;
+            n -= take;
+            if (take == chunk.len) {
+                cur.rank = 0;
+                _ = cur.it.?.next(r);
+            } else {
+                cur.rank += @intCast(take);
+            }
+        }
+    }
+
+    pub fn skip_until(cur: *ReadCursor, r: *SkipRope, needle: u8) bool {
+        while (cur.peek(r)) |chunk| {
+            if (std.mem.indexOfScalar(u8, chunk, needle)) |idx| {
+                cur.consume(r, @intCast(idx + 1));
+                return true;
+            }
+            cur.consume(r, @intCast(chunk.len));
+        }
+        return false;
+    }
+
+    pub fn next_chunk(cur: *ReadCursor, r: *SkipRope) ?[]const u8 {
+        const chunk = cur.peek(r) orelse return null;
+        cur.consume(r, @intCast(chunk.len));
+        return chunk;
+    }
+};
+
+pub fn read_cursor_at(r: *SkipRope, ofs: BytesInt) ReadCursor {
+    assert(ofs <= r.len);
+    if (ofs == r.len or r.root == .null) {
+        return .{
+            .it = null,
+            .rank = 0,
+            .rest = 0,
+        };
+    }
+
+    const found = db_iter_at_ofs(r, ofs) orelse unreachable;
+    return .{
+        .it = found.it,
+        .rank = found.rank,
+        .rest = r.len - ofs,
+    };
+}
+
+fn db_iter_at_ofs(
+    r: *SkipRope,
+    ofs: BytesInt,
+) ?struct {
+    it: Db.PtrNum.Iter,
+    rank: Db.CapInt,
+} {
+    if (r.root == .null) return null;
+
+    const root: Ib.PtrNum = .{
+        .num = r.root,
+        .ptr = r.ib_at(r.root),
+    };
+    var find_cur: FindCursor() = .{
+        .b = .{ .ib = root },
+        .b_ofs = 0,
+        .b_is_header = true,
+    };
+    if (!find_cur.ib_find_ofs_leaf(r, r.ib_height, ofs))
+        std.debug.panic("offset out of bounds", .{});
+
+    var it = find_cur.b.db.iter();
+    var rank = find_cur.down.rank.in_db;
+    if (rank == find_cur.b.db.ptr.len) {
+        _ = it.next(r);
+        rank = 0;
+    }
+
+    return .{
+        .it = it,
+        .rank = rank,
+    };
+}
+
 pub fn insert(
     r: *SkipRope,
     gpa: Allocator,
@@ -957,6 +1070,50 @@ test "delete-against-arraylist" {
     s.replaceRangeAssumeCapacity(0, s.items.len, "");
     try r.expect_valid();
     try std.testing.expectFmt(s.items, "{f}", .{r.fmtString(0, r.len)});
+}
+
+test "read cursor streams across db boundaries" {
+    var r: SkipRope = .empty;
+    defer r.deinit(std.testing.allocator);
+
+    const text =
+        ("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" ** 5);
+    try r.insert(std.testing.allocator, 0, text);
+
+    var cur = r.read_cursor_at(0);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    while (cur.next_chunk(&r)) |chunk| {
+        try out.appendSlice(std.testing.allocator, chunk);
+    }
+
+    try std.testing.expectEqualStrings(text, out.items);
+}
+
+test "read cursor can start at db boundary" {
+    var r: SkipRope = .empty;
+    defer r.deinit(std.testing.allocator);
+
+    const text =
+        ("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" ** 5);
+    try r.insert(std.testing.allocator, 0, text);
+
+    var split_ofs: usize = 0;
+    {
+        var cur = r.read_cursor_at(0);
+        const first = cur.next_chunk(&r).?;
+        split_ofs = first.len;
+        try std.testing.expect(split_ofs < text.len);
+    }
+
+    var cur = r.read_cursor_at(@intCast(split_ofs));
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    while (cur.next_chunk(&r)) |chunk| {
+        try out.appendSlice(std.testing.allocator, chunk);
+    }
+
+    try std.testing.expectEqualStrings(text[split_ofs..], out.items);
 }
 
 test "delete: targeted regression cases" {
@@ -1530,11 +1687,11 @@ const FuzzAgainstArrayList = struct {
 test "fuzz-against-arraylist" {
     const log_ = @import("./log.zig");
     log_.testing_level.* = .warn;
-    log_.testing_scope_levels = &.{
-        .{ .scope = .fuzz, .level = .info },
-        .{ .scope = .rope, .level = .debug },
-        .{ .scope = .rope_test, .level = .debug },
-    };
+    // log_.testing_scope_levels = &.{
+    //     .{ .scope = .fuzz, .level = .info },
+    //     .{ .scope = .rope, .level = .debug },
+    //     .{ .scope = .rope_test, .level = .debug },
+    // };
 
     // std.testing.random_seed = 0x8d31b0a1;
 
@@ -1970,28 +2127,11 @@ fn formatString(
     assert(args.ofs + args.len <= r.len);
     if (args.len == 0) return;
 
-    const root: Ib.PtrNum = .{ .num = r.root, .ptr = r.ib_at(r.root) };
-    var find_cur: FindCursor() = .{
-        .b = .{ .ib = root },
-        .b_ofs = 0,
-        .b_is_header = true,
-    };
-    if (!find_cur.ib_find_ofs_leaf(r, r.ib_height, args.ofs))
-        std.debug.panic("offset out of bounds", .{});
-
-    assert(find_cur.down.rank_ofs == args.ofs);
-    var rank_cur = find_cur.down.rank.in_db;
-    var rest = args.len;
-    var iter = find_cur.b.db.iter();
-    while (rest > 0) {
-        const db = iter.peek(r).?;
-        const cpy_len = @min(rest, db.ptr.len - rank_cur);
-        try w.writeAll(db.ptr.data[rank_cur..][0..cpy_len]);
-        rest -= cpy_len;
-        if (rest > 0) {
-            rank_cur = 0;
-            _ = iter.next(r);
-        }
+    var cur = r.read_cursor_at(args.ofs);
+    assert(args.len <= cur.rest);
+    cur.rest = args.len;
+    while (cur.next_chunk(r)) |chunk| {
+        try w.writeAll(chunk);
     }
 }
 

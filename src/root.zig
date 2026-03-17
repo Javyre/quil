@@ -178,7 +178,7 @@ pub fn run(q: *Quil, setup_cb: ?fn (*Quil) Error!void) !void {
     {
         const wm = &q.win_manager;
         const dims = try q.render.tty_get_dimensions();
-        try wm.tree_layout(wm.main_root.?, .zero, dims);
+        try wm.tree_layout(wm.main_root.?, .origin, dims);
     }
     try q.render.flush();
 
