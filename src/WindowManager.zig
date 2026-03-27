@@ -1,7 +1,6 @@
 const std = @import("std");
 const Render = @import("./Render.zig");
 const BufferManager = @import("./BufferManager.zig");
-const SkipRope = @import("./SkipRope.zig");
 const log = @import("./log.zig").scoped(.wm);
 
 const WindowManager = @This();
@@ -252,6 +251,11 @@ fn layout_tiled_window(
         .y = new_grid_pos.y + screen_pos_ofs.y,
     });
 
+    if (new_dims.w == 0 or new_dims.h == 0) {
+        wm.render.surface_touch(window.surface);
+        return;
+    }
+
     try wm.redraw_window(window, new_dims);
 }
 
@@ -260,24 +264,37 @@ fn redraw_window(
     window: *Node.Window,
     dims: Render.Dimensions,
 ) !void {
+    std.debug.assert(dims.h > 0);
+    std.debug.assert(dims.w > 0);
     // TODO: impl word/text wrapping
 
     const rope = wm.buf_manager.buffer_get_rope(window.buf);
     var cur = try wm.buf_manager.buffer_get_rope_reader(window.buf, 0);
     var gc_it: Render.TrueGcIter = .empty;
 
-    var y: u16 = 0;
-    while (y < dims.h) : (y += 1) {
+    for (0..dims.h) |y_| {
+        const y: u16 = @intCast(y_);
         var writer: Render.Utf8StreamWriter =
             .init(wm.render, window.surface, .{ .x = 0, .y = y }, &gc_it);
 
         while (true) {
             const drawn = try writer.write();
             switch (drawn.end) {
-                .need_feed => redraw_feed_gc(&gc_it, rope, &cur),
+                .need_feed => {
+                    const chunk = cur.peek(rope) orelse {
+                        gc_it.finish_input();
+                        continue;
+                    };
+                    const fed = try gc_it.feed(chunk);
+                    cur.consume(rope, @intCast(fed));
+                    if (cur.rest == 0) gc_it.finish_input();
+                },
                 .eos => {
                     try wm.redraw_blank_tail(window, dims, y, writer.pos.x);
-                    try wm.redraw_blank_rows(window, dims, y + 1);
+                    for (y + 1..dims.h) |blank_y_| {
+                        const blank_y: u16 = @intCast(blank_y_);
+                        try wm.redraw_blank_tail(window, dims, blank_y, 0);
+                    }
                     return;
                 },
                 .newline => {
@@ -288,7 +305,10 @@ fn redraw_window(
                     const found_nl = redraw_discard_iter_to_nl(&gc_it) or
                         cur.skip_until(rope, '\n');
                     if (!found_nl) {
-                        try wm.redraw_blank_rows(window, dims, y + 1);
+                        for (y + 1..dims.h) |blank_y_| {
+                            const blank_y: u16 = @intCast(blank_y_);
+                            try wm.redraw_blank_tail(window, dims, blank_y, 0);
+                        }
                         return;
                     }
                     break;
@@ -296,20 +316,6 @@ fn redraw_window(
             }
         }
     }
-}
-
-fn redraw_feed_gc(
-    gc_it: *Render.TrueGcIter,
-    rope: *SkipRope,
-    cur: *SkipRope.ReadCursor,
-) void {
-    const chunk = cur.peek(rope) orelse {
-        gc_it.finish_input();
-        return;
-    };
-    const fed = gc_it.feed_cp(chunk);
-    cur.consume(rope, @intCast(fed));
-    if (cur.rest == 0) gc_it.finish_input();
 }
 
 fn redraw_discard_iter_to_nl(gc_it: *Render.TrueGcIter) bool {
@@ -324,18 +330,6 @@ fn redraw_discard_iter_to_nl(gc_it: *Render.TrueGcIter) bool {
     }
     gc_it.discard(@intCast(parts.len()));
     return false;
-}
-
-fn redraw_blank_rows(
-    wm: *WindowManager,
-    window: *Node.Window,
-    dims: Render.Dimensions,
-    y0: u16,
-) !void {
-    var y = y0;
-    while (y < dims.h) : (y += 1) {
-        try wm.redraw_blank_tail(window, dims, y, 0);
-    }
 }
 
 fn redraw_blank_tail(
@@ -636,71 +630,97 @@ fn expect_screen(
     try std.testing.expectEqualStrings(want, got.items);
 }
 
+fn set_buf_parts(ctx: *TestCtx, parts: []const []const u8) !void {
+    try ctx.buf_manager.buffer_set_region(ctx.buf, 0, -1, "");
+    for (parts) |part| {
+        try ctx.buf_manager.buffer_set_region(ctx.buf, -1, -1, part);
+    }
+}
+
 test "redraw screen cases" {
     var ctx: TestCtx = undefined;
     try ctx.init(std.testing.allocator, .{ .w = 4, .h = 2 });
     defer ctx.deinit();
 
+    const basic_parts = [_][]const u8{
+        "abcd\nefgh\nijkl",
+    };
+    const long_line_parts = [_][]const u8{
+        "abcdef\nxy",
+    };
+    const clear_parts = [_][]const u8{
+        "abcd\nxy",
+    };
+    const empty_parts = [_][]const u8{
+        "",
+    };
+    const split_gc_parts = [_][]const u8{
+        "A",
+        "\u{0300}",
+        "B\nxy",
+    };
+    const split_cp_parts = [_][]const u8{
+        "\xc3",
+        "\xa9B\nxy",
+    };
+
     const cases = [_]struct {
-        text: []const u8,
+        parts: []const []const u8,
         want: []const u8,
-        text_after: ?[]const u8 = null,
+        parts_after: ?[]const []const u8 = null,
         want_after: ?[]const u8 = null,
     }{
         .{
-            .text = "abcd\nefgh\nijkl",
+            .parts = &basic_parts,
             .want =
             \\abcd
             \\efgh
             ,
         },
         .{
-            .text = "abcdef\nxy",
+            .parts = &long_line_parts,
             .want =
             \\abcd
             \\xy  
             ,
         },
         .{
-            .text = "abcd\nxy",
+            .parts = &clear_parts,
             .want =
             \\abcd
             \\xy  
             ,
-            .text_after = "",
+            .parts_after = &empty_parts,
             .want_after =
             \\    
             \\    
             ,
         },
+        .{
+            .parts = &split_gc_parts,
+            .want =
+            \\#B  
+            \\xy  
+            ,
+        },
+        .{
+            .parts = &split_cp_parts,
+            .want =
+            \\#B  
+            \\xy  
+            ,
+        },
     };
 
     for (cases) |case| {
-        try ctx.buf_manager.buffer_set_region(ctx.buf, 0, -1, case.text);
+        try set_buf_parts(&ctx, case.parts);
         try ctx.wm.redraw_window(&ctx.window, .{ .w = 4, .h = 2 });
         try expect_screen(&ctx, case.want);
 
-        if (case.text_after) |text_after| {
-            try ctx.buf_manager.buffer_set_region(ctx.buf, 0, -1, text_after);
+        if (case.parts_after) |parts_after| {
+            try set_buf_parts(&ctx, parts_after);
             try ctx.wm.redraw_window(&ctx.window, .{ .w = 4, .h = 2 });
             try expect_screen(&ctx, case.want_after.?);
         }
     }
-}
-
-test "redraw handles split grapheme across rope chunks" {
-    var ctx: TestCtx = undefined;
-    try ctx.init(std.testing.allocator, .{ .w = 4, .h = 2 });
-    defer ctx.deinit();
-
-    try ctx.buf_manager.buffer_set_region(ctx.buf, -1, -1, "A");
-    try ctx.buf_manager.buffer_set_region(ctx.buf, -1, -1, "\u{0300}");
-    try ctx.buf_manager.buffer_set_region(ctx.buf, -1, -1, "B\nxy");
-
-    try ctx.wm.redraw_window(&ctx.window, .{ .w = 4, .h = 2 });
-    try expect_screen(
-        &ctx,
-        \\#B  
-        \\xy  
-    );
 }

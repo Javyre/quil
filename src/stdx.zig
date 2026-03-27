@@ -71,6 +71,17 @@ pub fn ByteRing(comptime cap: u16) type {
             };
         }
 
+        pub fn read_at(ring: *const Ring, ofs: u16, dst: []u8) []const u8 {
+            assert(dst.len != 0);
+            assert(ofs < ring.len);
+
+            const bytes = ring.span(ofs, @intCast(@min(
+                @as(usize, ring.len),
+                @as(usize, ofs) + dst.len,
+            )));
+            return bytes.flatten(dst);
+        }
+
         pub fn push(ring: *Ring, byte: u8) void {
             assert(ring.free() != 0);
             const tail = (ring.head + ring.len) % cap;

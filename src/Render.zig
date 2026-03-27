@@ -1401,6 +1401,12 @@ pub fn surface_get_dimensions(r: *Render, num: SurfaceNum) Dimensions {
     return slice.items(.dims)[num.to_idx().?];
 }
 
+pub fn surface_touch(r: *Render, num: SurfaceNum) void {
+    const dirt = &r.surfaces.slice().items(.dirt)[num.to_idx().?];
+    if (dirt.* == .clean) dirt.* = .partial;
+    r.surfaces_dirty = true;
+}
+
 pub fn surface_set_screen_position(
     r: *Render,
     num: SurfaceNum,
@@ -1487,6 +1493,7 @@ pub const TrueGcIter = struct {
     };
 
     pub const Item = struct {
+        // Borrowed ring span. Use before next iter mutation.
         bytes: stdx.ByteParts,
         wcwidth: usize,
     };
@@ -1497,17 +1504,25 @@ pub const TrueGcIter = struct {
         eos,
     };
 
-    pub fn feed_cp(it: *TrueGcIter, text: []const u8) usize {
+    pub fn feed(it: *TrueGcIter, text: []const u8) error{GraphemeTooLong}!usize {
         std.debug.assert(!it.input_done);
         if (text.len == 0) return 0;
 
         var utf8_it = uucode.utf8.Iterator.init(text);
-        _ = utf8_it.next() orelse return 0;
-        // Only push one full cp.
-        const cp_len = utf8_it.i;
-        assert(cp_len != 0);
-        it.ring.push_slice(text[0..cp_len]) catch unreachable;
-        return cp_len;
+        var fed: usize = 0;
+        while (utf8_it.i < text.len) {
+            const start = utf8_it.i;
+            _ = utf8_it.next() orelse break;
+            const cp_len = utf8_it.i - start;
+            assert(cp_len != 0);
+            if (cp_len > it.ring.free()) {
+                if (fed == 0) return error.GraphemeTooLong;
+                break;
+            }
+            it.ring.push_slice(text[start..utf8_it.i]) catch unreachable;
+            fed = utf8_it.i;
+        }
+        return fed;
     }
 
     pub fn finish_input(it: *TrueGcIter) void {
@@ -1522,14 +1537,49 @@ pub const TrueGcIter = struct {
         it.ring.pop_front(n);
     }
 
+    pub fn next_ascii(it: *TrueGcIter, max_len: u16) ?stdx.ByteParts {
+        if (it.ring.len == 0 or max_len == 0) return null;
+
+        const ring = it.ring.parts();
+        var run_len: u16 = 0;
+        for (ring.a) |byte| {
+            if (byte >= 128 or ascii_char_is_invisible(byte)) break;
+            run_len += 1;
+        }
+        if (run_len == ring.a.len) {
+            for (ring.b) |byte| {
+                if (byte >= 128 or ascii_char_is_invisible(byte)) break;
+                run_len += 1;
+            }
+        }
+        if (run_len == 0) return null;
+
+        const next_byte: ?u8 = if (run_len < ring.len())
+            it.ring.span(run_len, run_len + 1).first()
+        else
+            null;
+        var safe_len = run_len;
+        // Keep the last ASCII byte back if the next byte might still join it.
+        if (next_byte) |byte| {
+            if (byte >= 128 or ascii_char_is_invisible(byte)) safe_len -= 1;
+        } else if (!it.input_done) {
+            safe_len -= 1;
+        }
+        if (safe_len == 0) return null;
+
+        const take: u16 = @min(safe_len, max_len);
+        const ascii = it.ring.span(0, take);
+        it.ring.pop_front(take);
+        return ascii;
+    }
+
     pub fn next(it: *TrueGcIter) Next {
         if (it.ring.len == 0) {
             return if (it.input_done) .eos else .need_feed;
         }
 
-        const ring = it.ring.parts();
         var gc_it = uucode.grapheme.Iterator(BiUtf8Iterator).init(
-            .init(ring.a, ring.b),
+            .init(&it.ring),
         );
         const start = gc_it.i;
         const wcwidth = uucode.x.grapheme.wcwidthNext(&gc_it);
@@ -1557,28 +1607,25 @@ pub const TrueGcIter = struct {
 
 const BiUtf8Iterator = struct {
     i: usize = 0,
-    first: uucode.utf8.Iterator,
-    second: uucode.utf8.Iterator,
+    ring: *const stdx.ByteRing(TrueGcIter.buf_cap),
 
-    fn init(first: []const u8, second: []const u8) BiUtf8Iterator {
+    fn init(ring: *const stdx.ByteRing(TrueGcIter.buf_cap)) BiUtf8Iterator {
         return .{
-            .first = .init(first),
-            .second = .init(second),
+            .ring = ring,
         };
     }
 
     pub fn next(it: *BiUtf8Iterator) ?u21 {
-        if (it.first.peek()) |cp| {
-            _ = it.first.next();
-            it.i = it.first.i;
-            return cp;
-        }
-        if (it.second.peek()) |cp| {
-            _ = it.second.next();
-            it.i = it.first.bytes.len + it.second.i;
-            return cp;
-        }
-        return null;
+        const total_len = it.ring.len;
+        if (it.i >= total_len) return null;
+
+        var prefix: [4]u8 = undefined;
+        var utf8_it = uucode.utf8.Iterator.init(
+            it.ring.read_at(@intCast(it.i), &prefix),
+        );
+        const cp = utf8_it.next() orelse unreachable;
+        it.i += utf8_it.i;
+        return cp;
     }
 
     pub fn peek(it: BiUtf8Iterator) ?u21 {
@@ -1587,20 +1634,53 @@ const BiUtf8Iterator = struct {
     }
 };
 
+test "TrueGcIter decodes codepoint split across ring wrap" {
+    var gc_it: TrueGcIter = .empty;
+    gc_it.ring.head = TrueGcIter.buf_cap - 1;
+    gc_it.ring.len = 2;
+    gc_it.ring.buf[TrueGcIter.buf_cap - 1] = 0xc3;
+    gc_it.ring.buf[0] = 0xa9;
+    gc_it.finish_input();
+
+    var gc_buf: [8]u8 = undefined;
+    const gc = gc_it.next().item;
+    try std.testing.expectEqualStrings("\u{00e9}", gc.bytes.flatten(&gc_buf));
+}
+
+test "surface_write_utf8 ascii run respects wrapping ofs" {
+    var r = try Render.init(undefined, std.testing.allocator);
+    defer r.deinit();
+
+    const grid = try r.grid_create();
+    try r.grid_set_dimensions(grid, .{ .w = 4, .h = 1 });
+
+    const surface = try r.surface_create();
+    r.surface_set_grid(surface, grid);
+    try r.surface_set_dimensions(surface, .{ .w = 4, .h = 1 });
+    r.surface_set_grid_position(surface, .origin);
+    r.surfaces.slice().items(.wrapping_ofs)[surface.to_idx().?] = .{ .x = 1, .y = 0 };
+
+    const ret = try r.surface_write_utf8(surface, .origin, "abcd");
+    try std.testing.expectEqual(@as(usize, 4), ret.bytes);
+
+    try std.testing.expectEqual(@as(u16, 'd'), r.grid_get_cell_char(grid, .{ .x = 0, .y = 0 }));
+    try std.testing.expectEqual(@as(u16, 'a'), r.grid_get_cell_char(grid, .{ .x = 1, .y = 0 }));
+    try std.testing.expectEqual(@as(u16, 'b'), r.grid_get_cell_char(grid, .{ .x = 2, .y = 0 }));
+    try std.testing.expectEqual(@as(u16, 'c'), r.grid_get_cell_char(grid, .{ .x = 3, .y = 0 }));
+}
+
 test "TrueGcIter split grapheme feed protocol" {
     var gc_it: TrueGcIter = .empty;
-    try std.testing.expectEqual(1, gc_it.feed_cp("A\u{0300}"));
-    try std.testing.expectEqual(.need_feed, gc_it.next());
-    try std.testing.expectEqual(1, gc_it.ring.len);
-    try std.testing.expectEqual(2, gc_it.feed_cp("\u{0300}"));
+    try std.testing.expectEqual(3, try gc_it.feed("A\u{0300}"));
     try std.testing.expectEqual(.need_feed, gc_it.next());
     try std.testing.expectEqual(3, gc_it.ring.len);
-    _ = gc_it.feed_cp("B");
+    try std.testing.expectEqual(1, try gc_it.feed("B"));
     var gc_buf: [8]u8 = undefined;
     const first = gc_it.next().item;
     try std.testing.expectEqual(3, first.bytes.len());
     try std.testing.expectEqualStrings("A\u{0300}", first.bytes.flatten(&gc_buf));
 
+    try std.testing.expectEqual(.need_feed, gc_it.next());
     gc_it.finish_input();
     const second = gc_it.next().item;
     try std.testing.expectEqual(1, second.wcwidth);
@@ -1609,18 +1689,41 @@ test "TrueGcIter split grapheme feed protocol" {
     try std.testing.expectEqual(.eos, gc_it.next());
 }
 
+test "TrueGcIter next_ascii keeps last byte for possible gc join" {
+    var gc_it: TrueGcIter = .empty;
+    try std.testing.expectEqual(3, try gc_it.feed("abc"));
+    var buf: [8]u8 = undefined;
+    const ascii = gc_it.next_ascii(8).?;
+    try std.testing.expectEqualStrings("ab", ascii.flatten(&buf));
+    try std.testing.expectEqual(1, gc_it.ring.len);
+}
+
 test "TrueGcIter keeps ring wrap grapheme whole" {
     var gc_it: TrueGcIter = .empty;
     gc_it.ring.head = TrueGcIter.buf_cap - 1;
     gc_it.ring.len = 1;
     gc_it.ring.buf[TrueGcIter.buf_cap - 1] = 'A';
-    try std.testing.expectEqual(2, gc_it.feed_cp("\u{0300}B"));
-    try std.testing.expectEqual(1, gc_it.feed_cp("B"));
+    try std.testing.expectEqual(3, try gc_it.feed("\u{0300}B"));
     gc_it.finish_input();
     var gc_buf: [8]u8 = undefined;
 
     const gc = gc_it.next().item;
     try std.testing.expectEqualStrings("A\u{0300}", gc.bytes.flatten(&gc_buf));
+}
+
+test "TrueGcIter errors on too-long deferred grapheme" {
+    var gc_it: TrueGcIter = .empty;
+    var buf: [TrueGcIter.buf_cap]u8 = undefined;
+    buf[0] = 0xc3;
+    buf[1] = 0xa9;
+    for (0..127) |i| {
+        buf[2 + i * 2] = 0xcc;
+        buf[3 + i * 2] = 0x80;
+    }
+    const fed = try gc_it.feed(&buf);
+    try std.testing.expectEqual(@as(usize, TrueGcIter.buf_cap), fed);
+    try std.testing.expectEqual(.need_feed, gc_it.next());
+    try std.testing.expectError(error.GraphemeTooLong, gc_it.feed("\xcc\x80"));
 }
 
 test "surface_write_utf8 aggregates split feed result" {
@@ -1663,7 +1766,7 @@ pub fn surface_write_utf8(
                     gc_it.finish_input();
                     continue;
                 }
-                text_i += gc_it.feed_cp(text[text_i..]);
+                text_i += try gc_it.feed(text[text_i..]);
             },
             else => return .{
                 .bytes = bytes,
@@ -1709,6 +1812,39 @@ fn surface_write_utf8_impl(
     var cell_count: u16 = 0;
     var byte_count: usize = 0;
     const end: SurfaceWriteUtf8Result.End = while (true) {
+        if (writer.gc_iter.next_ascii(s_dims.w - pos.x)) |ascii| {
+            if (info.s_wrapping_ofs.x == 0) {
+                const g_pos = grid_pos_from_surface_pos(info, pos);
+                const base = g_dims.w * g_pos.y + g_pos.x;
+
+                for (ascii.a, 0..) |char, i| {
+                    g_grid.items[base + i] = char;
+                }
+                for (ascii.b, ascii.a.len..) |char, i| {
+                    g_grid.items[base + i] = char;
+                }
+            } else {
+                var x = pos.x;
+                for (ascii.a) |char| {
+                    const g_pos = grid_pos_from_surface_pos(info, .{ .x = x, .y = pos.y });
+                    g_grid.items[g_dims.w * g_pos.y + g_pos.x] = char;
+                    x += 1;
+                }
+                for (ascii.b) |char| {
+                    const g_pos = grid_pos_from_surface_pos(info, .{ .x = x, .y = pos.y });
+                    g_grid.items[g_dims.w * g_pos.y + g_pos.x] = char;
+                    x += 1;
+                }
+            }
+
+            const len: u16 = @intCast(ascii.len());
+            pos.x += len;
+            cell_count += len;
+            byte_count += ascii.len();
+            if (pos.x == s_dims.w) break .row_full;
+            continue;
+        }
+
         const gc_info = switch (writer.gc_iter.next()) {
             .item => |gc_info| gc_info,
             .need_feed => break .need_feed,
