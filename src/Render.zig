@@ -1582,7 +1582,7 @@ pub const TrueGcIter = struct {
             .init(&it.ring),
         );
         const start = gc_it.i;
-        const wcwidth = uucode.x.grapheme.wcwidthNext(&gc_it);
+        const wcwidth = uucode.grapheme.wcwidthNext(&gc_it);
         const end = gc_it.i;
         if (start == end) {
             assert(wcwidth == 0);

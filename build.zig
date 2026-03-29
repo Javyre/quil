@@ -13,9 +13,6 @@ pub fn build(b: *std.Build) void {
     const uucode_dep = b.dependency("uucode", .{
         .target = target,
         .optimize = optimize,
-        .extensions_0 = @as([]const []const u8, &.{
-            "wcwidth",
-        }),
         .fields_0 = @as([]const []const u8, &.{
             "is_emoji_vs_base",
             "grapheme_break",
