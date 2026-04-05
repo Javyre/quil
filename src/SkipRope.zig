@@ -1,42 +1,20 @@
-//! Packed B-skiplist for bytes.
+//! B-skiplist for bytes.
 //!
-//! B-skiplist with the following attributes:
-//! - K = indx of byte
-//! - V = byte
-//! - Tracking subtree widths instead of leader keys.
-//! - Dense. no holes between bytes, so indices are always implied from widths.
+//! K = byte offset, V = byte. Dense: every byte offset exists. Logical leaders
+//! are byte offsets; physical index slots store subtree widths.
 //!
-//! Logical model:
-//! - A byte's height is that of the highest width slot whose first covered byte
-//!   is that byte.
-//! - An `Ib` slot is logically owned by its first covered byte.
-//! - The slot width is the gap from just before that byte to the next byte of
-//!   the same height.
-//! - `Db` is the leaf layer: bytes are packed into linked leaf blocks.
-//!
-//! Height caveats:
-//! - A byte is at least height 1 if it is the first byte of a `Db`.
-//! - A byte is height 0 if it is not the first byte of anything.
-//! - The first block of each layer has a virtual `-inf` leading key.
-//!   The first byte in that range is therefore not truly the gap head for that
-//!   range's first slot.
-//!
-//! Physical model:
-//! - Each layer is a linked list of packed blocks.
-//! - `Ib` packs upper-layer width slots.
-//! - `Db` packs leaf bytes.
-//!
-//! B-skiplist repr:
+//! Logical skiplist, grouped by physical blocks:
 //! ```
-//! L2: [-inf 4]
-//! L1: [-inf 2] [4 8]
-//! L0: [-inf 0 1] [2 3] [4 5 6 7] [8 9]
+//! L2: [-inf ----------- 4 -----------] +inf
+//! L1: [-inf ----- 2 -] [4 ------- 8 -] +inf
+//! L0: [-inf 0 1] [2 3] [4 5 6 7] [8 9] +inf
 //!
-//! L2: [-inf -1 4]
-//! L1: [-inf] [-1 2] [4 8]
-//! L0: [-inf] [-1 0 1] [2 3] [4 5 6 7] [8 9]
-//! ````
-//! Skiprope repr:
+//! L2: [-inf] [-1 ----------- 4 -----------] +inf
+//! L1: [-inf] [-1 ----- 2 -] [4 ------- 8 -] +inf
+//! L0: [-inf] [-1 0 1] [2 3] [4 5 6 7] [8 9] +inf
+//! ```
+//!
+//! Physical width slots for same examples:
 //! ```
 //! L2: [4 6]
 //! L1: [2 2] [4 2]
@@ -45,23 +23,23 @@
 //! L2: [0 5 6]
 //! L1: [0] [3 2] [4 2]
 //! L0: [] [1 1 1] [1 1] [1 1 1 1] [1 1]
-//! ````
-//!
-//! - `LN >= L1`: Index Layer (Ib)
-//! - `L0`      : Data Layer (Db)
-//!
-//! Note that the `-inf` element doesn't have a real L0 rank.
-//! `L0: []` means an empty header `Db`, not a byte.
-//!
-//! We still follow the same algorithms in terms of block leaders despite this
-//! physical repr.
-//!
-//! For the empty case:
 //! ```
-//! L2: [-inf]               L2: [0]
-//! L1: [-inf]    Becomes:   L1: [0]
-//! L0: [-inf]               L0: []
-//! ```
+//!
+//! Logical model:
+//! - A byte's height is the highest layer where that byte is a leader.
+//! - An `Ib` slot is owned by the first byte covered by its `down` subtree.
+//! - `Ib.wide[i]` is the byte count covered by `down[i]`.
+//! - `Db` is the leaf layer: bytes packed into linked leaf blocks.
+//!
+//! Header:
+//! - The first block of each layer exposes a virtual `-inf` leader.
+//! - The virtual leader has no L0 rank.
+//! - Slot `0` may be 0-wide only for the virtual leader.
+//!
+//! Physical model:
+//! - Each layer is a linked list of packed blocks.
+//! - `Ib` packs upper-layer width slots.
+//! - `Db` packs leaf bytes.
 const std = @import("std");
 const assert = std.debug.assert;
 const log = @import("./log.zig").scoped(.rope);
@@ -75,7 +53,7 @@ const SkipRope = @This();
 rng: std.Random.DefaultPrng,
 root: Ib.Num,
 len: BytesInt,
-/// ib layer count - 1; total/ib+db layer count - 2
+/// ib layer count - 1; total ib+db layer count - 2
 ib_height: HeightInt,
 ibs: SegmentedPool(
     Ib,
@@ -119,24 +97,21 @@ const Ib = extern struct {
     pub const capacity = (2 * config.dcache_line_bytes / @sizeOf(u32)) - 1;
     pub const CapInt = std.math.IntFittingRange(0, capacity);
 
-    /// How wide the down subtree is. (# of full data bytes)
+    /// Subtree width: byte count covered by `down[i]`.
     ///
-    /// The first slot in each layer may be 0-wide with a populated down
-    /// pointer as it represents the header `-inf` key of the skiplist.
-    ///
-    /// All other slots must be > 0 or they signal the end of the block.
+    /// Slot `0` may be 0-wide for the virtual `-inf` leader.
     wide: [capacity]u32 align(config.dcache_line_bytes) = @splat(0),
-    /// Next Ib in the same level
+    /// Next Ib in the same level.
     next: Num = .null,
-    /// Down pointer either to next Ib level or Db leaf
+    /// Down pointer either to next Ib level or Db leaf.
     ///
-    /// 0 down num means null,
-    /// so it is reliable to use this for iteration end.
-    /// (except when building a subtree lazily)
+    /// 0 down num means null, so it is reliable to use this for iteration end.
     down: [capacity]u32 align(config.dcache_line_bytes) = @splat(0),
     pad: u32 = undefined,
 
-    const _ = assert(@sizeOf(Ib) == 4 * config.dcache_line_bytes);
+    comptime {
+        assert(@sizeOf(Ib) == 4 * config.dcache_line_bytes);
+    }
 
     pub const Num = enum(u32) { null = 0, _ };
     pub const PtrNum = struct {
@@ -2145,16 +2120,16 @@ fn augment_height(
         // TODO: consider p = 1/cB for some experimentally chosen constant c.
         // p = 1 / B
         if (h == 0) {
-            if (rand.uintAtMost(
-                std.math.IntFittingRange(0, Db.capacity),
+            if (rand.uintLessThan(
+                std.math.IntFittingRange(0, Db.capacity - 1),
                 Db.capacity,
             ) == 0) {
                 h += 1;
                 continue;
             }
         } else {
-            if (rand.uintAtMost(
-                std.math.IntFittingRange(0, Ib.capacity),
+            if (rand.uintLessThan(
+                std.math.IntFittingRange(0, Ib.capacity - 1),
                 Ib.capacity,
             ) == 0) {
                 h += 1;

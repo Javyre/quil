@@ -125,6 +125,7 @@ pub const RuntimeScopeLevel = struct {
 };
 pub const RuntimeScope = enum {
     quil,
+    range,
     rope,
     rope_test,
     segmented_pool,

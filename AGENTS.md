@@ -1,0 +1,1 @@
+- For domain language guidance use ./UBIQUITOUS_LANGUAGE.md
