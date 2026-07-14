@@ -13,6 +13,7 @@ const ICtnrChildIdx = WindowManager.ICtnrChildIdx;
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("SkipRange.zig");
     _ = @import("SkipRope.zig");
 }
 

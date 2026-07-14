@@ -27,12 +27,15 @@
 //! - `max(x,y)` names the range whose end gives that max.
 //!
 //! Logical model:
-//! - A distinct start's height is the highest layer where that start is a leader.
+//! - A distinct start's height is the highest layer where that start is a
+//!   leader.
 //! - An `Ib` slot is owned by the first start covered by its `down` subtree.
 //! - `Ib.gap[i]` is distance to the next distinct start at that layer.
-//! - `Ib.reach[i]` is distance from slot start to max range end under `down[i]`.
+//! - `Ib.reach[i]` is distance from slot start to max range end under
+//!   `down[i]`.
 //! - `Rb` is the leaf layer: one range per cell in start order.
 //! - Same-start ranges are adjacent `Rb` cells with `gap == 0`.
+//! - Same-start range order is unspecified.
 //!
 //! header:
 //! - The first block of each layer exposes a virtual `-inf` leader.
@@ -62,14 +65,42 @@ test {
     std.testing.refAllDecls(@This());
 }
 
-pub const RangeId = enum(u32) { null = 0, _ };
-const max_ranges = std.math.maxInt(u32);
-const max_blocks = std.math.maxInt(u32) - 1;
+// Largest range count whose worst-case promoted tower fits raw u32 block nums.
+// Worst case is attainable with distinct positive starts inserted descending,
+// all at max height:
+// - Rb and lower Ib layers: each continuing leader can isolate one real block;
+//   one global leftmost block can contain only the virtual header => N + 1.
+// - top Ib layer: promotion stops and leaders attach into packed blocks. A full
+//   15-slot block spills 8/8 => floor((N + 1) / 8) blocks.
+const max_ranges = 701_219_149;
+const RangeInt = std.math.IntFittingRange(0, max_ranges);
+pub const RangeId = enum(RangeInt) { null = 0, _ };
+const rb_capacity = 41;
+const ib_capacity = 15;
+
+const max_rb_count: u32 = max_ranges + 1;
+const max_height: u32 = std.math.log_int(u32, ib_capacity, max_rb_count);
+const ib_min_fill = (ib_capacity + 1) / 2;
+const max_ib_count: u32 =
+    (max_height - 1) * max_rb_count + max_rb_count / ib_min_fill;
+const IbPoolIndex = RangedInt(.skiprange_ib_num, 0, max_ib_count - 1);
+const RbPoolIndex = RangedInt(.skiprange_rb_num, 0, max_rb_count - 1);
+
+comptime {
+    const next_rb_count: u64 = max_rb_count + 1;
+    const next_height = std.math.log_int(u64, ib_capacity, next_rb_count);
+    const next_ib_count =
+        (next_height - 1) * next_rb_count + next_rb_count / ib_min_fill;
+    assert(next_ib_count > std.math.maxInt(u32));
+}
+
 // Keep same byte-scale bound as SkipRope's leaf-addressable space.
-const max_bytes = max_blocks * 127;
+const max_bytes = (std.math.maxInt(u32) - 1) * 127;
 const BytesInt = std.math.IntFittingRange(0, max_bytes);
 
 const config = .{
+    // Locality model and layout unit, benchmarked at 64 bytes. Hardware may
+    // differ.
     .dcache_line_bytes = 64,
 };
 
@@ -79,7 +110,7 @@ pub const RangeFlags = packed struct(u8) {
     _pad: u6 = 0,
 };
 
-pub const RangeValue = struct {
+pub const Range = struct {
     start: BytesInt,
     end: BytesInt,
     payload: u32,
@@ -99,45 +130,46 @@ rng: std.Random.DefaultPrng,
 root: Ib.Num,
 /// ib layer count - 1; total ib+rb layer count - 2
 ib_height: HeightInt,
-range_count: u32,
+range_count: RangeInt,
 ibs: SegmentedPool(
     Ib,
-    RangedInt(.skiprange_ib_num, 0, std.math.maxInt(u32)),
+    IbPoolIndex,
     .coerce(16),
 ),
 rbs: SegmentedPool(
     Rb,
-    RangedInt(.skiprange_rb_num, 0, std.math.maxInt(u32)),
+    RbPoolIndex,
     .coerce(16),
 ),
 
-const max_height = std.math.log_int(u32, Ib.capacity, max_blocks);
 const HeightInt = std.math.IntFittingRange(0, max_height);
 
 const Rb = extern struct {
-    const capacity = 41;
+    const capacity = rb_capacity;
     const CapInt = std.math.IntFittingRange(0, capacity);
 
     /// Start walk stays in the first eight cache lines. Only an entered first
-    /// block with `first_is_header` treats rank `0` as the virtual `-inf` header.
+    /// block with `first_is_header` treats rank `0` as the virtual `-inf`
+    /// header.
     gap: [capacity]Gap align(config.dcache_line_bytes),
-    id: [capacity]RangeId,
+    next: u32,
+    id: [capacity]u32,
     _walk_pad: [
         8 * config.dcache_line_bytes -
-            @sizeOf([capacity]Gap) - @sizeOf([capacity]RangeId)
+            @sizeOf([capacity]Gap) - @sizeOf([capacity]u32) - @sizeOf(u32)
     ]u8,
     range_len: [capacity]Len,
     payload: [capacity]u32,
-    next: Rb.Num,
     _pad: [
         8 * config.dcache_line_bytes -
-            @sizeOf([capacity]Len) - @sizeOf([capacity]u32) - @sizeOf(u32)
+            @sizeOf([capacity]Len) - @sizeOf([capacity]u32)
     ]u8,
 
     comptime {
         assert(@alignOf(Rb) == config.dcache_line_bytes);
         assert(@sizeOf(Rb) == 16 * config.dcache_line_bytes);
         assert(@offsetOf(Rb, "range_len") == 8 * config.dcache_line_bytes);
+        assert(@offsetOf(Rb, "next") < @offsetOf(Rb, "range_len"));
     }
 
     const Gap = packed struct(u64) {
@@ -155,7 +187,7 @@ const Rb = extern struct {
         _pad: u24 = 0,
     };
 
-    const Num = enum(u32) { null = 0, _ };
+    const Num = enum(std.math.IntFittingRange(0, max_rb_count)) { null = 0, _ };
     const PtrNum = struct {
         ptr: *Rb,
         num: Num,
@@ -197,17 +229,21 @@ const Rb = extern struct {
                         it.rank += 1;
                     }
 
-                    if (it.rank < capacity and it.rb.ptr.occupied(it.first_is_header, it.rank)) {
+                    if (it.rank < capacity and
+                        it.rb.ptr.occupied(it.first_is_header, it.rank))
+                    {
+                        const gap = it.rb.ptr.gap[it.rank];
+                        const range_len = it.rb.ptr.range_len[it.rank];
                         return .{
                             .rb = it.rb,
                             .start_rel = it.start_rel,
-                            .gap = it.rb.ptr.gap[it.rank].value,
-                            .len = it.rb.ptr.range_len[it.rank],
-                            .id = it.rb.ptr.id[it.rank],
+                            .gap = gap.value,
+                            .len = range_len,
+                            .id = @enumFromInt(it.rb.ptr.id[it.rank]),
                             .payload = it.rb.ptr.payload[it.rank],
                             .flags = .{
-                                .start_right = it.rb.ptr.gap[it.rank].start_right,
-                                .end_right = it.rb.ptr.range_len[it.rank].end_right,
+                                .start_right = gap.start_right,
+                                .end_right = range_len.end_right,
                             },
                         };
                     }
@@ -216,7 +252,7 @@ const Rb = extern struct {
             }
 
             fn next_block(it: *Iter, sr: *SkipRange) bool {
-                const next_num = it.rb.ptr.next;
+                const next_num: Rb.Num = @enumFromInt(it.rb.ptr.next);
                 if (next_num == .null) return false;
                 it.rb = .{
                     .num = next_num,
@@ -254,7 +290,8 @@ const Rb = extern struct {
         head: PtrNum,
         /// Whether `head` exposes the virtual `-inf` slot at rank 0.
         first_is_header: bool,
-        /// Exclusive end offset for this bounded view, relative to its caller-held base.
+        /// Exclusive end offset for this bounded view, relative to its
+        /// caller-held base.
         end_rel: ?BytesInt,
 
         const Iter = struct {
@@ -277,15 +314,15 @@ const Rb = extern struct {
             };
         }
 
-        fn past_end(view: View, pos: BytesInt) bool {
-            if (view.end_rel) |end| return pos >= end;
+        fn past_end(view: View, start_rel: BytesInt) bool {
+            if (view.end_rel) |end| return start_rel >= end;
             return false;
         }
     };
 
     fn occupied(rb: *const Rb, first_is_header: bool, rank: CapInt) bool {
         assert(rank < capacity);
-        return (first_is_header and rank == 0) or rb.id[rank] != .null;
+        return (first_is_header and rank == 0) or rb.id[rank] != 0;
     }
 
     fn len(rb: *const Rb, first_is_header: bool) CapInt {
@@ -297,33 +334,48 @@ const Rb = extern struct {
     }
 
     fn set_end(rb: *Rb, end_len: CapInt) void {
-        if (end_len < capacity) rb.id[end_len] = .null;
+        if (end_len < capacity) rb.id[end_len] = 0;
     }
 
-    fn set(rb: *Rb, rank: CapInt, value: RangeValue, id: RangeId, gap: BytesInt) void {
+    fn set(
+        rb: *Rb,
+        rank: CapInt,
+        range: Range,
+        id: RangeId,
+        gap: BytesInt,
+    ) void {
         rb.gap[rank] = .{
             .value = gap,
-            .start_right = value.flags.start_right,
+            .start_right = range.flags.start_right,
         };
         rb.range_len[rank] = .{
-            .value = value.end - value.start,
-            .end_right = value.flags.end_right,
+            .value = range.end - range.start,
+            .end_right = range.flags.end_right,
         };
-        rb.id[rank] = id;
-        rb.payload[rank] = value.payload;
+        rb.id[rank] = @intFromEnum(id);
+        rb.payload[rank] = range.payload;
     }
 
     fn set_header(rb: *Rb, gap: BytesInt) void {
         rb.gap[0] = .{ .value = gap };
         rb.range_len[0] = .{};
-        rb.id[0] = .null;
+        rb.id[0] = 0;
         rb.payload[0] = 0;
     }
 
-    fn copy_cells(dst: *Rb, dst_begin: usize, src: *const Rb, src_begin: usize, n: usize) void {
+    fn copy_cells(
+        dst: *Rb,
+        dst_begin: usize,
+        src: *const Rb,
+        src_begin: usize,
+        n: usize,
+    ) void {
         if (n == 0) return;
         @memcpy(dst.gap[dst_begin..][0..n], src.gap[src_begin..][0..n]);
-        @memcpy(dst.range_len[dst_begin..][0..n], src.range_len[src_begin..][0..n]);
+        @memcpy(
+            dst.range_len[dst_begin..][0..n],
+            src.range_len[src_begin..][0..n],
+        );
         @memcpy(dst.id[dst_begin..][0..n], src.id[src_begin..][0..n]);
         @memcpy(dst.payload[dst_begin..][0..n], src.payload[src_begin..][0..n]);
     }
@@ -331,14 +383,17 @@ const Rb = extern struct {
     fn move_cells(rb: *Rb, dst_begin: usize, src_begin: usize, n: usize) void {
         if (n == 0) return;
         @memmove(rb.gap[dst_begin..][0..n], rb.gap[src_begin..][0..n]);
-        @memmove(rb.range_len[dst_begin..][0..n], rb.range_len[src_begin..][0..n]);
+        @memmove(
+            rb.range_len[dst_begin..][0..n],
+            rb.range_len[src_begin..][0..n],
+        );
         @memmove(rb.id[dst_begin..][0..n], rb.id[src_begin..][0..n]);
         @memmove(rb.payload[dst_begin..][0..n], rb.payload[src_begin..][0..n]);
     }
 };
 
 const Ib = extern struct {
-    const capacity = 15;
+    const capacity = ib_capacity;
     const CapInt = std.math.IntFittingRange(0, capacity);
 
     /// gap to next distinct start at this layer. header slot stores the gap to
@@ -351,7 +406,7 @@ const Ib = extern struct {
     /// 0 down num means null, so it is reliable to use this for body-slot
     /// iteration end. header slot liveness comes from `first_is_header`.
     down: [capacity]u32 align(config.dcache_line_bytes),
-    next: Ib.Num,
+    next: u32,
 
     comptime {
         assert(@alignOf(Ib) == config.dcache_line_bytes);
@@ -360,7 +415,7 @@ const Ib = extern struct {
         assert(@offsetOf(Ib, "down") == 4 * config.dcache_line_bytes);
     }
 
-    const Num = enum(u32) { null = 0, _ };
+    const Num = enum(std.math.IntFittingRange(0, max_ib_count)) { null = 0, _ };
     const PtrNum = struct {
         ptr: *Ib,
         num: Num,
@@ -397,7 +452,9 @@ const Ib = extern struct {
                         it.rank += 1;
                     }
 
-                    if (it.rank < capacity and it.ib.ptr.occupied(it.first_is_header, it.rank)) {
+                    if (it.rank < capacity and
+                        it.ib.ptr.occupied(it.first_is_header, it.rank))
+                    {
                         return .{
                             .ib = it.ib,
                             .first_is_header = it.first_is_header,
@@ -413,7 +470,7 @@ const Ib = extern struct {
             }
 
             fn next_block(it: *Iter, sr: *SkipRange) bool {
-                const next_num = it.ib.ptr.next;
+                const next_num: Ib.Num = @enumFromInt(it.ib.ptr.next);
                 if (next_num == .null) return false;
                 it.ib = .{
                     .num = next_num,
@@ -451,7 +508,8 @@ const Ib = extern struct {
         head: PtrNum,
         /// Whether `head` exposes the virtual `-inf` slot at rank 0.
         first_is_header: bool,
-        /// Exclusive end offset for this bounded view, relative to its caller-held base.
+        /// Exclusive end offset for this bounded view, relative to its
+        /// caller-held base.
         end_rel: ?BytesInt,
 
         const Iter = struct {
@@ -474,8 +532,8 @@ const Ib = extern struct {
             };
         }
 
-        fn past_end(view: View, pos: BytesInt) bool {
-            if (view.end_rel) |end| return pos >= end;
+        fn past_end(view: View, start_rel: BytesInt) bool {
+            if (view.end_rel) |end| return start_rel >= end;
             return false;
         }
     };
@@ -497,7 +555,13 @@ const Ib = extern struct {
         if (end_len < capacity) ib.down[end_len] = 0;
     }
 
-    fn copy_slots(dst: *Ib, dst_begin: usize, src: *const Ib, src_begin: usize, n: usize) void {
+    fn copy_slots(
+        dst: *Ib,
+        dst_begin: usize,
+        src: *const Ib,
+        src_begin: usize,
+        n: usize,
+    ) void {
         if (n == 0) return;
         @memcpy(dst.gap[dst_begin..][0..n], src.gap[src_begin..][0..n]);
         @memcpy(dst.reach[dst_begin..][0..n], src.reach[src_begin..][0..n]);
@@ -566,32 +630,41 @@ pub fn deinit(sr: *SkipRange, gpa: Allocator) void {
     sr.* = undefined;
 }
 
-/// Asserts `value.start <= value.end`.
+/// Asserts `range.start <= range.end`.
 pub fn insert(
     sr: *SkipRange,
     gpa: Allocator,
-    value: RangeValue,
+    range: Range,
 ) Allocator.Error!RangeId {
-    assert(value.start <= value.end);
+    assert(range.start <= range.end);
     if (sr.range_count == max_ranges) return error.OutOfMemory;
 
-    const id: RangeId = @enumFromInt(sr.range_count + 1);
-    const sample_h = augment_height(sr.rng.random(), 0, max_height);
+    const height = augment_height(sr.rng.random(), 0, max_height);
+    return sr.insert_with_height(gpa, range, height);
+}
 
-    // First range seeds the leaf. Root growth below builds the sampled tower.
+fn insert_with_height(
+    sr: *SkipRange,
+    gpa: Allocator,
+    range: Range,
+    height: HeightInt,
+) Allocator.Error!RangeId {
+    const id: RangeId = @enumFromInt(sr.range_count + 1);
+
+    // First range seeds the leaf. Root growth below builds its tower.
     if (sr.root == .null) {
         const leader = try sr.rb_create(gpa);
         leader.ptr.* = undefined;
-        leader.ptr.next = .null;
-        leader.ptr.set(0, value, id, 0);
+        leader.ptr.next = 0;
+        leader.ptr.set(0, range, id, 0);
         leader.ptr.set_end(1);
 
         var heads: PendingTower.RbHeads = .{ .leader = leader.num };
-        if (value.start != 0) {
+        if (range.start != 0) {
             const prefix = try sr.rb_create(gpa);
             prefix.ptr.* = undefined;
-            prefix.ptr.next = leader.num;
-            prefix.ptr.set_header(value.start);
+            prefix.ptr.next = @intFromEnum(leader.num);
+            prefix.ptr.set_header(range.start);
             prefix.ptr.set_end(1);
             heads.prefix = prefix.num;
         }
@@ -599,30 +672,31 @@ pub fn insert(
         try sr.grow_root(
             gpa,
             .{ .rb = heads },
-            value.start,
+            range.start,
             0,
-            value.end,
+            range.end,
             0,
-            @max(@as(HeightInt, 1), sample_h),
+            @max(@as(HeightInt, 1), height),
             .null,
         );
         sr.range_count = 1;
         return id;
     }
 
-    // Descend once and widen reach. Only bottom promote_h frames can gain a promoted
-    // leader, so a fixed stack keeps those frames for one bottom-up tower pass.
-    // Same-start returns at the leaf; lower sampled height naturally shrinks
+    // Descend once and widen reach. Only bottom promote_h frames can gain a
+    // promoted leader, so a fixed stack keeps those frames for one bottom-up
+    // tower pass.
+    // Same-start returns at the leaf; lower height naturally shrinks
     // retained frames and ascent work. Capacity spills stay in their layer.
     var path: [max_height]PromoteFrame = undefined;
-    var promote_h = sample_h;
+    var promote_h = height;
     var ib_view: Ib.View = .{
         .head = sr.root_ptr(),
         .first_is_header = true,
         .end_rel = null,
     };
-    var insert_rel = value.start;
-    var end_rel = value.end;
+    var insert_rel = range.start;
+    var end_rel = range.end;
     var walk_h: HeightInt = sr.ib_height + 1;
 
     const leaf_view: Rb.View = descend: while (true) {
@@ -641,7 +715,8 @@ pub fn insert(
         // An upper tower hit proves same-start. Keep descending for leaf
         // placement; stop collecting promotion repair state.
         const child_rank = ib_scan.find.rank;
-        const child_is_header = ib_scan.find.first_is_header and child_rank == 0;
+        const child_is_header =
+            ib_scan.find.first_is_header and child_rank == 0;
         if (!child_is_header and ib_scan.find.start_rel == insert_rel) {
             promote_h = 0;
         } else if (need_reach) {
@@ -654,15 +729,25 @@ pub fn insert(
 
         const child_base_in_parent = ib_scan.find.start_rel;
         const child_gap = ib_scan.find.gap;
-        const child_end_rel = if (slot_child_end_rel(ib_view.end_rel, child_is_header, child_base_in_parent, child_gap)) |end_in_parent|
+        const child_end_in_parent_rel = slot_child_end_rel(
+            ib_view.end_rel,
+            child_is_header,
+            child_base_in_parent,
+            child_gap,
+        );
+        const child_end_rel = if (child_end_in_parent_rel) |end_in_parent|
             end_in_parent - child_base_in_parent
         else
             null;
         const child_num = ib_scan.find.ib.ptr.down[child_rank];
         const reach: u64 = @intCast(end_rel - child_base_in_parent);
-        ib_scan.find.ib.ptr.reach[child_rank] = @max(ib_scan.find.ib.ptr.reach[child_rank], reach);
+        ib_scan.find.ib.ptr.reach[child_rank] = @max(
+            ib_scan.find.ib.ptr.reach[child_rank],
+            reach,
+        );
 
-        // Mutable coordinates follow the walk: parent-relative to child-relative.
+        // Mutable coordinates follow the walk: parent-relative to
+        // child-relative.
         insert_rel -= child_base_in_parent;
         end_rel -= child_base_in_parent;
 
@@ -695,17 +780,16 @@ pub fn insert(
         .target_rel = insert_rel,
         .scan = rb_scan,
     });
-    const same_start = rb_scan.exact_tail != null;
+    const same_start = rb_scan.same_start;
     // Same-start ranges and leaf-only leaders share one packed insertion.
     if (same_start or promote_h == 0) {
-        const place: RbScan.ExactTail = rb_scan.exact_tail orelse .{
-            .rb = leaf.rb,
-            .first_is_header = leaf.first_is_header,
-            .rank = leaf.rank,
-        };
+        const place = leaf;
         const old_len = place.rb.ptr.len(place.first_is_header);
         const insert_rank = place.rank + 1;
-        const delta: BytesInt = if (same_start) 0 else insert_rel - leaf.start_rel;
+        const delta: BytesInt = if (same_start)
+            0
+        else
+            insert_rel - leaf.start_rel;
         const prev_gap = delta;
         const gap_after: BytesInt = if (same_start)
             place.rb.ptr.gap[place.rank].value
@@ -714,9 +798,13 @@ pub fn insert(
         else
             leaf.gap - delta;
         if (old_len < Rb.capacity) {
-            place.rb.ptr.move_cells(insert_rank + 1, insert_rank, old_len - insert_rank);
+            place.rb.ptr.move_cells(
+                insert_rank + 1,
+                insert_rank,
+                old_len - insert_rank,
+            );
             place.rb.ptr.gap[place.rank].value = prev_gap;
-            place.rb.ptr.set(insert_rank, value, id, gap_after);
+            place.rb.ptr.set(insert_rank, range, id, gap_after);
             place.rb.ptr.set_end(old_len + 1);
         } else {
             _ = try sr.rb_spill(
@@ -725,7 +813,7 @@ pub fn insert(
                 place.first_is_header,
                 insert_rank,
                 prev_gap,
-                value,
+                range,
                 id,
                 gap_after,
             );
@@ -737,7 +825,7 @@ pub fn insert(
     // Distinct-start promotion makes the leaf leader view, then carries its
     // pending tower through one bottom-up pass over promote_h logical views.
     var pending: PendingTower = .{
-        .rb = try sr.rb_promote(gpa, leaf, insert_rel, value, id),
+        .rb = try sr.rb_promote(gpa, leaf, insert_rel, range, id),
     };
     var left_max_end_rel = rb_scan.left_max_end_rel;
     var right_max_end_rel = @max(rb_scan.right_max_end_rel, end_rel);
@@ -777,7 +865,7 @@ pub fn insert(
             };
         } else {
             assert(h_up == promote_h);
-            // Sampled height reached. Attach final promoted leader here.
+            // Promotion height reached. Attach final promoted leader here.
             try sr.ib_attach(
                 gpa,
                 frame.found,
@@ -788,21 +876,27 @@ pub fn insert(
             );
         }
 
-        left_max_end_rel = @max(frame.parent_left_max_end_rel, left_max_end_rel);
-        right_max_end_rel = @max(frame.parent_right_max_end_rel, right_max_end_rel);
+        left_max_end_rel = @max(
+            frame.parent_left_max_end_rel,
+            left_max_end_rel,
+        );
+        right_max_end_rel = @max(
+            frame.parent_right_max_end_rel,
+            right_max_end_rel,
+        );
     }
 
-    // Build sampled layers above the old root.
+    // Build remaining layers above the old root.
     if (h_up < promote_h) {
         try sr.grow_root(
             gpa,
             pending,
-            value.start,
+            range.start,
             left_max_end_rel,
             right_max_end_rel,
             h_up,
             promote_h,
-            if (value.start == 0) .null else sr.root,
+            if (range.start == 0) .null else sr.root,
         );
     }
     sr.range_count += 1;
@@ -814,7 +908,7 @@ fn rb_promote(
     gpa: Allocator,
     found: Rb.Find,
     leader_start_rel: BytesInt,
-    value: RangeValue,
+    range: Range,
     id: RangeId,
 ) Allocator.Error!PendingTower.RbHeads {
     const at_header = found.first_is_header and found.rank == 0;
@@ -827,7 +921,7 @@ fn rb_promote(
             const leader_next = found.rb.ptr.next;
             if (prefix_gap == 0) {
                 found.rb.ptr.next = leader_next;
-                found.rb.ptr.set(0, value, id, leader_gap);
+                found.rb.ptr.set(0, range, id, leader_gap);
                 found.rb.ptr.set_end(1);
                 return .{ .leader = found.rb.num };
             }
@@ -835,10 +929,10 @@ fn rb_promote(
             const leader = try sr.rb_create(gpa);
             leader.ptr.* = undefined;
             leader.ptr.next = leader_next;
-            leader.ptr.set(0, value, id, leader_gap);
+            leader.ptr.set(0, range, id, leader_gap);
             leader.ptr.set_end(1);
 
-            found.rb.ptr.next = leader.num;
+            found.rb.ptr.next = @intFromEnum(leader.num);
             found.rb.ptr.set_header(prefix_gap);
             found.rb.ptr.set_end(1);
             return .{
@@ -850,15 +944,15 @@ fn rb_promote(
         rb_strip_header(found.rb);
         const leader = try sr.rb_create(gpa);
         leader.ptr.* = undefined;
-        leader.ptr.next = found.rb.num;
-        leader.ptr.set(0, value, id, leader_gap);
+        leader.ptr.next = @intFromEnum(found.rb.num);
+        leader.ptr.set(0, range, id, leader_gap);
         leader.ptr.set_end(1);
 
         if (prefix_gap == 0) return .{ .leader = leader.num };
 
         const prefix = try sr.rb_create(gpa);
         prefix.ptr.* = undefined;
-        prefix.ptr.next = leader.num;
+        prefix.ptr.next = @intFromEnum(leader.num);
         prefix.ptr.set_header(prefix_gap);
         prefix.ptr.set_end(1);
         return .{
@@ -869,15 +963,15 @@ fn rb_promote(
 
     const leader = try sr.rb_create(gpa);
     leader.ptr.* = undefined;
-    leader.ptr.next = .null;
-    leader.ptr.set(0, value, id, gap_after);
+    leader.ptr.next = 0;
+    leader.ptr.set(0, range, id, gap_after);
     leader.ptr.set_end(1);
 
     rb_copy_suffix(leader, found.rb, found.rank + 1, 1, found.first_is_header);
     leader.ptr.next = found.rb.ptr.next;
 
     found.rb.ptr.set_end(found.rank + 1);
-    found.rb.ptr.next = leader.num;
+    found.rb.ptr.next = @intFromEnum(leader.num);
     found.rb.ptr.gap[found.rank].value = delta;
     return .{ .leader = leader.num };
 }
@@ -894,6 +988,7 @@ fn ib_promote(
     const at_header = found.first_is_header and found.rank == 0;
     const delta = leader_start_rel - found.start_rel;
     const gap_after = if (found.gap == 0) 0 else found.gap - delta;
+    const leader_reach = right_max_end_rel - leader_start_rel;
     if (at_header) {
         const left_child = if (delta == 0) 0 else found.ib.ptr.down[found.rank];
         const next: PendingTower.IbHeads = next: {
@@ -918,7 +1013,7 @@ fn ib_promote(
                 leader.ptr.down[0] = 0;
                 leader.ptr.set_end(1);
 
-                found.ib.ptr.next = leader.num;
+                found.ib.ptr.next = @intFromEnum(leader.num);
                 found.ib.ptr.gap[0] = @intCast(prefix_gap);
                 found.ib.ptr.reach[0] = 0;
                 found.ib.ptr.down[0] = 0;
@@ -932,7 +1027,7 @@ fn ib_promote(
             ib_strip_header(found.ib);
             const leader = try sr.ib_create(gpa);
             leader.ptr.* = undefined;
-            leader.ptr.next = found.ib.num;
+            leader.ptr.next = @intFromEnum(found.ib.num);
             leader.ptr.gap[0] = @intCast(leader_gap);
             leader.ptr.reach[0] = 0;
             leader.ptr.down[0] = 0;
@@ -943,7 +1038,7 @@ fn ib_promote(
 
             const prefix = try sr.ib_create(gpa);
             prefix.ptr.* = undefined;
-            prefix.ptr.next = leader.num;
+            prefix.ptr.next = @intFromEnum(leader.num);
             prefix.ptr.gap[0] = @intCast(prefix_gap);
             prefix.ptr.reach[0] = 0;
             prefix.ptr.down[0] = 0;
@@ -962,13 +1057,16 @@ fn ib_promote(
                 .num = next.prefix,
                 .ptr = sr.ib_at(next.prefix),
             };
-            prefix.ptr.down[0] = if (child.prefix != 0) child.prefix else left_child;
+            prefix.ptr.down[0] = if (child.prefix != 0)
+                child.prefix
+            else
+                left_child;
             leader.ptr.down[0] = child.leader;
             prefix.ptr.reach[0] = @intCast(left_max_end_rel);
-            leader.ptr.reach[0] = @intCast(right_max_end_rel - leader_start_rel);
+            leader.ptr.reach[0] = @intCast(leader_reach);
         } else {
             leader.ptr.down[0] = child.leader;
-            leader.ptr.reach[0] = @intCast(right_max_end_rel - leader_start_rel);
+            leader.ptr.reach[0] = @intCast(leader_reach);
         }
         return next;
     }
@@ -976,7 +1074,7 @@ fn ib_promote(
     assert(child.prefix == 0);
     const leader = try sr.ib_create(gpa);
     leader.ptr.* = undefined;
-    leader.ptr.next = .null;
+    leader.ptr.next = 0;
 
     leader.ptr.gap[0] = @intCast(gap_after);
     leader.ptr.reach[0] = 0;
@@ -993,10 +1091,11 @@ fn ib_promote(
     }
     leader.ptr.next = old.ptr.next;
     old.ptr.set_end(keep);
-    old.ptr.next = leader.num;
+    old.ptr.next = @intFromEnum(leader.num);
+    const left_reach = left_max_end_rel - found.start_rel;
     old.ptr.gap[found.rank] = @intCast(delta);
-    old.ptr.reach[found.rank] = @intCast(left_max_end_rel - found.start_rel);
-    leader.ptr.reach[0] = @intCast(right_max_end_rel - leader_start_rel);
+    old.ptr.reach[found.rank] = @intCast(left_reach);
+    leader.ptr.reach[0] = @intCast(leader_reach);
     return .{ .leader = leader.num };
 }
 
@@ -1012,6 +1111,7 @@ fn ib_attach(
     const at_header = found.first_is_header and found.rank == 0;
     const delta = leader_start_rel - found.start_rel;
     const gap_after = if (found.gap == 0) 0 else found.gap - delta;
+    const leader_reach = right_max_end_rel - leader_start_rel;
     if (at_header) {
         const left_child = if (delta == 0) 0 else found.ib.ptr.down[found.rank];
         const left_down = if (child.prefix != 0) child.prefix else left_child;
@@ -1026,7 +1126,7 @@ fn ib_attach(
                 left_max_end_rel,
                 left_down,
                 gap_after,
-                right_max_end_rel - leader_start_rel,
+                leader_reach,
                 child.leader,
             );
         } else {
@@ -1035,7 +1135,7 @@ fn ib_attach(
             found.ib.ptr.reach[0] = @intCast(left_max_end_rel);
             found.ib.ptr.down[0] = left_down;
             found.ib.ptr.gap[1] = @intCast(gap_after);
-            found.ib.ptr.reach[1] = @intCast(right_max_end_rel - leader_start_rel);
+            found.ib.ptr.reach[1] = @intCast(leader_reach);
             found.ib.ptr.down[1] = child.leader;
             found.ib.ptr.set_end(old_len + 1);
         }
@@ -1043,19 +1143,20 @@ fn ib_attach(
     }
 
     assert(child.prefix == 0);
+    const left_reach = left_max_end_rel - found.start_rel;
     const old_len = found.ib.ptr.len(found.first_is_header);
     if (old_len == Ib.capacity) {
-        // Sampled promotion ends here. Capacity adds a balanced same-layer spill.
+        // Promotion ends here. Capacity adds a balanced same-layer spill.
         _ = try sr.ib_spill(
             gpa,
             found.ib,
             found.first_is_header,
             found.rank + 1,
             delta,
-            left_max_end_rel - found.start_rel,
+            left_reach,
             found.ib.ptr.down[found.rank],
             gap_after,
-            right_max_end_rel - leader_start_rel,
+            leader_reach,
             child.leader,
         );
         return;
@@ -1067,8 +1168,8 @@ fn ib_attach(
     found.ib.ptr.gap[rank] = @intCast(gap_after);
     found.ib.ptr.set_end(old_len + 1);
     found.ib.ptr.down[rank] = child.leader;
-    found.ib.ptr.reach[found.rank] = @intCast(left_max_end_rel - found.start_rel);
-    found.ib.ptr.reach[rank] = @intCast(right_max_end_rel - leader_start_rel);
+    found.ib.ptr.reach[found.rank] = @intCast(left_reach);
+    found.ib.ptr.reach[rank] = @intCast(leader_reach);
 }
 
 fn grow_root(
@@ -1084,6 +1185,7 @@ fn grow_root(
 ) Allocator.Error!void {
     assert(built_h < tower_h);
 
+    const leader_reach = right_max_end_abs - leader_start_abs;
     var h_up = built_h;
     var child = pending.down();
     var fallback: u32 = @intFromEnum(left_fallback);
@@ -1098,9 +1200,9 @@ fn grow_root(
         if (h_up < tower_h) {
             const leader = try sr.ib_create(gpa);
             leader.ptr.* = undefined;
-            leader.ptr.next = .null;
+            leader.ptr.next = 0;
             leader.ptr.gap[0] = 0;
-            leader.ptr.reach[0] = @intCast(right_max_end_abs - leader_start_abs);
+            leader.ptr.reach[0] = @intCast(leader_reach);
             leader.ptr.down[0] = child.leader;
             leader.ptr.set_end(1);
 
@@ -1108,7 +1210,7 @@ fn grow_root(
             if (leader_start_abs != 0 or left_down != 0) {
                 const prefix = try sr.ib_create(gpa);
                 prefix.ptr.* = undefined;
-                prefix.ptr.next = leader.num;
+                prefix.ptr.next = @intFromEnum(leader.num);
                 prefix.ptr.gap[0] = @intCast(leader_start_abs);
                 prefix.ptr.reach[0] = @intCast(left_max_end_abs);
                 prefix.ptr.down[0] = left_down;
@@ -1124,12 +1226,12 @@ fn grow_root(
 
         const root = try sr.ib_create(gpa);
         root.ptr.* = undefined;
-        root.ptr.next = .null;
+        root.ptr.next = 0;
         root.ptr.gap[0] = @intCast(leader_start_abs);
         root.ptr.reach[0] = @intCast(left_max_end_abs);
         root.ptr.down[0] = left_down;
         root.ptr.gap[1] = 0;
-        root.ptr.reach[1] = @intCast(right_max_end_abs - leader_start_abs);
+        root.ptr.reach[1] = @intCast(leader_reach);
         root.ptr.down[1] = child.leader;
         root.ptr.set_end(2);
         sr.root = root.num;
@@ -1213,16 +1315,10 @@ fn slot_child_end_rel(
 }
 
 const RbScan = struct {
-    const ExactTail = struct {
-        rb: Rb.PtrNum,
-        first_is_header: bool,
-        rank: Rb.CapInt,
-    };
-
     find: Rb.Find,
     left_max_end_rel: BytesInt,
     right_max_end_rel: BytesInt,
-    exact_tail: ?ExactTail,
+    same_start: bool,
 };
 
 fn scan_rb(
@@ -1234,21 +1330,21 @@ fn scan_rb(
     var left_max_end_rel: BytesInt = 0;
     var right_max_end_rel: BytesInt = 0;
     var found: ?Rb.Find = null;
-    var exact_tail: ?RbScan.ExactTail = null;
+    var same_start = false;
     var rb = view.head;
-    var pos: BytesInt = 0;
+    var start_rel: BytesInt = 0;
     var rb_first_is_header = view.first_is_header;
     scan: while (true) {
         var i_begin: Rb.CapInt = 0;
         if (rb_first_is_header) {
-            pos = rb.ptr.gap[0].value;
-            if (target_rel < pos) {
+            start_rel = rb.ptr.gap[0].value;
+            if (target_rel < start_rel) {
                 found = .{
                     .rb = rb,
                     .first_is_header = true,
                     .rank = 0,
                     .start_rel = 0,
-                    .gap = pos,
+                    .gap = start_rel,
                 };
             }
             i_begin = 1;
@@ -1256,64 +1352,60 @@ fn scan_rb(
         for (i_begin..Rb.capacity) |i_usize| {
             const i: Rb.CapInt = @intCast(i_usize);
             if (!rb.ptr.occupied(rb_first_is_header, i)) break;
-            if (view.past_end(pos)) break;
+            if (view.past_end(start_rel)) break;
             if (need_reach) {
-                const end = pos + rb.ptr.range_len[i].value;
-                if (pos < target_rel)
+                const end = start_rel + rb.ptr.range_len[i].value;
+                if (start_rel < target_rel)
                     left_max_end_rel = @max(left_max_end_rel, end)
-                else if (pos > target_rel)
+                else if (start_rel > target_rel)
                     right_max_end_rel = @max(right_max_end_rel, end);
             }
-            if (pos == target_rel)
-                exact_tail = .{
-                    .rb = rb,
-                    .first_is_header = rb_first_is_header,
-                    .rank = i,
-                };
             const gap: BytesInt = rb.ptr.gap[i].value;
             if (found == null) {
-                if (target_rel == pos) {
+                if (target_rel == start_rel) {
                     found = .{
                         .rb = rb,
                         .first_is_header = rb_first_is_header,
                         .rank = i,
-                        .start_rel = pos,
+                        .start_rel = start_rel,
                         .gap = gap,
                     };
-                } else if (gap != 0 and target_rel < pos + gap) {
+                    same_start = true;
+                    break :scan;
+                } else if (gap != 0 and target_rel < start_rel + gap) {
                     found = .{
                         .rb = rb,
                         .first_is_header = rb_first_is_header,
                         .rank = i,
-                        .start_rel = pos,
+                        .start_rel = start_rel,
                         .gap = gap,
                     };
                 } else if (gap == 0 and
-                    (i + 1 == Rb.capacity or !rb.ptr.occupied(rb_first_is_header, i + 1)) and
-                    rb.ptr.next == .null)
+                    (i + 1 == Rb.capacity or
+                        !rb.ptr.occupied(rb_first_is_header, i + 1)) and
+                    rb.ptr.next == 0)
                 {
                     found = .{
                         .rb = rb,
                         .first_is_header = rb_first_is_header,
                         .rank = i,
-                        .start_rel = pos,
+                        .start_rel = start_rel,
                         .gap = gap,
                     };
                 }
             }
             if (found != null) {
-                if (exact_tail != null and pos == target_rel and gap != 0)
-                    break :scan;
-                if (!need_reach and exact_tail == null)
+                if (!need_reach)
                     break :scan;
             }
-            pos += gap;
+            start_rel += gap;
         }
-        if (view.past_end(pos)) break;
-        if (rb.ptr.next == .null) break;
+        if (view.past_end(start_rel)) break;
+        if (rb.ptr.next == 0) break;
+        const next_num: Rb.Num = @enumFromInt(rb.ptr.next);
         rb = .{
-            .num = rb.ptr.next,
-            .ptr = sr.rb_at(rb.ptr.next),
+            .num = next_num,
+            .ptr = sr.rb_at(next_num),
         };
         rb_first_is_header = false;
     }
@@ -1322,7 +1414,7 @@ fn scan_rb(
         .find = found.?,
         .left_max_end_rel = left_max_end_rel,
         .right_max_end_rel = right_max_end_rel,
-        .exact_tail = exact_tail,
+        .same_start = same_start,
     };
 }
 
@@ -1342,23 +1434,26 @@ fn scan_ib(
     var right_max_end_rel: BytesInt = 0;
     var found: ?Ib.Find = null;
     var ib = view.head;
-    var pos: BytesInt = 0;
+    var leader_start_rel: BytesInt = 0;
     var ib_first_is_header = view.first_is_header;
     scan: while (true) {
         if (ib_first_is_header)
-            pos = @intCast(ib.ptr.gap[0]);
+            leader_start_rel = @intCast(ib.ptr.gap[0]);
 
         for (0..Ib.capacity) |i_usize| {
             const i: Ib.CapInt = @intCast(i_usize);
             if (!ib.ptr.occupied(ib_first_is_header, i)) break;
             const child_is_header = ib_first_is_header and i == 0;
-            if (!child_is_header and view.past_end(pos)) break;
+            if (!child_is_header and view.past_end(leader_start_rel)) break;
 
             const gap: BytesInt = @intCast(ib.ptr.gap[i]);
-            const slot_start_rel = if (child_is_header) @as(BytesInt, 0) else pos;
+            const slot_start_rel: BytesInt = if (child_is_header)
+                0
+            else
+                leader_start_rel;
             var chosen = false;
             if (found == null) {
-                if (child_is_header and target_rel < pos) {
+                if (child_is_header and target_rel < leader_start_rel) {
                     found = .{
                         .ib = ib,
                         .first_is_header = true,
@@ -1367,21 +1462,25 @@ fn scan_ib(
                         .gap = gap,
                     };
                     chosen = true;
-                } else if (!child_is_header and target_rel == pos) {
+                } else if (!child_is_header and
+                    target_rel == leader_start_rel)
+                {
                     found = .{
                         .ib = ib,
                         .first_is_header = ib_first_is_header,
                         .rank = i,
-                        .start_rel = pos,
+                        .start_rel = leader_start_rel,
                         .gap = gap,
                     };
                     chosen = true;
-                } else if (!child_is_header and (gap == 0 or target_rel < pos + gap)) {
+                } else if (!child_is_header and
+                    (gap == 0 or target_rel < leader_start_rel + gap))
+                {
                     found = .{
                         .ib = ib,
                         .first_is_header = ib_first_is_header,
                         .rank = i,
-                        .start_rel = pos,
+                        .start_rel = leader_start_rel,
                         .gap = gap,
                     };
                     chosen = true;
@@ -1400,8 +1499,11 @@ fn scan_ib(
                 .chosen = chosen,
             });
 
-            if (need_reach and !chosen and !(child_is_header and ib.ptr.down[i] == 0)) {
-                const end_rel = slot_start_rel + @as(BytesInt, @intCast(ib.ptr.reach[i]));
+            const header_without_child =
+                child_is_header and ib.ptr.down[i] == 0;
+            if (need_reach and !chosen and !header_without_child) {
+                const end_rel = slot_start_rel +
+                    @as(BytesInt, @intCast(ib.ptr.reach[i]));
                 if (slot_start_rel < target_rel)
                     left_max_end_rel = @max(left_max_end_rel, end_rel)
                 else
@@ -1409,13 +1511,14 @@ fn scan_ib(
             }
             if (!need_reach and found != null)
                 break :scan;
-            if (!child_is_header) pos += gap;
+            if (!child_is_header) leader_start_rel += gap;
         }
-        if (view.past_end(pos)) break;
-        if (ib.ptr.next == .null) break;
+        if (view.past_end(leader_start_rel)) break;
+        if (ib.ptr.next == 0) break;
+        const next_num: Ib.Num = @enumFromInt(ib.ptr.next);
         ib = .{
-            .num = ib.ptr.next,
-            .ptr = sr.ib_at(ib.ptr.next),
+            .num = next_num,
+            .ptr = sr.ib_at(next_num),
         };
         ib_first_is_header = false;
     }
@@ -1473,7 +1576,11 @@ fn ib_spill(
     const left_len: Ib.CapInt = (Ib.capacity + 1) / 2;
     if (insert_rank < left_len) {
         spill.ptr.copy_slots(0, ib.ptr, left_len - 1, old_len - (left_len - 1));
-        ib.ptr.move_slots(insert_rank + 1, insert_rank, left_len - 1 - insert_rank);
+        ib.ptr.move_slots(
+            insert_rank + 1,
+            insert_rank,
+            left_len - 1 - insert_rank,
+        );
         ib.ptr.gap[insert_rank] = @intCast(gap);
         ib.ptr.reach[insert_rank] = @intCast(reach);
         ib.ptr.down[insert_rank] = down;
@@ -1483,12 +1590,17 @@ fn ib_spill(
         spill.ptr.gap[right_rank] = @intCast(gap);
         spill.ptr.reach[right_rank] = @intCast(reach);
         spill.ptr.down[right_rank] = down;
-        spill.ptr.copy_slots(right_rank + 1, ib.ptr, insert_rank, old_len - insert_rank);
+        spill.ptr.copy_slots(
+            right_rank + 1,
+            ib.ptr,
+            insert_rank,
+            old_len - insert_rank,
+        );
     }
 
     ib.ptr.set_end(left_len);
     spill.ptr.set_end(left_len);
-    ib.ptr.next = spill.num;
+    ib.ptr.next = @intFromEnum(spill.num);
     return spill;
 }
 
@@ -1499,7 +1611,7 @@ fn rb_spill(
     first_is_header: bool,
     insert_rank: Rb.CapInt,
     prev_gap: BytesInt,
-    value: RangeValue,
+    range: Range,
     id: RangeId,
     gap: BytesInt,
 ) Allocator.Error!Rb.PtrNum {
@@ -1516,18 +1628,27 @@ fn rb_spill(
     const left_len: Rb.CapInt = (Rb.capacity + 1) / 2;
     if (insert_rank < left_len) {
         spill.ptr.copy_cells(0, rb.ptr, left_len - 1, old_len - (left_len - 1));
-        rb.ptr.move_cells(insert_rank + 1, insert_rank, left_len - 1 - insert_rank);
-        rb.ptr.set(insert_rank, value, id, gap);
+        rb.ptr.move_cells(
+            insert_rank + 1,
+            insert_rank,
+            left_len - 1 - insert_rank,
+        );
+        rb.ptr.set(insert_rank, range, id, gap);
     } else {
         const right_rank = insert_rank - left_len;
         spill.ptr.copy_cells(0, rb.ptr, left_len, right_rank);
-        spill.ptr.set(right_rank, value, id, gap);
-        spill.ptr.copy_cells(right_rank + 1, rb.ptr, insert_rank, old_len - insert_rank);
+        spill.ptr.set(right_rank, range, id, gap);
+        spill.ptr.copy_cells(
+            right_rank + 1,
+            rb.ptr,
+            insert_rank,
+            old_len - insert_rank,
+        );
     }
 
     rb.ptr.set_end(left_len);
     spill.ptr.set_end(left_len);
-    rb.ptr.next = spill.num;
+    rb.ptr.next = @intFromEnum(spill.num);
     return spill;
 }
 
@@ -1553,7 +1674,7 @@ const OwnerCounts = struct {
 
 fn expect_valid(sr: *SkipRange) !void {
     if (sr.root == .null) {
-        try std.testing.expectEqual(@as(u32, 0), sr.range_count);
+        try std.testing.expectEqual(@as(RangeInt, 0), sr.range_count);
         return;
     }
 
@@ -1566,7 +1687,7 @@ fn expect_valid(sr: *SkipRange) !void {
     defer gpa.free(rb_counts);
     @memset(rb_counts, .{});
 
-    var ranges: u32 = 0;
+    var ranges: RangeInt = 0;
     _ = try sr.expect_valid_ib(
         .{
             .head = sr.root_ptr(),
@@ -1601,7 +1722,7 @@ fn expect_valid_ib(
     view: Ib.View,
     base_abs: BytesInt,
     h_cur: HeightInt,
-    ranges: *u32,
+    ranges: *RangeInt,
     ib_counts: []OwnerCounts,
     rb_counts: []OwnerCounts,
 ) !BytesInt {
@@ -1614,16 +1735,19 @@ fn expect_valid_ib(
     }
 
     var max_end_abs: BytesInt = base_abs;
-    var prev_last_start_abs: ?BytesInt = null;
+    var prev_leader_start_abs: ?BytesInt = null;
     var prev_ib: Ib.Num = .null;
     var it = view.iter();
     while (it.next(sr)) |item| {
         const ib_idx = @as(usize, @intFromEnum(item.ib.num));
         const slot_start_abs = base_abs + item.slot_start_rel;
         const child_is_header = item.first_is_header and item.rank == 0;
+        if (!child_is_header) {
+            if (prev_leader_start_abs) |prev_abs|
+                try std.testing.expect(prev_abs < slot_start_abs);
+            prev_leader_start_abs = slot_start_abs;
+        }
         if (item.ib.num != prev_ib) {
-            if (prev_last_start_abs) |last_abs|
-                try std.testing.expect(last_abs < slot_start_abs);
             try std.testing.expect(!ib_counts[ib_idx].active);
             try std.testing.expect(!ib_counts[ib_idx].seen);
             try active_ibs.append(gpa, ib_idx);
@@ -1637,7 +1761,10 @@ fn expect_valid_ib(
         }
 
         const gap = item.gap;
-        const next_start_abs = if (child_is_header or gap != 0) slot_start_abs + gap else null;
+        const next_start_abs = if (child_is_header or gap != 0)
+            slot_start_abs + gap
+        else
+            null;
         const has_next_in_subtree = if (next_start_abs) |next_abs|
             if (view.end_rel) |end_rel| next_abs < base_abs + end_rel else true
         else
@@ -1648,13 +1775,18 @@ fn expect_valid_ib(
             else
                 try std.testing.expect(item.down != 0);
             if (view.end_rel) |end_rel|
-                try std.testing.expect(slot_start_abs + gap <= base_abs + end_rel);
+                try std.testing.expect(
+                    slot_start_abs + gap <= base_abs + end_rel,
+                );
         } else {
             try std.testing.expect(item.down != 0);
             if (has_next_in_subtree)
                 try std.testing.expect(gap > 0)
             else if (view.end_rel) |end_rel|
-                try std.testing.expect(gap == 0 or gap == base_abs + end_rel - slot_start_abs)
+                try std.testing.expect(
+                    gap == 0 or
+                        gap == base_abs + end_rel - slot_start_abs,
+                )
             else
                 try std.testing.expectEqual(@as(BytesInt, 0), gap);
         }
@@ -1663,22 +1795,32 @@ fn expect_valid_ib(
             if (h_cur == 1) {
                 const rb_num: Rb.Num = @enumFromInt(item.down);
                 rb_counts[@intFromEnum(rb_num)].down += 1;
-                try std.testing.expect(rb_counts[@intFromEnum(rb_num)].down <= 1);
+                try std.testing.expect(
+                    rb_counts[@intFromEnum(rb_num)].down <= 1,
+                );
             } else {
                 const child_num: Ib.Num = @enumFromInt(item.down);
                 ib_counts[@intFromEnum(child_num)].down += 1;
-                try std.testing.expect(ib_counts[@intFromEnum(child_num)].down <= 1);
+                try std.testing.expect(
+                    ib_counts[@intFromEnum(child_num)].down <= 1,
+                );
             }
         }
 
-        const child_base_abs = if (child_is_header) base_abs else slot_start_abs;
+        const child_base_abs = if (child_is_header)
+            base_abs
+        else
+            slot_start_abs;
         const child_end_rel = slot_child_end_rel(
             view.end_rel,
             child_is_header,
             item.slot_start_rel,
             gap,
         );
-        const child_view_end_rel = if (child_end_rel) |end_rel| end_rel - (child_base_abs - base_abs) else null;
+        const child_view_end_rel = if (child_end_rel) |end_rel|
+            end_rel - (child_base_abs - base_abs)
+        else
+            null;
         const child_end_abs = if (child_is_header and item.down == 0) blk: {
             try std.testing.expectEqual(@as(BytesInt, 0), gap);
             break :blk child_base_abs;
@@ -1698,9 +1840,13 @@ fn expect_valid_ib(
                 try std.testing.expectEqual(slot_start_abs, child_first_abs);
             if (child_view_end_rel) |end_rel|
                 if (child_is_header)
-                    try std.testing.expect(child_first_abs <= child_base_abs + end_rel)
+                    try std.testing.expect(
+                        child_first_abs <= child_base_abs + end_rel,
+                    )
                 else
-                    try std.testing.expect(child_first_abs < child_base_abs + end_rel);
+                    try std.testing.expect(
+                        child_first_abs < child_base_abs + end_rel,
+                    );
             break :blk try sr.expect_valid_rb(
                 .{
                     .head = rb,
@@ -1727,9 +1873,13 @@ fn expect_valid_ib(
                 try std.testing.expectEqual(slot_start_abs, child_first_abs);
             if (child_view_end_rel) |end_rel|
                 if (child_is_header)
-                    try std.testing.expect(child_first_abs <= child_base_abs + end_rel)
+                    try std.testing.expect(
+                        child_first_abs <= child_base_abs + end_rel,
+                    )
                 else
-                    try std.testing.expect(child_first_abs < child_base_abs + end_rel);
+                    try std.testing.expect(
+                        child_first_abs < child_base_abs + end_rel,
+                    );
             break :blk try sr.expect_valid_ib(
                 .{
                     .head = child,
@@ -1743,15 +1893,16 @@ fn expect_valid_ib(
                 rb_counts,
             );
         };
-        if (child_end_abs - slot_start_abs != item.reach) log.debug(@src(), "bad reach", .{
-            .height = h_cur,
-            .base_abs = base_abs,
-            .item = item,
-            .actual = child_end_abs - slot_start_abs,
-        });
+        if (child_end_abs - slot_start_abs != item.reach) {
+            log.debug(@src(), "bad reach", .{
+                .height = h_cur,
+                .base_abs = base_abs,
+                .item = item,
+                .actual = child_end_abs - slot_start_abs,
+            });
+        }
         try std.testing.expectEqual(child_end_abs - slot_start_abs, item.reach);
         max_end_abs = @max(max_end_abs, child_end_abs);
-        prev_last_start_abs = slot_start_abs;
     }
     return max_end_abs;
 }
@@ -1760,7 +1911,7 @@ fn expect_valid_rb(
     sr: *SkipRange,
     view: Rb.View,
     base_abs: BytesInt,
-    ranges: *u32,
+    ranges: *RangeInt,
     rb_counts: []OwnerCounts,
 ) !BytesInt {
     const gpa = std.testing.allocator;
@@ -1782,8 +1933,11 @@ fn expect_valid_rb(
     rb_counts[head_idx].seen = true;
     var it = view.iter();
     if (view.first_is_header) {
-        try std.testing.expectEqual(RangeId.null, view.head.ptr.id[0]);
-        try std.testing.expectEqual(@as(BytesInt, 0), view.head.ptr.range_len[0].value);
+        try std.testing.expectEqual(@as(u32, 0), view.head.ptr.id[0]);
+        try std.testing.expectEqual(
+            @as(BytesInt, 0),
+            view.head.ptr.range_len[0].value,
+        );
     }
     var item_opt = it.next(sr);
     while (item_opt) |item| {
@@ -1806,9 +1960,15 @@ fn expect_valid_rb(
             try std.testing.expect(prev_abs <= start_abs);
 
         if (next_item) |next|
-            try std.testing.expectEqual(next.start_rel - item.start_rel, item.gap)
+            try std.testing.expectEqual(
+                next.start_rel - item.start_rel,
+                item.gap,
+            )
         else if (view.end_rel) |end_rel|
-            try std.testing.expect(item.gap == 0 or item.gap == base_abs + end_rel - start_abs)
+            try std.testing.expect(
+                item.gap == 0 or
+                    item.gap == base_abs + end_rel - start_abs,
+            )
         else
             try std.testing.expectEqual(@as(BytesInt, 0), item.gap);
 
@@ -1859,14 +2019,20 @@ fn debug_collect_ib_chain(
     while (it.next(sr)) |item| {
         const slot_start_abs = base_abs + item.slot_start_rel;
         const child_is_header = item.first_is_header and item.rank == 0;
-        const child_base_abs = if (child_is_header) base_abs else slot_start_abs;
+        const child_base_abs = if (child_is_header)
+            base_abs
+        else
+            slot_start_abs;
         const child_end_rel = slot_child_end_rel(
             view.end_rel,
             child_is_header,
             item.slot_start_rel,
             item.gap,
         );
-        const child_view_end_rel = if (child_end_rel) |end_rel| end_rel - (child_base_abs - base_abs) else null;
+        const child_view_end_rel = if (child_end_rel) |end_rel|
+            end_rel - (child_base_abs - base_abs)
+        else
+            null;
         if (child_is_header and item.down == 0) {
             assert(item.gap == 0);
             continue;
@@ -1915,7 +2081,10 @@ fn debug_collect_rb_chain(
     }
 }
 
-fn expect_debug_matches_oracle(sr: *SkipRange, oracle: []const DebugRange) !void {
+fn expect_debug_matches_oracle(
+    sr: *SkipRange,
+    oracle: []const DebugRange,
+) !void {
     const got = try sr.debug_collect(std.testing.allocator);
     defer std.testing.allocator.free(got);
     const seen = try std.testing.allocator.alloc(bool, oracle.len);
@@ -1924,11 +2093,8 @@ fn expect_debug_matches_oracle(sr: *SkipRange, oracle: []const DebugRange) !void
 
     try std.testing.expectEqual(oracle.len, got.len);
     for (got, 0..) |range, i| {
-        if (i > 0) {
+        if (i > 0)
             try std.testing.expect(got[i - 1].start <= range.start);
-            if (got[i - 1].start == range.start)
-                try std.testing.expect(@intFromEnum(got[i - 1].id) < @intFromEnum(range.id));
-        }
 
         const want_idx = for (oracle, 0..) |candidate, candidate_idx| {
             if (candidate.id == range.id) break candidate_idx;
@@ -1944,7 +2110,7 @@ fn expect_debug_matches_oracle(sr: *SkipRange, oracle: []const DebugRange) !void
     }
 }
 
-test "skiprange: insert range" {
+test "skiprange: first insert round-trips range" {
     var sr: SkipRange = .empty;
     defer sr.deinit(std.testing.allocator);
     sr.rng = .init(std.testing.random_seed);
@@ -1965,9 +2131,76 @@ test "skiprange: insert range" {
     try std.testing.expectEqual(@as(u32, 7), got[0].payload);
 }
 
+test "skiprange: explicit towers suppress same-start promotion" {
+    var sr: SkipRange = .empty;
+    defer sr.deinit(std.testing.allocator);
+
+    const cases = [_]struct {
+        start: BytesInt,
+        end: BytesInt,
+        height: HeightInt,
+        want_ib_height: HeightInt,
+    }{
+        .{ .start = 10, .end = 14, .height = 0, .want_ib_height = 0 },
+        .{ .start = 20, .end = 25, .height = 2, .want_ib_height = 1 },
+        .{ .start = 30, .end = 36, .height = 2, .want_ib_height = 1 },
+        .{ .start = 30, .end = 38, .height = 2, .want_ib_height = 1 },
+    };
+    var oracle: [cases.len]DebugRange = undefined;
+
+    for (cases, 0..) |case, i| {
+        const range: Range = .{
+            .start = case.start,
+            .end = case.end,
+            .payload = @intCast(i),
+        };
+        const id = try sr.insert_with_height(
+            std.testing.allocator,
+            range,
+            case.height,
+        );
+        oracle[i] = .{
+            .start = range.start,
+            .end = range.end,
+            .id = id,
+            .payload = range.payload,
+            .flags = range.flags,
+        };
+        try sr.expect_valid();
+        try std.testing.expectEqual(case.want_ib_height, sr.ib_height);
+    }
+
+    try sr.expect_debug_matches_oracle(&oracle);
+}
+
+test "skiprange: worst-case block counts match limit model" {
+    var sr: SkipRange = .empty;
+    defer sr.deinit(std.testing.allocator);
+
+    const range_count = 100;
+    const height: HeightInt = 3;
+    for (0..range_count) |i| {
+        const start: BytesInt = @intCast(range_count - i);
+        _ = try sr.insert_with_height(
+            std.testing.allocator,
+            .{ .start = start, .end = start + 1, .payload = @intCast(i) },
+            height,
+        );
+    }
+
+    const rb_count = range_count + 1;
+    const ib_count =
+        (@as(usize, height) - 1) * rb_count + rb_count / ib_min_fill;
+    try std.testing.expectEqual(rb_count, sr.rbs.segm_list.len);
+    try std.testing.expectEqual(ib_count, sr.ibs.segm_list.len);
+    try sr.expect_valid();
+}
+
 test "skiprange: random inserts match range oracle" {
     var data_prng = std.Random.DefaultPrng.init(std.testing.random_seed);
     const rand = data_prng.random();
+    const insert_count = 256;
+    const check_interval = 16;
 
     for (0..4) |run| {
         var sr: SkipRange = .empty;
@@ -1977,10 +2210,10 @@ test "skiprange: random inserts match range oracle" {
         var oracle: std.ArrayList(DebugRange) = .empty;
         defer oracle.deinit(std.testing.allocator);
 
-        for (0..256) |i| {
+        for (0..insert_count) |i| {
             const start = rand.uintAtMost(BytesInt, 255);
             const len = rand.uintAtMost(BytesInt, 63);
-            const value: RangeValue = .{
+            const range: Range = .{
                 .start = start,
                 .end = start + len,
                 .payload = @intCast(i),
@@ -1989,16 +2222,17 @@ test "skiprange: random inserts match range oracle" {
                     .end_right = rand.boolean(),
                 },
             };
-            const id = try sr.insert(std.testing.allocator, value);
+            const id = try sr.insert(std.testing.allocator, range);
             try oracle.append(std.testing.allocator, .{
-                .start = value.start,
-                .end = value.end,
+                .start = range.start,
+                .end = range.end,
                 .id = id,
-                .payload = value.payload,
-                .flags = value.flags,
+                .payload = range.payload,
+                .flags = range.flags,
             });
 
-            if (i % 16 == 15) {
+            const inserted = i + 1;
+            if (inserted % check_interval == 0 and inserted < insert_count) {
                 try sr.expect_valid();
                 try sr.expect_debug_matches_oracle(oracle.items);
             }
@@ -2011,24 +2245,23 @@ test "skiprange: random inserts match range oracle" {
 test "skiprange: same-start ranges survive leaf spills" {
     var sr: SkipRange = .empty;
     defer sr.deinit(std.testing.allocator);
-    sr.rng = .init(std.testing.random_seed);
 
     var oracle: std.ArrayList(DebugRange) = .empty;
     defer oracle.deinit(std.testing.allocator);
 
     for (0..3 * Rb.capacity) |i| {
-        const value: RangeValue = .{
+        const range: Range = .{
             .start = 10,
             .end = 11 + @as(BytesInt, @intCast(i % 7)),
             .payload = @intCast(i),
         };
-        const id = try sr.insert(std.testing.allocator, value);
+        const id = try sr.insert_with_height(std.testing.allocator, range, 0);
         try oracle.append(std.testing.allocator, .{
-            .start = value.start,
-            .end = value.end,
+            .start = range.start,
+            .end = range.end,
             .id = id,
-            .payload = value.payload,
-            .flags = value.flags,
+            .payload = range.payload,
+            .flags = range.flags,
         });
     }
 
@@ -2037,47 +2270,46 @@ test "skiprange: same-start ranges survive leaf spills" {
 }
 
 test "skiprange: ordered and reverse starts survive block spills" {
-    var sr: SkipRange = .empty;
-    defer sr.deinit(std.testing.allocator);
-    sr.rng = .init(std.testing.random_seed);
+    const cases = [_]struct {
+        n: usize,
+        height: HeightInt,
+        reverse: bool,
+    }{
+        .{ .n = 2 * Rb.capacity, .height = 0, .reverse = true },
+        .{ .n = 2 * Ib.capacity, .height = 2, .reverse = true },
+        .{ .n = 2 * Ib.capacity, .height = 2, .reverse = false },
+    };
 
-    var oracle: std.ArrayList(DebugRange) = .empty;
-    defer oracle.deinit(std.testing.allocator);
+    for (cases) |case| {
+        var sr: SkipRange = .empty;
+        defer sr.deinit(std.testing.allocator);
 
-    const n = 4 * Rb.capacity;
-    for (0..n) |i| {
-        const start: BytesInt = @intCast((n - i - 1) * 3);
-        const value: RangeValue = .{
-            .start = start,
-            .end = start + 5,
-            .payload = @intCast(i),
-        };
-        const id = try sr.insert(std.testing.allocator, value);
-        try oracle.append(std.testing.allocator, .{
-            .start = value.start,
-            .end = value.end,
-            .id = id,
-            .payload = value.payload,
-            .flags = value.flags,
-        });
+        var oracle: std.ArrayList(DebugRange) = .empty;
+        defer oracle.deinit(std.testing.allocator);
+
+        for (0..case.n) |i| {
+            const rank = if (case.reverse) case.n - i - 1 else i;
+            const start: BytesInt = @intCast(rank * 3);
+            const range: Range = .{
+                .start = start,
+                .end = start + 5,
+                .payload = @intCast(i),
+            };
+            const id = try sr.insert_with_height(
+                std.testing.allocator,
+                range,
+                case.height,
+            );
+            try oracle.append(std.testing.allocator, .{
+                .start = range.start,
+                .end = range.end,
+                .id = id,
+                .payload = range.payload,
+                .flags = range.flags,
+            });
+        }
+
+        try sr.expect_valid();
+        try sr.expect_debug_matches_oracle(oracle.items);
     }
-    for (0..n) |i| {
-        const start: BytesInt = @intCast(1_000 + i * 3);
-        const value: RangeValue = .{
-            .start = start,
-            .end = start + 9,
-            .payload = @intCast(n + i),
-        };
-        const id = try sr.insert(std.testing.allocator, value);
-        try oracle.append(std.testing.allocator, .{
-            .start = value.start,
-            .end = value.end,
-            .id = id,
-            .payload = value.payload,
-            .flags = value.flags,
-        });
-    }
-
-    try sr.expect_valid();
-    try sr.expect_debug_matches_oracle(oracle.items);
 }
