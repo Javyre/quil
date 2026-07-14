@@ -341,7 +341,7 @@ fn redraw_blank_tail(
 ) !void {
     if (x >= dims.w) return;
 
-    const spaces = [_]u8{' '} ** 128;
+    const spaces: [128]u8 = @splat(' ');
     var cur_x = x;
     while (cur_x < dims.w) {
         const len: u16 = @min(dims.w - cur_x, spaces.len);

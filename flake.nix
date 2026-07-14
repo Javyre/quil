@@ -6,15 +6,11 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
 
-    zig.url = "github:mitchellh/zig-overlay";
-    zig.inputs.nixpkgs.follows = "nixpkgs";
-
     zig-src.url = "github:Javyre/nix-zig-build";
     zig-src.inputs.nixpkgs.follows = "nixpkgs";
 
     zls.url = "github:zigtools/zls";
     zls.inputs.nixpkgs.follows = "nixpkgs";
-    zls.inputs.zig-overlay.follows = "zig";
   };
 
   outputs =
@@ -23,7 +19,6 @@
       imports = [ ];
       systems = [
         "x86_64-linux"
-        "x86_64-darwin"
         "aarch64-linux"
         "aarch64-darwin"
       ];
@@ -37,13 +32,12 @@
           ...
         }:
         let
-          # zig = inputs'.zig.packages.master;
           zig = inputs'.zig-src.packages.zig.override {
             release = {
-              version = "0.16.0-dev.3128+ad7a02822";
+              version = "0.17.0-dev.1414+80d06578a";
               src = {
-                rev = "ad7a028228eabffd19b2d831bebe87c67723347c";
-                hash = "sha256-tJ88eGgZzoHFhDLF/WF6XysRp9fhkiNyOCpG1jHUGLc=";
+                rev = "80d06578ac66bce3aa0a21e9610cdb782b9a0593";
+                hash = "sha256-Zb0v4QUq57NBDilUwc0BFC8PLFoxa5Cy5iWZlOrXc80=";
               };
             };
           };

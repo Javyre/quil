@@ -1051,9 +1051,9 @@ test "read cursor streams across db boundaries" {
     var r: SkipRope = .empty;
     defer r.deinit(std.testing.allocator);
 
-    const text =
-        ("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" ** 5);
-    try r.insert(std.testing.allocator, 0, text);
+    const part = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const text: [part.len * 5]u8 = @bitCast(@as([5][part.len]u8, @splat(part.*)));
+    try r.insert(std.testing.allocator, 0, &text);
 
     var cur = r.read_cursor_at(0);
     var out: std.ArrayList(u8) = .empty;
@@ -1062,16 +1062,16 @@ test "read cursor streams across db boundaries" {
         try out.appendSlice(std.testing.allocator, chunk);
     }
 
-    try std.testing.expectEqualStrings(text, out.items);
+    try std.testing.expectEqualStrings(&text, out.items);
 }
 
 test "read cursor can start at db boundary" {
     var r: SkipRope = .empty;
     defer r.deinit(std.testing.allocator);
 
-    const text =
-        ("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" ** 5);
-    try r.insert(std.testing.allocator, 0, text);
+    const part = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const text: [part.len * 5]u8 = @bitCast(@as([5][part.len]u8, @splat(part.*)));
+    try r.insert(std.testing.allocator, 0, &text);
 
     var split_ofs: usize = 0;
     {

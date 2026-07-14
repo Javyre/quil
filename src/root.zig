@@ -43,7 +43,7 @@ pub const Quil = struct {
             .io = io,
             .alloc = alloc,
             .render = try .init(io, alloc),
-            .buf_manager = try .init(io, alloc),
+            .buf_manager = .init(io, alloc),
             .win_manager = try .init(alloc, &q.render, &q.buf_manager),
         };
     }
@@ -124,8 +124,8 @@ pub fn run(q: *Quil, setup_cb: ?fn (*Quil) Error!void) !void {
     defer q.render.teardown() catch unreachable;
 
     // Setup Buffer Manager
-    try q.buf_manager.setup();
-    defer q.buf_manager.teardown() catch unreachable;
+    q.buf_manager.setup();
+    defer q.buf_manager.teardown();
 
     // Setup Window Manager
     try q.win_manager.setup();

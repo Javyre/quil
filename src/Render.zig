@@ -318,10 +318,11 @@ const BitMap = struct {
 
                     // Since we use native endianness, these reads are
                     // conceptually just a bitcast + shift.
-                    word.* = std.mem.readPackedIntNative(
+                    word.* = std.mem.readPackedInt(
                         Word,
                         std.mem.sliceAsBytes(view.bm),
                         base_bit_ofs,
+                        native_endian,
                     );
                 }
 
@@ -339,20 +340,22 @@ const BitMap = struct {
                 const bits_overflow: std.math.Log2Int(Word) = @intCast(vp_x + VEC_BITS -| dest.vp_dims.w);
                 std.debug.assert(bits_overflow <= VEC_BITS);
                 if (bits_overflow > 0) {
-                    const prev_word = std.mem.readPackedIntNative(
+                    const prev_word = std.mem.readPackedInt(
                         Word,
                         std.mem.sliceAsBytes(dest.bm),
                         dest_base_bit_ofs,
+                        native_endian,
                     );
                     const mask = (std.math.boolMask(Word, true) >> bits_overflow);
                     dest_word = (prev_word & ~mask) | (dest_word & mask);
                 }
 
-                std.mem.writePackedIntNative(
+                std.mem.writePackedInt(
                     Word,
                     std.mem.sliceAsBytes(dest.bm),
                     dest_base_bit_ofs,
                     dest_word,
+                    native_endian,
                 );
             }
         }
@@ -529,14 +532,14 @@ const BitMap = struct {
         for ([_]std.builtin.Endian{ .little, .big }) |endian| {
             for ([_]usize{ 0, 1, 2, 3, 4, 5, 6 }) |bit_ofs| {
                 inline for (.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }) |bit_count| {
-                    const uN = std.meta.Int(.unsigned, bit_count);
+                    const uN = @Int(.unsigned, bit_count);
 
-                    var bytes = [_]u8{0} ** 4;
+                    var bytes: [4]u8 = @splat(0);
                     set_bits(&bytes, bit_ofs, bit_count, 1, endian);
                     var val = std.mem.readPackedInt(uN, &bytes, bit_ofs, endian);
                     try std.testing.expectEqual(std.math.boolMask(uN, true), val);
 
-                    bytes = [_]u8{1} ** 4;
+                    bytes = @splat(1);
                     set_bits(&bytes, bit_ofs, bit_count, 0, endian);
                     val = std.mem.readPackedInt(uN, &bytes, bit_ofs, endian);
                     try std.testing.expectEqual(std.math.boolMask(uN, false), val);
