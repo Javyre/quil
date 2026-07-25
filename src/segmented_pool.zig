@@ -42,12 +42,22 @@ pub fn SegmentedPool(
             pool.* = undefined;
         }
 
+        pub fn clearRetainingCapacity(pool: *Pool) void {
+            pool.segm_list.clearRetainingCapacity();
+            pool.free_list = null;
+            if (is_debug)
+                pool.len = Num.coerce(0);
+        }
+
         pub const ItemPair = struct {
             ptr: *Item,
             num: Num,
         };
 
-        pub fn create(pool: *Pool, alloc: std.mem.Allocator) Allocator.Error!ItemPair {
+        pub fn create(
+            pool: *Pool,
+            alloc: std.mem.Allocator,
+        ) Allocator.Error!ItemPair {
             if (pool.free_list) |num| {
                 const item: *Item = pool.segm_list.at(num.to_int());
                 const node: NodePtr = @ptrCast(item);
@@ -80,6 +90,16 @@ pub fn SegmentedPool(
             pool.free_list = num;
             if (is_debug)
                 pool.len = pool.len.sub(.coerce(1));
+        }
+
+        pub fn freeHead(pool: *const Pool) ?Num {
+            return pool.free_list;
+        }
+
+        pub fn freeNext(pool: *const Pool, num: Num) ?Num {
+            const item: *const Item = pool.segm_list.at(num.to_int());
+            const node: *const Node = @ptrCast(item);
+            return node.next;
         }
 
         pub fn at(
